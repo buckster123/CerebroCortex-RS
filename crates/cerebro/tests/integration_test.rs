@@ -821,3 +821,256 @@ mod cortex_pipeline {
         assert_eq!(storage.graph.graph.node_count(), 2);
     }
 }
+
+// =============================================================================
+// Step 12 — Python → Rust DB schema migration
+// =============================================================================
+
+#[cfg(test)]
+mod db_compat {
+    use cerebro::storage::sqlite::SqliteStore;
+    use cerebro::types::{MemoryId, VisibilityScope};
+    use rusqlite::Connection;
+    use tempfile::TempDir;
+
+    /// Minimal Python-schema SQL — same table/column names as
+    /// src/cerebro/storage/sqlite_schema.py in the CerebroCortex Python repo.
+    const PYTHON_SCHEMA: &str = r#"
+    CREATE TABLE IF NOT EXISTS memory_nodes (
+        id TEXT PRIMARY KEY,
+        content TEXT NOT NULL DEFAULT '',
+        content_hash TEXT NOT NULL DEFAULT '',
+        memory_type TEXT NOT NULL DEFAULT 'semantic',
+        layer TEXT NOT NULL DEFAULT 'working',
+        agent_id TEXT NOT NULL DEFAULT 'CLAUDE',
+        visibility TEXT NOT NULL DEFAULT 'shared',
+        stability REAL NOT NULL DEFAULT 1.0,
+        difficulty REAL NOT NULL DEFAULT 5.0,
+        access_count INTEGER NOT NULL DEFAULT 0,
+        access_timestamps_json TEXT NOT NULL DEFAULT '[]',
+        compressed_count INTEGER NOT NULL DEFAULT 0,
+        compressed_avg_interval REAL NOT NULL DEFAULT 0.0,
+        last_retrievability REAL NOT NULL DEFAULT 1.0,
+        last_activation REAL NOT NULL DEFAULT 0.0,
+        last_computed_at REAL,
+        valence TEXT NOT NULL DEFAULT 'neutral',
+        arousal REAL NOT NULL DEFAULT 0.5,
+        salience REAL NOT NULL DEFAULT 0.5,
+        episode_id TEXT,
+        session_id TEXT,
+        conversation_thread TEXT,
+        tags_json TEXT NOT NULL DEFAULT '[]',
+        concepts_json TEXT NOT NULL DEFAULT '[]',
+        responding_to_json TEXT NOT NULL DEFAULT '[]',
+        related_agents_json TEXT NOT NULL DEFAULT '[]',
+        recipient TEXT,
+        source TEXT NOT NULL DEFAULT 'user_input',
+        derived_from_json TEXT NOT NULL DEFAULT '[]',
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        last_accessed_at TEXT,
+        promoted_at TEXT,
+        media_type TEXT NOT NULL DEFAULT 'text',
+        source_file TEXT,
+        deleted_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS associative_links (
+        id TEXT PRIMARY KEY,
+        source_id TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        link_type TEXT NOT NULL,
+        weight REAL NOT NULL DEFAULT 0.5,
+        activation_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        last_activated TEXT,
+        source_reason TEXT NOT NULL DEFAULT 'system',
+        evidence TEXT
+    );
+    CREATE TABLE IF NOT EXISTS agents (
+        id TEXT PRIMARY KEY,
+        display_name TEXT NOT NULL,
+        generation INTEGER NOT NULL DEFAULT 0,
+        lineage TEXT,
+        specialization TEXT,
+        origin_story TEXT,
+        color TEXT DEFAULT '#888888',
+        symbol TEXT DEFAULT 'A',
+        registered_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS episodes (
+        id TEXT PRIMARY KEY,
+        title TEXT,
+        agent_id TEXT NOT NULL DEFAULT 'CLAUDE',
+        session_id TEXT,
+        started_at TEXT,
+        ended_at TEXT,
+        overall_valence TEXT NOT NULL DEFAULT 'neutral',
+        peak_arousal REAL NOT NULL DEFAULT 0.5,
+        tags_json TEXT NOT NULL DEFAULT '[]',
+        consolidated INTEGER NOT NULL DEFAULT 0,
+        schema_extracted INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS episode_steps (
+        episode_id TEXT NOT NULL,
+        memory_id TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        role TEXT NOT NULL DEFAULT 'event',
+        timestamp TEXT NOT NULL,
+        PRIMARY KEY (episode_id, position)
+    );
+    CREATE TABLE IF NOT EXISTS audit_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+        event_type TEXT NOT NULL,
+        actor_agent_id TEXT,
+        target_memory_id TEXT,
+        old_value TEXT,
+        new_value TEXT,
+        details_json TEXT NOT NULL DEFAULT '{}'
+    );
+    CREATE TABLE IF NOT EXISTS dream_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        cycle_id TEXT,
+        agent_id TEXT,
+        phase TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        completed_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS memory_versions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        memory_id TEXT NOT NULL,
+        content TEXT NOT NULL,
+        tags_json TEXT NOT NULL DEFAULT '[]',
+        salience REAL NOT NULL,
+        visibility TEXT NOT NULL,
+        edited_by TEXT,
+        edited_at TEXT NOT NULL,
+        change_note TEXT
+    );
+    CREATE TABLE IF NOT EXISTS schema_version (
+        version INTEGER PRIMARY KEY,
+        applied_at TEXT NOT NULL,
+        description TEXT
+    );
+    INSERT INTO schema_version (version, applied_at, description)
+    VALUES (7, datetime('now'), 'Initial CerebroCortex schema');
+    "#;
+
+    fn seed_python_db(path: &std::path::Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=OFF;").unwrap();
+        conn.execute_batch(PYTHON_SCHEMA).unwrap();
+
+        // Insert a memory
+        conn.execute(
+            "INSERT INTO memory_nodes (id, content, memory_type, layer, salience, tags_json, \
+             agent_id, visibility, conversation_thread, valence, arousal, access_count, \
+             access_timestamps_json, stability, difficulty, metadata_json, created_at, last_accessed_at) \
+             VALUES (?1, ?2, 'semantic', 'working', 0.8, '[\"rust\",\"migration\"]', \
+             'FORGE', 'shared', NULL, 'positive', 0.7, 3, '[1700000000.0,1700001000.0,1700002000.0]', 5.0, 4.0, '{\"foo\":\"bar\"}', \
+             '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z')",
+            rusqlite::params!["mem_test_migrate_001", "test memory content about Rust migration"],
+        ).unwrap();
+
+        // Insert a second memory
+        conn.execute(
+            "INSERT INTO memory_nodes (id, content, memory_type, layer, salience, tags_json, \
+             agent_id, visibility, valence, arousal, created_at) \
+             VALUES ('mem_test_migrate_002', 'second memory for link test', 'episodic', 'long_term', \
+             0.9, '[]', 'FORGE', 'private', 'neutral', 0.5, '2026-01-01T01:00:00Z')",
+            [],
+        ).unwrap();
+
+        // Insert a link
+        conn.execute(
+            "INSERT INTO associative_links (id, source_id, target_id, link_type, weight, \
+             activation_count, created_at, last_activated) \
+             VALUES ('lnk_001', 'mem_test_migrate_001', 'mem_test_migrate_002', \
+             'semantic', 0.75, 2, '2026-01-01T00:01:00Z', '2026-01-02T00:00:00Z')",
+            [],
+        ).unwrap();
+
+        // Insert an agent
+        conn.execute(
+            "INSERT INTO agents (id, display_name, generation, color, symbol, registered_at) \
+             VALUES ('FORGE', 'Forge Agent', 1, '#B7410E', '⚒', '2026-01-01T00:00:00Z')",
+            [],
+        ).unwrap();
+
+        // Insert an episode
+        conn.execute(
+            "INSERT INTO episodes (id, title, agent_id, session_id, started_at, created_at) \
+             VALUES ('ep_001', 'Test episode', 'FORGE', 'sess_001', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [],
+        ).unwrap();
+
+        // Insert an episode step
+        conn.execute(
+            "INSERT INTO episode_steps (episode_id, memory_id, position, role, timestamp) \
+             VALUES ('ep_001', 'mem_test_migrate_001', 0, 'event', '2026-01-01T00:00:00Z')",
+            [],
+        ).unwrap();
+
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_reads_python_memories() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("cerebro.db");
+
+        // Create a Python-schema DB with seed data
+        seed_python_db(&db_path);
+
+        // Open with Rust SqliteStore — triggers auto-migration
+        let store = SqliteStore::open(&db_path).await.unwrap();
+
+        // Verify both memories are readable
+        let id1 = MemoryId("mem_test_migrate_001".into());
+        let mem = store.get_memory(&id1, &VisibilityScope::global()).await.unwrap()
+            .expect("migrated memory should be retrievable");
+        assert_eq!(mem.content, "test memory content about Rust migration");
+        assert_eq!(mem.salience, 0.8);
+        assert_eq!(mem.access_count, 3);
+        assert_eq!(mem.tags, vec!["rust".to_string(), "migration".to_string()]);
+        assert!((mem.strength.stability - 5.0).abs() < 1e-6);
+
+        let id2 = MemoryId("mem_test_migrate_002".into());
+        let mem2 = store.get_memory(&id2, &VisibilityScope::global()).await.unwrap()
+            .expect("second migrated memory should be retrievable");
+        assert_eq!(mem2.content, "second memory for link test");
+
+        // Verify link was migrated
+        let links = store.list_links_from(&id1).await.unwrap();
+        assert!(!links.is_empty(), "link should have been migrated");
+        assert_eq!(links[0].link_type, cerebro::types::LinkType::Semantic);
+        assert!((links[0].weight - 0.75).abs() < 1e-6);
+
+        // Verify migration is idempotent — re-opening should not error
+        drop(store);
+        SqliteStore::open(&db_path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_preserves_enum_strings() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("cerebro.db");
+        seed_python_db(&db_path);
+        let store = SqliteStore::open(&db_path).await.unwrap();
+
+        let id1 = MemoryId("mem_test_migrate_001".into());
+        let mem = store.get_memory(&id1, &VisibilityScope::global()).await.unwrap().unwrap();
+
+        // Python stores "semantic"/"working"/"shared"/"positive" — Rust must parse them correctly
+        assert_eq!(mem.memory_type,  cerebro::types::MemoryType::Semantic);
+        assert_eq!(mem.layer,        cerebro::types::MemoryLayer::Working);
+        assert_eq!(mem.visibility,   cerebro::types::Visibility::Shared);
+
+        let id2 = MemoryId("mem_test_migrate_002".into());
+        let mem2 = store.get_memory(&id2, &VisibilityScope::global()).await.unwrap().unwrap();
+        assert_eq!(mem2.memory_type, cerebro::types::MemoryType::Episodic);
+        assert_eq!(mem2.layer,       cerebro::types::MemoryLayer::LongTerm);
+        assert_eq!(mem2.visibility,  cerebro::types::Visibility::Private);
+    }
+}

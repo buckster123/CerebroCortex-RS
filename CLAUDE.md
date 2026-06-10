@@ -128,7 +128,7 @@ agentd never knows. Same 63 tools. Same MCP contract.
 | 9 | Remaining 61 MCP tools | Full tool surface | ✓ 62/66 wired |
 | 10 | `engines/dream.rs` | All 6 phases, live LLM calls | ✓ all 6 phases + dream_run/dream_status wired |
 | 11 | `cerebro-cli/` + `cerebro-api/` | CLI and REST parity | ✓ |
-| 12 | DB compatibility | Rust reads a Python-generated `cerebro.db` | ⬜ |
+| 12 | DB compatibility | Rust reads a Python-generated `cerebro.db` | ✓ |
 
 ## Cerebro agent
 
@@ -156,6 +156,7 @@ This feeds the knowledge graph. Dream cycles (`dream_run`) then consolidate acro
 
 ---
 
+**Step 12 done (2026-06-10)** — Auto-migration from Python `cerebro.db` in `SqliteStore::open()`. Detects Python schema (`memory_nodes` table present), runs a single-transaction migration: `memory_nodes→memories`, `associative_links→links`, renames+recreates `agents`/`episodes`/`episode_steps`/`audit_log` with Rust column names. Access timestamps converted from Unix floats to RFC3339 via `strftime`. Idempotent (schema_version=100 marks completion). 2 new migration tests; 42 cerebro + 8 mcp = 50 total tests green.
 **Step 11 done (2026-06-10)** — `cerebro` (binary) and `cerebro-api` fully implemented. CLI: 9 top-level commands + 8 subcommand groups (episode, session, agents, intention, graph, schema, procedure, dream) covering all core operations. REST API: 40 routes (health/stats, memory CRUD, associate, episodes, sessions, agents, graph, tags, intentions, schemas, procedures, trash lifecycle, threads, dream). StdRng replaces thread_rng in DreamEngine (thread_rng is !Send, broke axum handlers). 116 tests still green.
 **Step 10 done (2026-06-10)** — DreamEngine fully implemented: all 6 phases (SWS replay, pattern extraction, schema formation, emotional reprocessing, pruning, REM recombination). LLM phases 2/3/6 skip gracefully when `ANTHROPIC_API_KEY` unset. 3 new SqliteStore methods: `has_link_between`, `save_dream_report`, `get_last_dream_report`. `dream_run` and `dream_status` now wired (62/66 tools). 8 dispatch tests still green; total 116 tests pass.
 **Step 9 done (2026-06-10)** — 60/66 tools wired. Added 13 more routes: store/list/resolve_intention, store/list/find_relevant_procedures/record_procedure_outcome, create/list/find_matching_schemas/get_schema_sources, get_memory_versions/restore_version. Added memory_versions table to SCHEMA_SQL + log_memory_version/get_memory_versions_raw/get_version_raw to SqliteStore. Intentions/procedures/schemas use existing MemoryType variants (Prospective/Procedural/Schematic) — no extra tables. Remaining 4 stubs: cognitive_bootstrap/ingest_file/describe_image/search_vision (Tier 7 deferred).
@@ -181,6 +182,8 @@ This feeds the knowledge graph. Dream cycles (`dream_run`) then consolidate acro
 - **Debian trixie pip gotcha** (relevant for the Python reference, not Rust): PEP 668 enforced — use a venv. Not a Rust issue but good to know when running `scripts/gen_activation_fixtures.py`.
 - **Never modify `../CerebroCortex`** — it's the running daily driver for ApexOS and the reference implementation. The Rust port runs in parallel.
 - **Graph is cache, SQLite is truth** — the petgraph in-memory graph is rebuilt from SQLite on startup. Write to SQLite first; graph/vector are derived.
+- **Python DB auto-migration** — `SqliteStore::open()` detects a Python `cerebro.db` (by checking for `memory_nodes` table) and migrates it in-place automatically. No user action needed; just point `CEREBRO_DATA_DIR` at the Python DB and start the Rust binary. Migration is marked complete with `schema_version=100`; subsequent opens are no-ops. Python's `access_timestamps_json` (Unix floats) → Rust `access_times` (RFC3339) via `strftime`. Old Python tables renamed to `_py_*` for safety.
+- **Python DB column mapping** — `memory_nodes`→`memories`, `associative_links`→`links`, `tags_json`→`tags`, `valence`→`emotional_valence`, `arousal`→`emotional_intensity`, `conversation_thread`→`thread_id`, `stability`→`fsrs_stability`, `difficulty`→`fsrs_difficulty`, `metadata_json`→`metadata`, `last_accessed_at`→`updated_at`.
 
 ---
 

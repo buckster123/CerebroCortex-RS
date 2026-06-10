@@ -202,6 +202,199 @@ const SELECT_COLS: &str =
      thread_id, emotional_valence, emotional_intensity, created_at, updated_at, \
      access_count, access_times, fsrs_stability, fsrs_difficulty, fsrs_last_review, metadata";
 
+// ---------------------------------------------------------------------------
+// One-time migration: Python CerebroCortex schema → Rust schema
+// ---------------------------------------------------------------------------
+
+/// Detects a Python-generated `cerebro.db` (table `memory_nodes` present) and
+/// converts it in-place to the Rust schema.  Runs once; subsequent opens are
+/// no-ops (schema_version 100 marks completion).
+fn migrate_from_python(conn: &mut Connection) -> Result<()> {
+    // Is this a Python-schema DB?
+    let has_py: bool = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='memory_nodes'",
+        [],
+        |r| r.get::<_, i64>(0),
+    ).unwrap_or(0) > 0;
+    if !has_py {
+        return Ok(());
+    }
+
+    // Already migrated?
+    let sv_exists: bool = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_version'",
+        [],
+        |r| r.get::<_, i64>(0),
+    ).unwrap_or(0) > 0;
+    if sv_exists {
+        let done: bool = conn.query_row(
+            "SELECT COUNT(*) FROM schema_version WHERE version=100",
+            [],
+            |r| r.get::<_, i64>(0),
+        ).unwrap_or(0) > 0;
+        if done {
+            return Ok(());
+        }
+    }
+
+    tracing::info!("Python CerebroCortex schema detected — running one-time migration to Rust schema");
+
+    // Disable FK enforcement for the duration: we rename parent tables before
+    // recreating them, which would otherwise violate FK constraints.
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+
+    {
+        let tx = conn.transaction()?;
+        tx.execute_batch(MIGRATION_SQL)?;
+        tx.commit()?;
+    }
+
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+
+    // Rebuild FTS5 from the freshly-populated memories table.
+    // (Triggers also fired row-by-row during INSERT — rebuild is idempotent.)
+    if let Err(e) = conn.execute_batch(
+        "INSERT INTO memories_fts(memories_fts) VALUES('rebuild');"
+    ) {
+        tracing::warn!("FTS5 rebuild after migration failed (non-fatal): {e}");
+    }
+
+    let n: i64 = conn.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))?;
+    tracing::info!("Migration complete — {n} memories now in Rust schema");
+    Ok(())
+}
+
+/// SQL executed inside a transaction during Python→Rust migration.
+///
+/// Column mapping summary (memory_nodes → memories):
+///   tags_json → tags | conversation_thread → thread_id
+///   valence → emotional_valence | arousal → emotional_intensity
+///   last_accessed_at → updated_at | access_timestamps_json → access_times
+///   stability/difficulty → fsrs_stability/fsrs_difficulty | metadata_json → metadata
+const MIGRATION_SQL: &str = r#"
+-- 1. Memories: memory_nodes → memories (already created empty by SCHEMA_SQL)
+INSERT OR IGNORE INTO memories (
+    id, content, memory_type, layer, salience, tags, agent_id, visibility,
+    thread_id, emotional_valence, emotional_intensity, created_at, updated_at,
+    access_count, access_times, fsrs_stability, fsrs_difficulty, fsrs_last_review,
+    metadata, embedding, deleted_at
+)
+SELECT
+    id,
+    content,
+    memory_type,
+    layer,
+    salience,
+    COALESCE(tags_json, '[]'),
+    agent_id,
+    visibility,
+    conversation_thread,
+    valence,
+    COALESCE(arousal, 0.5),
+    created_at,
+    COALESCE(last_accessed_at, created_at),
+    COALESCE(access_count, 0),
+    COALESCE(
+        (SELECT json_group_array(strftime('%Y-%m-%dT%H:%M:%SZ', value, 'unixepoch'))
+         FROM json_each(memory_nodes.access_timestamps_json)),
+        '[]'
+    ),
+    COALESCE(stability, 1.0),
+    COALESCE(difficulty, 5.0),
+    NULL,
+    COALESCE(metadata_json, 'null'),
+    NULL,
+    deleted_at
+FROM memory_nodes;
+
+-- 2. Links: associative_links → links (already created empty by SCHEMA_SQL)
+INSERT OR IGNORE INTO links (
+    source_id, target_id, link_type, weight, created_at, last_traversed, traversal_count
+)
+SELECT source_id, target_id, link_type, weight, created_at,
+       last_activated, COALESCE(activation_count, 0)
+FROM associative_links;
+
+-- 3. Agents: rename Python table (different columns), recreate with Rust schema
+ALTER TABLE agents RENAME TO _py_agents;
+CREATE TABLE agents (
+    id            TEXT PRIMARY KEY,
+    name          TEXT NOT NULL UNIQUE,
+    description   TEXT,
+    registered_at TEXT NOT NULL,
+    last_seen     TEXT,
+    metadata      TEXT NOT NULL DEFAULT 'null'
+);
+INSERT OR IGNORE INTO agents (id, name, description, registered_at, last_seen, metadata)
+SELECT
+    id,
+    display_name,
+    specialization,
+    registered_at,
+    NULL,
+    json_object(
+        'symbol',     COALESCE(symbol, 'A'),
+        'color',      COALESCE(color, '#888888'),
+        'generation', COALESCE(generation, 0)
+    )
+FROM _py_agents;
+
+-- 4. Episodes: rename Python table, recreate with Rust schema
+ALTER TABLE episodes RENAME TO _py_episodes;
+CREATE TABLE episodes (
+    id         TEXT PRIMARY KEY,
+    title      TEXT,
+    agent_id   TEXT,
+    thread_id  TEXT,
+    started_at TEXT NOT NULL,
+    ended_at   TEXT,
+    summary    TEXT,
+    memory_ids TEXT NOT NULL DEFAULT '[]',
+    metadata   TEXT NOT NULL DEFAULT 'null'
+);
+INSERT OR IGNORE INTO episodes (id, title, agent_id, thread_id, started_at, ended_at, summary, memory_ids, metadata)
+SELECT id, title, agent_id, session_id,
+       COALESCE(started_at, created_at), ended_at, NULL, '[]', 'null'
+FROM _py_episodes;
+
+-- 5. Episode steps: rename Python table, recreate with Rust schema
+--    Python: position (int), role (text)  →  Rust: step_index (int), description (text)
+ALTER TABLE episode_steps RENAME TO _py_episode_steps;
+CREATE TABLE episode_steps (
+    episode_id TEXT    NOT NULL,
+    step_index INTEGER NOT NULL,
+    description TEXT   NOT NULL,
+    memory_id  TEXT,
+    timestamp  TEXT    NOT NULL,
+    PRIMARY KEY (episode_id, step_index),
+    FOREIGN KEY (episode_id) REFERENCES episodes(id)
+);
+INSERT OR IGNORE INTO episode_steps (episode_id, step_index, description, memory_id, timestamp)
+SELECT episode_id, position, COALESCE(role, ''), memory_id, timestamp
+FROM _py_episode_steps;
+
+-- 6. Audit log: rename Python table (different columns), recreate with Rust schema
+--    The index idx_audit_ts was created by SCHEMA_SQL on the old table; drop and recreate.
+ALTER TABLE audit_log RENAME TO _py_audit_log;
+DROP INDEX IF EXISTS idx_audit_ts;
+CREATE TABLE audit_log (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    agent_id  TEXT,
+    action    TEXT NOT NULL,
+    memory_id TEXT,
+    details   TEXT
+);
+CREATE INDEX idx_audit_ts ON audit_log(timestamp);
+INSERT OR IGNORE INTO audit_log (timestamp, agent_id, action, memory_id, details)
+SELECT timestamp, actor_agent_id, event_type, target_memory_id, details_json
+FROM _py_audit_log;
+
+-- 7. Mark migration complete in Python's schema_version table.
+INSERT OR REPLACE INTO schema_version (version, applied_at, description)
+VALUES (100, datetime('now'), 'Migrated from Python CerebroCortex to Rust schema');
+"#;
+
 impl SqliteStore {
     pub async fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -209,11 +402,15 @@ impl SqliteStore {
         }
         // Register sqlite-vec before opening so the extension is available on this connection.
         register_sqlite_vec();
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
 
         // Base schema (no vec0 dependency)
         conn.execute_batch(SCHEMA_SQL)?;
+
+        // One-time migration: if this DB was created by the Python CerebroCortex server
+        // (uses memory_nodes / associative_links), transparently convert it to Rust schema.
+        migrate_from_python(&mut conn)?;
 
         // Try to create the vec0 virtual table; works only if sqlite-vec loaded successfully.
         let vec_available = conn.execute_batch(
