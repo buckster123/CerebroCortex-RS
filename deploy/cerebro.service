@@ -1,0 +1,21 @@
+[Unit]
+Description=CerebroCortex MCP memory server (Rust)
+After=network.target
+Documentation=https://github.com/buckster123/CerebroCortex-RS
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cerebro-mcp
+Restart=always
+RestartSec=3s
+Environment=CEREBRO_DATA_DIR=/var/lib/cerebro
+Environment=RUST_LOG=info
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+# Use a dedicated system user in production
+# User=cerebro
+# Group=cerebro
+
+[Install]
+WantedBy=multi-user.target

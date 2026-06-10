@@ -1,0 +1,7 @@
+/target/
+/.cerebro-cortex/
+*.db
+*.db-shm
+*.db-wal
+tests/fixtures/activation.json
+Cargo.lock
