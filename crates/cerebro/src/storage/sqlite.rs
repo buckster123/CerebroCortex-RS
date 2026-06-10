@@ -291,8 +291,8 @@ SELECT
     conversation_thread,
     valence,
     COALESCE(arousal, 0.5),
-    created_at,
-    COALESCE(last_accessed_at, created_at),
+    strftime('%Y-%m-%dT%H:%M:%SZ', created_at),
+    strftime('%Y-%m-%dT%H:%M:%SZ', COALESCE(last_accessed_at, created_at)),
     COALESCE(access_count, 0),
     COALESCE(
         (SELECT json_group_array(strftime('%Y-%m-%dT%H:%M:%SZ', value, 'unixepoch'))
@@ -311,8 +311,11 @@ FROM memory_nodes;
 INSERT OR IGNORE INTO links (
     source_id, target_id, link_type, weight, created_at, last_traversed, traversal_count
 )
-SELECT source_id, target_id, link_type, weight, created_at,
-       last_activated, COALESCE(activation_count, 0)
+SELECT source_id, target_id, link_type, weight,
+       strftime('%Y-%m-%dT%H:%M:%SZ', created_at),
+       CASE WHEN last_activated IS NULL THEN NULL
+            ELSE strftime('%Y-%m-%dT%H:%M:%SZ', last_activated) END,
+       COALESCE(activation_count, 0)
 FROM associative_links;
 
 -- 3. Agents: rename Python table (different columns), recreate with Rust schema
@@ -330,7 +333,7 @@ SELECT
     id,
     display_name,
     specialization,
-    registered_at,
+    strftime('%Y-%m-%dT%H:%M:%SZ', registered_at),
     NULL,
     json_object(
         'symbol',     COALESCE(symbol, 'A'),
@@ -354,7 +357,10 @@ CREATE TABLE episodes (
 );
 INSERT OR IGNORE INTO episodes (id, title, agent_id, thread_id, started_at, ended_at, summary, memory_ids, metadata)
 SELECT id, title, agent_id, session_id,
-       COALESCE(started_at, created_at), ended_at, NULL, '[]', 'null'
+       strftime('%Y-%m-%dT%H:%M:%SZ', COALESCE(started_at, created_at)),
+       CASE WHEN ended_at IS NULL THEN NULL
+            ELSE strftime('%Y-%m-%dT%H:%M:%SZ', ended_at) END,
+       NULL, '[]', 'null'
 FROM _py_episodes;
 
 -- 5. Episode steps: rename Python table, recreate with Rust schema
@@ -370,7 +376,9 @@ CREATE TABLE episode_steps (
     FOREIGN KEY (episode_id) REFERENCES episodes(id)
 );
 INSERT OR IGNORE INTO episode_steps (episode_id, step_index, description, memory_id, timestamp)
-SELECT episode_id, position, COALESCE(role, ''), memory_id, timestamp
+SELECT episode_id, position, COALESCE(role, ''),
+       memory_id,
+       strftime('%Y-%m-%dT%H:%M:%SZ', timestamp)
 FROM _py_episode_steps;
 
 -- 6. Audit log: rename Python table (different columns), recreate with Rust schema
@@ -387,7 +395,8 @@ CREATE TABLE audit_log (
 );
 CREATE INDEX idx_audit_ts ON audit_log(timestamp);
 INSERT OR IGNORE INTO audit_log (timestamp, agent_id, action, memory_id, details)
-SELECT timestamp, actor_agent_id, event_type, target_memory_id, details_json
+SELECT strftime('%Y-%m-%dT%H:%M:%SZ', timestamp),
+       actor_agent_id, event_type, target_memory_id, details_json
 FROM _py_audit_log;
 
 -- 7. Mark migration complete in Python's schema_version table.
