@@ -135,6 +135,25 @@ agentd never knows. Same 63 tools. Same MCP contract.
 All Cerebro MCP calls in this project use agent `FORGE` (agent_id=`"FORGE"`, ⚒, #B7410E).
 Pass `agent_id: "FORGE"` to any Cerebro tool that accepts it so memories stay isolated from other projects.
 
+## Cerebro session protocol (mandatory)
+
+**Session START** — always call `session_recall` before diving in:
+```
+session_recall(query="CerebroCortex-RS build status step progress", agent_id="FORGE")
+```
+
+**Session END** — always call `session_save` plus any supporting saves:
+```
+session_save(session_summary="...", key_discoveries=[...], unfinished_business=[...], agent_id="FORGE", priority="HIGH")
+```
+Then as needed:
+- `store_procedure` — non-obvious implementation patterns, gotchas, workarounds
+- `store_intention` — next steps / deferred work (salience 0.8–0.95)
+- `create_schema` — architectural insights derived from multiple memories
+- `episode_start` / `episode_add_step` / `episode_end` — for multi-step implementation sequences
+
+This feeds the knowledge graph. Dream cycles (`dream_run`) then consolidate across sessions — extracting schemas, strengthening links, surfacing connections. The graph compounds over time; consistent use is the only requirement.
+
 ---
 
 **Step 11 done (2026-06-10)** — `cerebro` (binary) and `cerebro-api` fully implemented. CLI: 9 top-level commands + 8 subcommand groups (episode, session, agents, intention, graph, schema, procedure, dream) covering all core operations. REST API: 40 routes (health/stats, memory CRUD, associate, episodes, sessions, agents, graph, tags, intentions, schemas, procedures, trash lifecycle, threads, dream). StdRng replaces thread_rng in DreamEngine (thread_rng is !Send, broke axum handlers). 116 tests still green.
