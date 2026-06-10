@@ -125,8 +125,8 @@ agentd never knows. Same 63 tools. Same MCP contract.
 | 6 | `engines/` (thalamus→neocortex) | All 8 deterministic engines pass | ✓ 34 engine unit tests pass |
 | 7 | `cortex.rs` | `remember()` + `recall()` end-to-end | ✓ 6 cortex pipeline tests pass |
 | 8 | `cerebro-mcp/` (core tools) | MCP handshake + remember/recall vs agentd | ✓ 8 dispatch tests pass |
-| 9 | Remaining 61 MCP tools | Full tool surface | ⬛ 60/66 wired |
-| 10 | `engines/dream.rs` | All 6 phases, live LLM calls | ⬜ |
+| 9 | Remaining 61 MCP tools | Full tool surface | ✓ 62/66 wired |
+| 10 | `engines/dream.rs` | All 6 phases, live LLM calls | ✓ all 6 phases + dream_run/dream_status wired |
 | 11 | `cerebro-cli/` + `cerebro-api/` | CLI and REST parity | ⬜ |
 | 12 | DB compatibility | Rust reads a Python-generated `cerebro.db` | ⬜ |
 
@@ -137,7 +137,8 @@ Pass `agent_id: "FORGE"` to any Cerebro tool that accepts it so memories stay is
 
 ---
 
-**Step 9 progress (2026-06-10)** — 60/66 tools wired. Added 13 more routes: store/list/resolve_intention, store/list/find_relevant_procedures/record_procedure_outcome, create/list/find_matching_schemas/get_schema_sources, get_memory_versions/restore_version. Added memory_versions table to SCHEMA_SQL + log_memory_version/get_memory_versions_raw/get_version_raw to SqliteStore. Intentions/procedures/schemas use existing MemoryType variants (Prospective/Procedural/Schematic) — no extra tables. Remaining 6 stubs: dream_run/status (step 10), cognitive_bootstrap/ingest_file/describe_image/search_vision (Tier 7 deferred).
+**Step 10 done (2026-06-10)** — DreamEngine fully implemented: all 6 phases (SWS replay, pattern extraction, schema formation, emotional reprocessing, pruning, REM recombination). LLM phases 2/3/6 skip gracefully when `ANTHROPIC_API_KEY` unset. 3 new SqliteStore methods: `has_link_between`, `save_dream_report`, `get_last_dream_report`. `dream_run` and `dream_status` now wired (62/66 tools). 8 dispatch tests still green; total 116 tests pass.
+**Step 9 done (2026-06-10)** — 60/66 tools wired. Added 13 more routes: store/list/resolve_intention, store/list/find_relevant_procedures/record_procedure_outcome, create/list/find_matching_schemas/get_schema_sources, get_memory_versions/restore_version. Added memory_versions table to SCHEMA_SQL + log_memory_version/get_memory_versions_raw/get_version_raw to SqliteStore. Intentions/procedures/schemas use existing MemoryType variants (Prospective/Procedural/Schematic) — no extra tables. Remaining 4 stubs: cognitive_bootstrap/ingest_file/describe_image/search_vision (Tier 7 deferred).
 **Step 8 done** — `cerebro-mcp` dispatch wired. Notification handling (skip response for `notifications/*`), id echoing fixed. `remember`, `recall`, `associate`, `get_memory` routes fully wired; full `inputSchema` for all four. 8 dispatch tests. Tool count corrected: 66 (not 63 — Python server has 66 as of 2026-06-10).
 **Step 7 done** — `cortex.rs` `remember()` + `recall()` + `associate()` fully wired. Pipeline: thalamus gate → amygdala → temporal → SQLite → vector embed → graph node; recall: FTS5/vec search → spreading activation → bulk SQLite load → prefrontal ranking. 6 new end-to-end tests. Total: 108 tests (68 unit + 40 integration).
 **Step 6 done** — all 8 deterministic engines implemented. Pure logic tested: thalamus gating/classify/salience, amygdala valence/arousal, temporal concept extraction/bigrams/enrich_node, association find_path/common_neighbors, prefrontal rank_results, neocortex tag helpers. Hippocampus/cerebellum stubbed (DB-driven, wired in step 7). 34 new unit tests.

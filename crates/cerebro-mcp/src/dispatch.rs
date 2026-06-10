@@ -906,6 +906,18 @@ async fn route(name: &str, args: &Value, brain: Arc<CerebroCortex>) -> anyhow::R
             }))
         }
 
+        "dream_run" => {
+            let max_llm_calls = args["max_llm_calls"].as_u64().unwrap_or(20) as usize;
+            let scope  = agent_scope(args);
+            let report = brain.dream.run_cycle(scope, Arc::clone(&brain), max_llm_calls).await?;
+            Ok(serde_json::to_value(&report)?)
+        }
+
+        "dream_status" => {
+            let report = brain.storage.read().await.sqlite.get_last_dream_report().await?;
+            Ok(report.unwrap_or(json!({ "status": "no_cycles_run" })))
+        }
+
         _ => Ok(json!({ "status": "not_yet_implemented", "tool": name })),
     }
 }
@@ -1078,17 +1090,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_stub_tool_returns_not_implemented() {
+    async fn dispatch_dream_run_returns_report() {
         let (brain, _dir) = make_brain().await;
         let msg = json!({
             "jsonrpc":"2.0","id":8,"method":"tools/call",
-            "params":{"name":"dream_run","arguments":{}}
+            "params":{"name":"dream_run","arguments":{"max_llm_calls":0}}
         });
         let resp = dispatch_tool(msg, brain).await;
-        // Stub tools return a result (not an error), with not_yet_implemented status
-        assert!(resp["error"].is_null(), "stub should not produce a protocol error");
+        assert!(resp["error"].is_null(), "dream_run should not produce a protocol error: {}", resp["error"]);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         let result: Value = serde_json::from_str(text).unwrap();
-        assert_eq!(result["status"], "not_yet_implemented");
+        // Report always has phases array (6 phases) and success field
+        assert!(result["phases"].is_array(), "dream report should have phases: {result}");
+        assert_eq!(result["phases"].as_array().unwrap().len(), 6);
+        assert!(result["success"].is_boolean());
     }
 }

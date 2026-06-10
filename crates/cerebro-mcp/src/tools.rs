@@ -805,6 +805,29 @@ fn tool_schema(name: &str) -> Value {
             }
         }),
 
+        "dream_run" => json!({
+            "name": "dream_run",
+            "description": "Run a full 6-phase memory consolidation cycle: SWS replay (Hebbian link strengthening), pattern extraction (procedural memory formation), schema formation (abstract principle generation), emotional reprocessing, pruning of stale memories, and REM recombination (unexpected semantic connections). LLM-assisted phases skip gracefully when no API key is configured.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "agent_id":      { "type": "string", "description": "Scope consolidation to a specific agent's memories" },
+                    "max_llm_calls": { "type": "integer", "description": "Cap on LLM API calls (default 20, max 20)", "default": 20 }
+                },
+                "required": []
+            }
+        }),
+
+        "dream_status" => json!({
+            "name": "dream_status",
+            "description": "Return the most recent dream consolidation report, or {\"status\": \"no_cycles_run\"} if no cycle has run yet.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }),
+
         _ => json!({
             "name": name,
             "description": format!("(stub) {name}"),

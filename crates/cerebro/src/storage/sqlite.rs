@@ -1265,6 +1265,76 @@ impl SqliteStore {
             Err(e) => Err(e.into()),
         }
     }
+
+    pub async fn has_link_between(&self, a: &MemoryId, b: &MemoryId) -> Result<bool> {
+        let conn = self.conn.lock().await;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM links \
+             WHERE (source_id = ?1 AND target_id = ?2) \
+                OR (source_id = ?2 AND target_id = ?1)",
+            params![a.0, b.0],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub async fn save_dream_report(
+        &self,
+        id:       &str,
+        agent_id: Option<&str>,
+        report:   &crate::engines::dream::DreamReport,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let phases_json = serde_json::to_string(&report.phases)?;
+        let metadata_json = serde_json::to_string(&serde_json::json!({
+            "total_llm_calls":     report.total_llm_calls,
+            "total_duration_secs": report.total_duration_secs,
+            "success":             report.success,
+        }))?;
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT OR REPLACE INTO dream_reports \
+             (id, agent_id, started_at, ended_at, phases, metadata) \
+             VALUES (?1, ?2, ?3, ?3, ?4, ?5)",
+            params![id, agent_id, now, phases_json, metadata_json],
+        )?;
+        Ok(())
+    }
+
+    pub async fn get_last_dream_report(&self) -> Result<Option<serde_json::Value>> {
+        let conn = self.conn.lock().await;
+        let result = conn.query_row(
+            "SELECT id, agent_id, started_at, ended_at, phases, metadata \
+             FROM dream_reports ORDER BY started_at DESC LIMIT 1",
+            [],
+            |r| Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+            )),
+        );
+        match result {
+            Ok((id, agent_id, started_at, ended_at, phases_json, metadata_json)) => {
+                let phases = serde_json::from_str::<serde_json::Value>(&phases_json)
+                    .unwrap_or(serde_json::Value::Array(vec![]));
+                let metadata = serde_json::from_str::<serde_json::Value>(&metadata_json)
+                    .unwrap_or(serde_json::Value::Null);
+                Ok(Some(serde_json::json!({
+                    "id":         id,
+                    "agent_id":   agent_id,
+                    "started_at": started_at,
+                    "ended_at":   ended_at,
+                    "phases":     phases,
+                    "metadata":   metadata,
+                })))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 const SCHEMA_SQL: &str = r#"
