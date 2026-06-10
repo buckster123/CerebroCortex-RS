@@ -122,7 +122,11 @@ impl VectorStore {
     ) -> Result<Vec<(MemoryId, f32)>> {
         if self.vec_available {
             if let Some(ref embedder) = self.embedder {
-                return self.vec_search(query, k, scope_sql, scope_params, embedder.clone()).await;
+                let results = self.vec_search(query, k, scope_sql, scope_params, embedder.clone()).await?;
+                if !results.is_empty() {
+                    return Ok(results);
+                }
+                // vec0 returned nothing (e.g. no embeddings stored yet) — fall through to FTS5
             }
         }
         self.fts5_search(query, k, scope_sql, scope_params).await
