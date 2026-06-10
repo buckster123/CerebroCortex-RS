@@ -2,7 +2,7 @@ pub mod graph;
 pub mod sqlite;
 pub mod vector;
 
-pub use sqlite::SqliteStore;
+pub use sqlite::{ListFilter, SqliteStore};
 
 /// StorageCoordinator owns all three storage backends and keeps them in sync.
 /// Graph and vector index are rebuilt from SQLite on init (single source of truth).

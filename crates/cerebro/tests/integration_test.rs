@@ -314,7 +314,12 @@ mod activation_fixtures {
 
 #[cfg(test)]
 mod storage_basic {
-    use cerebro::{config::Config, storage::StorageCoordinator};
+    use cerebro::{
+        config::Config,
+        models::{AssociativeLink, MemoryNode},
+        storage::{ListFilter, StorageCoordinator},
+        types::{AgentId, LinkType, MemoryType, Visibility, VisibilityScope},
+    };
     use tempfile::TempDir;
 
     async fn make_store() -> (StorageCoordinator, TempDir) {
@@ -334,8 +339,7 @@ mod storage_basic {
     }
 
     #[tokio::test]
-    async fn insert_and_schema_is_idempotent() {
-        // Opening twice should not fail (CREATE TABLE IF NOT EXISTS)
+    async fn schema_is_idempotent() {
         let dir = TempDir::new().unwrap();
         let config = Config {
             db_path:       dir.path().join("test.db"),
@@ -344,5 +348,139 @@ mod storage_basic {
         };
         StorageCoordinator::new(&config).await.unwrap();
         StorageCoordinator::new(&config).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn insert_and_get_memory_global_scope() {
+        let (store, _dir) = make_store().await;
+        let node = MemoryNode::new("hello world", MemoryType::Semantic);
+        let id   = node.id.clone();
+        store.sqlite.insert_memory(&node).await.unwrap();
+
+        let got = store.sqlite.get_memory(&id, &VisibilityScope::global()).await.unwrap();
+        let got = got.expect("should find the inserted memory");
+        assert_eq!(got.id, id);
+        assert_eq!(got.content, "hello world");
+        assert_eq!(got.memory_type, MemoryType::Semantic);
+        assert_eq!(got.visibility, Visibility::Shared);
+    }
+
+    #[tokio::test]
+    async fn get_memory_returns_none_for_missing_id() {
+        let (store, _dir) = make_store().await;
+        use cerebro::types::MemoryId;
+        let result = store.sqlite.get_memory(
+            &MemoryId("does-not-exist".into()),
+            &VisibilityScope::global(),
+        ).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn scope_filters_private_memories() {
+        let (store, _dir) = make_store().await;
+
+        // Private memory owned by agent-a
+        let mut node = MemoryNode::new("agent-a secret", MemoryType::Semantic);
+        node.visibility = Visibility::Private;
+        node.agent_id   = Some(AgentId("agent-a".into()));
+        let id = node.id.clone();
+        store.sqlite.insert_memory(&node).await.unwrap();
+
+        // agent-a can see it
+        let scope_a = VisibilityScope::for_agent(AgentId("agent-a".into()));
+        assert!(
+            store.sqlite.get_memory(&id, &scope_a).await.unwrap().is_some(),
+            "agent-a should see its own private memory"
+        );
+
+        // agent-b cannot see it
+        let scope_b = VisibilityScope::for_agent(AgentId("agent-b".into()));
+        assert!(
+            store.sqlite.get_memory(&id, &scope_b).await.unwrap().is_none(),
+            "agent-b must not see agent-a's private memory"
+        );
+
+        // global scope sees everything
+        assert!(
+            store.sqlite.get_memory(&id, &VisibilityScope::global()).await.unwrap().is_some(),
+            "global scope sees private memories"
+        );
+    }
+
+    #[tokio::test]
+    async fn soft_delete_hides_memory() {
+        let (store, _dir) = make_store().await;
+        let node = MemoryNode::new("to be deleted", MemoryType::Episodic);
+        let id   = node.id.clone();
+        store.sqlite.insert_memory(&node).await.unwrap();
+
+        let deleted = store.sqlite.delete_memory(&id).await.unwrap();
+        assert!(deleted, "first delete returns true");
+
+        // Should be invisible now
+        let got = store.sqlite.get_memory(&id, &VisibilityScope::global()).await.unwrap();
+        assert!(got.is_none(), "deleted memory must not appear in get_memory");
+
+        // Second delete returns false (already deleted)
+        let deleted2 = store.sqlite.delete_memory(&id).await.unwrap();
+        assert!(!deleted2, "double-delete returns false");
+    }
+
+    #[tokio::test]
+    async fn update_memory_persists_changes() {
+        let (store, _dir) = make_store().await;
+        let mut node = MemoryNode::new("original", MemoryType::Semantic);
+        let id = node.id.clone();
+        store.sqlite.insert_memory(&node).await.unwrap();
+
+        node.content = "updated content".into();
+        node.salience = 0.9;
+        store.sqlite.update_memory(&node).await.unwrap();
+
+        let got = store.sqlite.get_memory(&id, &VisibilityScope::global()).await.unwrap().unwrap();
+        assert_eq!(got.content, "updated content");
+        assert!((got.salience - 0.9).abs() < 1e-5, "salience should be 0.9, got {}", got.salience);
+    }
+
+    #[tokio::test]
+    async fn insert_link_and_list_links_from() {
+        let (store, _dir) = make_store().await;
+
+        let a = MemoryNode::new("node a", MemoryType::Semantic);
+        let b = MemoryNode::new("node b", MemoryType::Semantic);
+        let a_id = a.id.clone();
+        let b_id = b.id.clone();
+        store.sqlite.insert_memory(&a).await.unwrap();
+        store.sqlite.insert_memory(&b).await.unwrap();
+
+        let link = AssociativeLink::new(a_id.clone(), b_id.clone(), LinkType::Causal, 0.8);
+        store.sqlite.insert_link(&link).await.unwrap();
+
+        let links = store.sqlite.list_links_from(&a_id).await.unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].source_id, a_id);
+        assert_eq!(links[0].target_id, b_id);
+        assert!((links[0].weight - 0.8).abs() < 1e-5, "weight should be 0.8");
+
+        // No links from b
+        let links_b = store.sqlite.list_links_from(&b_id).await.unwrap();
+        assert!(links_b.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_memories_scoped_type_filter() {
+        let (store, _dir) = make_store().await;
+
+        store.sqlite.insert_memory(&MemoryNode::new("ep1", MemoryType::Episodic)).await.unwrap();
+        store.sqlite.insert_memory(&MemoryNode::new("ep2", MemoryType::Episodic)).await.unwrap();
+        store.sqlite.insert_memory(&MemoryNode::new("sem1", MemoryType::Semantic)).await.unwrap();
+
+        let filter = ListFilter { memory_type: Some(MemoryType::Episodic), limit: 50, offset: 0, include_deleted: false };
+        let results = store.sqlite.list_memories_scoped(&VisibilityScope::global(), &filter).await.unwrap();
+        assert_eq!(results.len(), 2, "should return 2 episodic memories, got {}", results.len());
+        for r in &results {
+            assert_eq!(r.memory_type, MemoryType::Episodic);
+        }
     }
 }

@@ -119,7 +119,7 @@ agentd never knows. Same 63 tools. Same MCP contract.
 |------|--------|------|--------|
 | 1 | `types.rs` + `models/` | Serde round-trips | ✓ 6 type tests pass |
 | 2 | `activation/` | Values match Python fixtures within 1e-4 | ✓ 41 fixture tests pass |
-| 3 | `storage/sqlite.rs` | Schema init, CRUD, scope filtering | ⬜ |
+| 3 | `storage/sqlite.rs` | Schema init, CRUD, scope filtering | ✓ 9 storage tests pass |
 | 4 | `storage/vector.rs` | sqlite-vec loads, cosine search, FTS5 fallback | ⬜ |
 | 5 | `storage/graph.rs` | petgraph rebuild + neighbor traversal | ⬜ |
 | 6 | `engines/` (thalamus→neocortex) | All 8 deterministic engines pass | ⬜ |
@@ -130,6 +130,14 @@ agentd never knows. Same 63 tools. Same MCP contract.
 | 11 | `cerebro-cli/` + `cerebro-api/` | CLI and REST parity | ⬜ |
 | 12 | DB compatibility | Rust reads a Python-generated `cerebro.db` | ⬜ |
 
+## Cerebro agent
+
+All Cerebro MCP calls in this project use agent `FORGE` (agent_id=`"FORGE"`, ⚒, #B7410E).
+Pass `agent_id: "FORGE"` to any Cerebro tool that accepts it so memories stay isolated from other projects.
+
+---
+
+**Step 3 done** — `storage/sqlite.rs` full CRUD with scope filtering.
 **Step 2 done.** Re-generate fixtures if Python source changes:
 ```bash
 /home/andre/Projects/CerebroCortex/venv/bin/python3 scripts/gen_activation_fixtures.py
