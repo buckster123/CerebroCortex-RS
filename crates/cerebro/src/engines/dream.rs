@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use anyhow::Result;
 use chrono::Utc;
-use rand::{seq::SliceRandom, Rng};
+use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -530,7 +530,7 @@ impl DreamEngine {
             return Ok(result);
         }
 
-        let mut rng = rand::thread_rng();
+        let mut rng = StdRng::from_entropy();
         let sample_count = all_ids.len().min(REM_SAMPLE_SIZE);
         let sample_ids: Vec<_> = all_ids
             .choose_multiple(&mut rng, sample_count)

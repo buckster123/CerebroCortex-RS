@@ -14,8 +14,10 @@ cerebro          = { path = "../cerebro" }
 tokio.workspace  = true
 axum.workspace   = true
 tower.workspace  = true
-serde.workspace  = true
+serde        = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+chrono.workspace  = true
+uuid.workspace    = true
