@@ -417,6 +417,38 @@ impl SqliteStore {
         }
         Ok(results)
     }
+
+    /// All non-deleted memory IDs — used by GraphStore::rebuild_from_db.
+    pub async fn list_all_memory_ids(&self) -> Result<Vec<MemoryId>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT id FROM memories WHERE deleted_at IS NULL"
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(MemoryId(row?));
+        }
+        Ok(ids)
+    }
+
+    /// All links whose both endpoints are non-deleted memories — for graph rebuild.
+    pub async fn list_all_links(&self) -> Result<Vec<AssociativeLink>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT l.source_id, l.target_id, l.link_type, l.weight, \
+                    l.created_at, l.last_traversed, l.traversal_count \
+             FROM links l \
+             JOIN memories ms ON ms.id = l.source_id AND ms.deleted_at IS NULL \
+             JOIN memories mt ON mt.id = l.target_id AND mt.deleted_at IS NULL"
+        )?;
+        let rows = stmt.query_map([], row_to_raw_link)?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?.into_link()?);
+        }
+        Ok(results)
+    }
 }
 
 const SCHEMA_SQL: &str = r#"

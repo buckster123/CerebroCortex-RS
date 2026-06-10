@@ -608,3 +608,113 @@ mod vector_store {
         );
     }
 }
+
+mod graph_store {
+    use cerebro::{
+        config::Config,
+        models::{AssociativeLink, MemoryNode},
+        storage::{graph::GraphStore, StorageCoordinator},
+        types::{LinkType, MemoryType},
+    };
+    use tempfile::TempDir;
+
+    async fn make_store() -> (StorageCoordinator, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let config = Config {
+            db_path:     dir.path().join("test.db"),
+            anthropic_key: None,
+            embed_model: "".into(),
+        };
+        let store = StorageCoordinator::new(&config).await.unwrap();
+        (store, dir)
+    }
+
+    #[tokio::test]
+    async fn rebuild_empty_graph() {
+        let (store, _dir) = make_store().await;
+        let graph = GraphStore::rebuild_from_db(&store.sqlite).await.unwrap();
+        assert_eq!(graph.graph.node_count(), 0);
+        assert_eq!(graph.graph.edge_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn rebuild_nodes_only() {
+        let (store, _dir) = make_store().await;
+        let a = MemoryNode::new("memory alpha", MemoryType::Semantic);
+        let b = MemoryNode::new("memory beta", MemoryType::Semantic);
+        let a_id = a.id.clone();
+        let b_id = b.id.clone();
+        store.sqlite.insert_memory(&a).await.unwrap();
+        store.sqlite.insert_memory(&b).await.unwrap();
+
+        let graph = GraphStore::rebuild_from_db(&store.sqlite).await.unwrap();
+        assert_eq!(graph.graph.node_count(), 2);
+        assert_eq!(graph.graph.edge_count(), 0);
+        assert!(graph.index.contains_key(&a_id));
+        assert!(graph.index.contains_key(&b_id));
+    }
+
+    #[tokio::test]
+    async fn rebuild_with_link_neighbors() {
+        let (store, _dir) = make_store().await;
+        let a = MemoryNode::new("node A", MemoryType::Semantic);
+        let b = MemoryNode::new("node B", MemoryType::Semantic);
+        let a_id = a.id.clone();
+        let b_id = b.id.clone();
+        store.sqlite.insert_memory(&a).await.unwrap();
+        store.sqlite.insert_memory(&b).await.unwrap();
+
+        let link = AssociativeLink::new(a_id.clone(), b_id.clone(), LinkType::Semantic, 0.8);
+        store.sqlite.insert_link(&link).await.unwrap();
+
+        let graph = GraphStore::rebuild_from_db(&store.sqlite).await.unwrap();
+        assert_eq!(graph.graph.node_count(), 2);
+        assert_eq!(graph.graph.edge_count(), 1);
+
+        let neighbors = graph.neighbors(&a_id);
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0], &b_id);
+
+        // B has no outbound edges
+        assert!(graph.neighbors(&b_id).is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleted_memories_excluded_from_graph() {
+        let (store, _dir) = make_store().await;
+        let a = MemoryNode::new("alive node", MemoryType::Semantic);
+        let b = MemoryNode::new("deleted node", MemoryType::Semantic);
+        let a_id = a.id.clone();
+        let b_id = b.id.clone();
+        store.sqlite.insert_memory(&a).await.unwrap();
+        store.sqlite.insert_memory(&b).await.unwrap();
+        store.sqlite.delete_memory(&b_id).await.unwrap();
+
+        let graph = GraphStore::rebuild_from_db(&store.sqlite).await.unwrap();
+        assert_eq!(graph.graph.node_count(), 1, "only non-deleted node expected");
+        assert!(graph.index.contains_key(&a_id));
+        assert!(!graph.index.contains_key(&b_id));
+    }
+
+    #[tokio::test]
+    async fn link_to_deleted_endpoint_excluded() {
+        let (store, _dir) = make_store().await;
+        let a = MemoryNode::new("alive", MemoryType::Semantic);
+        let b = MemoryNode::new("will be deleted", MemoryType::Semantic);
+        let a_id = a.id.clone();
+        let b_id = b.id.clone();
+        store.sqlite.insert_memory(&a).await.unwrap();
+        store.sqlite.insert_memory(&b).await.unwrap();
+
+        let link = AssociativeLink::new(a_id.clone(), b_id.clone(), LinkType::Semantic, 0.5);
+        store.sqlite.insert_link(&link).await.unwrap();
+
+        // Delete b — the link's target disappears
+        store.sqlite.delete_memory(&b_id).await.unwrap();
+
+        let graph = GraphStore::rebuild_from_db(&store.sqlite).await.unwrap();
+        assert_eq!(graph.graph.node_count(), 1);
+        assert_eq!(graph.graph.edge_count(), 0, "link to deleted target must be excluded");
+        assert!(graph.neighbors(&a_id).is_empty());
+    }
+}
