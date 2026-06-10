@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{path::Path, sync::{Arc, OnceLock}};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -11,10 +11,29 @@ use crate::{
     types::{AgentId, LinkType, MemoryId, VisibilityScope},
 };
 
+/// Register the sqlite-vec extension exactly once for the process.
+/// Uses sqlite3_auto_extension so every subsequent Connection::open* call has vec0.
+/// Returns true if the extension was successfully registered.
+fn register_sqlite_vec() -> bool {
+    static REGISTERED: OnceLock<bool> = OnceLock::new();
+    *REGISTERED.get_or_init(|| {
+        unsafe {
+            use rusqlite::ffi::sqlite3_auto_extension;
+            use sqlite_vec::sqlite3_vec_init;
+            // sqlite3_auto_extension expects void(*)(void); transmute is the
+            // canonical way to bridge the extension init signature in Rust.
+            sqlite3_auto_extension(Some(std::mem::transmute(sqlite3_vec_init as *const ())));
+        }
+        true
+    })
+}
+
 /// SQLite backend — single source of truth for all persistent state.
 /// Graph and vector index are derived from this; never written independently.
 pub struct SqliteStore {
-    conn: Mutex<Connection>,
+    conn:              Arc<Mutex<Connection>>,
+    /// True when sqlite-vec was successfully registered and the vec0 table exists.
+    pub vec_available: bool,
 }
 
 /// Filters for `list_memories_scoped`.
@@ -188,17 +207,33 @@ impl SqliteStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // Register sqlite-vec before opening so the extension is available on this connection.
+        register_sqlite_vec();
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
-        let store = Self { conn: Mutex::new(conn) };
-        store.init_schema().await?;
-        Ok(store)
+
+        // Base schema (no vec0 dependency)
+        conn.execute_batch(SCHEMA_SQL)?;
+
+        // Try to create the vec0 virtual table; works only if sqlite-vec loaded successfully.
+        let vec_available = conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS memory_vectors USING vec0(embedding float[384]);"
+        ).is_ok();
+        if vec_available {
+            tracing::info!("sqlite-vec loaded — vector search enabled");
+        } else {
+            tracing::warn!("vec0 table init failed — falling back to FTS5 keyword search");
+        }
+
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            vec_available,
+        })
     }
 
-    async fn init_schema(&self) -> Result<()> {
-        let conn = self.conn.lock().await;
-        conn.execute_batch(SCHEMA_SQL)?;
-        Ok(())
+    /// Clone the shared connection Arc — used by VectorStore and GraphStore.
+    pub fn shared_conn(&self) -> Arc<Mutex<Connection>> {
+        self.conn.clone()
     }
 
     // -----------------------------------------------------------------------

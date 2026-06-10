@@ -327,7 +327,9 @@ mod storage_basic {
         let config = Config {
             db_path:       dir.path().join("test.db"),
             anthropic_key: None,
-            embed_model:   "BAAI/bge-small-en-v1.5".into(),
+            // Empty string skips fastembed model download in tests.
+            // Vector search falls back to FTS5 in this configuration.
+            embed_model:   "".into(),
         };
         let store = StorageCoordinator::new(&config).await.unwrap();
         (store, dir)
@@ -344,7 +346,7 @@ mod storage_basic {
         let config = Config {
             db_path:       dir.path().join("test.db"),
             anthropic_key: None,
-            embed_model:   "BAAI/bge-small-en-v1.5".into(),
+            embed_model:   "".into(),
         };
         StorageCoordinator::new(&config).await.unwrap();
         StorageCoordinator::new(&config).await.unwrap();
@@ -482,5 +484,127 @@ mod storage_basic {
         for r in &results {
             assert_eq!(r.memory_type, MemoryType::Episodic);
         }
+    }
+}
+
+// =============================================================================
+// Step 4 — vector store (FTS5 path + embedding blob roundtrip)
+// Tests run without downloading the fastembed model (embed_model = "").
+// Vector index (vec0) may or may not be available depending on the build.
+// =============================================================================
+
+#[cfg(test)]
+mod vector_store {
+    use cerebro::{
+        config::Config,
+        models::MemoryNode,
+        storage::{StorageCoordinator, vector::{blob_to_vec, vec_to_blob}},
+        types::{MemoryType, VisibilityScope},
+    };
+    use tempfile::TempDir;
+
+    async fn make_store() -> (StorageCoordinator, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let store = StorageCoordinator::new(&Config {
+            db_path:       dir.path().join("test.db"),
+            anthropic_key: None,
+            embed_model:   "".into(),   // no fastembed in tests
+        }).await.unwrap();
+        (store, dir)
+    }
+
+    #[tokio::test]
+    async fn vec_store_constructs_without_error() {
+        let (_store, _dir) = make_store().await;
+    }
+
+    #[tokio::test]
+    async fn embedder_not_loaded_when_model_empty() {
+        let (store, _dir) = make_store().await;
+        assert!(!store.vector.is_embedder_loaded(), "embedder should be None when embed_model is empty");
+    }
+
+    #[tokio::test]
+    async fn embed_and_store_noop_when_no_embedder() {
+        let (store, _dir) = make_store().await;
+        let node = MemoryNode::new("test content", MemoryType::Semantic);
+        store.sqlite.insert_memory(&node).await.unwrap();
+
+        // Should return empty vec, no error
+        let result = store.vector.embed_and_store(&node.id, &node.content).await.unwrap();
+        assert!(result.is_empty(), "no embedder → empty return");
+    }
+
+    #[tokio::test]
+    async fn store_raw_embedding_roundtrip() {
+        let (store, _dir) = make_store().await;
+        let node = MemoryNode::new("embedding test", MemoryType::Semantic);
+        store.sqlite.insert_memory(&node).await.unwrap();
+
+        // Store a known 384-dim vector
+        let embedding: Vec<f32> = (0..384).map(|i| i as f32 / 384.0).collect();
+        store.vector.store_raw_embedding(&node.id, &embedding).await.unwrap();
+
+        // Read back from memories.embedding blob
+        let conn = store.sqlite.shared_conn();
+        let conn = conn.lock().await;
+        let blob: Vec<u8> = conn.query_row(
+            "SELECT embedding FROM memories WHERE id = ?",
+            rusqlite::params![node.id.0],
+            |r| r.get(0),
+        ).unwrap();
+
+        let recovered = blob_to_vec(&blob);
+        assert_eq!(recovered.len(), 384);
+        for (a, b) in embedding.iter().zip(recovered.iter()) {
+            assert!((a - b).abs() < 1e-7, "embedding roundtrip mismatch at index");
+        }
+    }
+
+    #[tokio::test]
+    async fn blob_vec_roundtrip() {
+        let v: Vec<f32> = vec![0.0, 0.5, -1.0, f32::MAX, f32::MIN_POSITIVE];
+        let blob = vec_to_blob(&v);
+        let back = blob_to_vec(&blob);
+        for (a, b) in v.iter().zip(back.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits(), "f32 bit-exact roundtrip failed");
+        }
+    }
+
+    #[tokio::test]
+    async fn fts5_search_returns_matching_ids() {
+        let (store, _dir) = make_store().await;
+
+        let a = MemoryNode::new("the quick brown fox jumps", MemoryType::Semantic);
+        let b = MemoryNode::new("lazy dog sat down", MemoryType::Semantic);
+        let a_id = a.id.clone();
+        store.sqlite.insert_memory(&a).await.unwrap();
+        store.sqlite.insert_memory(&b).await.unwrap();
+
+        // FTS5 search for "fox" — should return a only
+        let (scope_sql, scope_params) = VisibilityScope::global().sql_filter();
+        let results = store.vector.search("fox", 10, scope_sql, &scope_params).await.unwrap();
+        assert!(!results.is_empty(), "FTS5 should find 'fox'");
+        assert!(
+            results.iter().any(|(id, _)| id == &a_id),
+            "result should include the 'fox' memory"
+        );
+    }
+
+    #[tokio::test]
+    async fn fts5_search_scope_filters_deleted() {
+        let (store, _dir) = make_store().await;
+
+        let node = MemoryNode::new("unique xyzzy content", MemoryType::Semantic);
+        let id = node.id.clone();
+        store.sqlite.insert_memory(&node).await.unwrap();
+        store.sqlite.delete_memory(&id).await.unwrap();
+
+        let (scope_sql, scope_params) = VisibilityScope::global().sql_filter();
+        let results = store.vector.search("xyzzy", 10, scope_sql, &scope_params).await.unwrap();
+        assert!(
+            results.iter().all(|(rid, _)| rid != &id),
+            "deleted memory must not appear in search results"
+        );
     }
 }

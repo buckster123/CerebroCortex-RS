@@ -120,7 +120,7 @@ agentd never knows. Same 63 tools. Same MCP contract.
 | 1 | `types.rs` + `models/` | Serde round-trips | ✓ 6 type tests pass |
 | 2 | `activation/` | Values match Python fixtures within 1e-4 | ✓ 41 fixture tests pass |
 | 3 | `storage/sqlite.rs` | Schema init, CRUD, scope filtering | ✓ 9 storage tests pass |
-| 4 | `storage/vector.rs` | sqlite-vec loads, cosine search, FTS5 fallback | ⬜ |
+| 4 | `storage/vector.rs` | sqlite-vec loads, cosine search, FTS5 fallback | ✓ 7 vector tests pass |
 | 5 | `storage/graph.rs` | petgraph rebuild + neighbor traversal | ⬜ |
 | 6 | `engines/` (thalamus→neocortex) | All 8 deterministic engines pass | ⬜ |
 | 7 | `cortex.rs` | `remember()` + `recall()` end-to-end | ⬜ |
@@ -137,6 +137,7 @@ Pass `agent_id: "FORGE"` to any Cerebro tool that accepts it so memories stay is
 
 ---
 
+**Step 4 done** — `storage/vector.rs`: sqlite-vec auto-extension + FTS5 fallback. fastembed init is graceful (no model download in tests; pass `embed_model=""` to skip).
 **Step 3 done** — `storage/sqlite.rs` full CRUD with scope filtering.
 **Step 2 done.** Re-generate fixtures if Python source changes:
 ```bash
