@@ -117,8 +117,8 @@ agentd never knows. Same 63 tools. Same MCP contract.
 
 | Step | Module | Gate | Status |
 |------|--------|------|--------|
-| 1 | `types.rs` + `models/` | Serde round-trips | ✓ Scaffold (types_roundtrip tests pass) |
-| 2 | `activation/` | Values match Python fixtures within 1e-4 | ⬜ Generate fixtures first |
+| 1 | `types.rs` + `models/` | Serde round-trips | ✓ 6 type tests pass |
+| 2 | `activation/` | Values match Python fixtures within 1e-4 | ✓ 41 fixture tests pass |
 | 3 | `storage/sqlite.rs` | Schema init, CRUD, scope filtering | ⬜ |
 | 4 | `storage/vector.rs` | sqlite-vec loads, cosine search, FTS5 fallback | ⬜ |
 | 5 | `storage/graph.rs` | petgraph rebuild + neighbor traversal | ⬜ |
@@ -130,9 +130,9 @@ agentd never knows. Same 63 tools. Same MCP contract.
 | 11 | `cerebro-cli/` + `cerebro-api/` | CLI and REST parity | ⬜ |
 | 12 | DB compatibility | Rust reads a Python-generated `cerebro.db` | ⬜ |
 
-**Step 2 gate:** generate Python fixtures before writing any Rust activation code:
+**Step 2 done.** Re-generate fixtures if Python source changes:
 ```bash
-PYTHONPATH=../CerebroCortex/src python scripts/gen_activation_fixtures.py
+/home/andre/Projects/CerebroCortex/venv/bin/python3 scripts/gen_activation_fixtures.py
 ```
 
 ---
