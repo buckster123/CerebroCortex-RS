@@ -418,6 +418,59 @@ impl SqliteStore {
         Ok(results)
     }
 
+    /// Hard-delete a single memory (use after backup/purge confirmation).
+    pub async fn purge_memory(&self, id: &MemoryId) -> Result<bool> {
+        let conn = self.conn.lock().await;
+        let changed = conn.execute("DELETE FROM memories WHERE id = ?", params![id.0])?;
+        Ok(changed > 0)
+    }
+
+    /// Hard-delete all soft-deleted memories.
+    pub async fn purge_all_deleted(&self) -> Result<usize> {
+        let conn = self.conn.lock().await;
+        let changed = conn.execute("DELETE FROM memories WHERE deleted_at IS NOT NULL", [])?;
+        Ok(changed)
+    }
+
+    /// Restore a soft-deleted memory.
+    pub async fn restore_memory(&self, id: &MemoryId) -> Result<bool> {
+        let conn = self.conn.lock().await;
+        let changed = conn.execute(
+            "UPDATE memories SET deleted_at = NULL WHERE id = ? AND deleted_at IS NOT NULL",
+            params![id.0],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Aggregate counts: (total_live, total_deleted, count_per_type as JSON).
+    pub async fn memory_stats(&self) -> Result<serde_json::Value> {
+        let conn = self.conn.lock().await;
+        let live: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE deleted_at IS NULL", [], |r| r.get(0))?;
+        let deleted: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE deleted_at IS NOT NULL", [], |r| r.get(0))?;
+        let links: i64 = conn.query_row("SELECT COUNT(*) FROM links", [], |r| r.get(0))?;
+
+        let mut by_type: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+        let mut stmt = conn.prepare(
+            "SELECT memory_type, COUNT(*) FROM memories WHERE deleted_at IS NULL GROUP BY memory_type"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (t, count) = row?;
+            by_type.insert(t, serde_json::Value::Number(count.into()));
+        }
+
+        Ok(serde_json::json!({
+            "total_memories": live,
+            "deleted_memories": deleted,
+            "total_links": links,
+            "by_type": by_type,
+        }))
+    }
+
     /// Bulk-load memories by ID list — used by the recall pipeline.
     pub async fn get_memories_by_ids(&self, ids: &[MemoryId], scope: &VisibilityScope) -> Result<Vec<MemoryNode>> {
         if ids.is_empty() { return Ok(vec![]); }

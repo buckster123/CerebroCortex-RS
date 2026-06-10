@@ -10,7 +10,21 @@
       "Bash(git commit *)",
       "Bash(PYTHONPATH=../CerebroCortex/src python *)",
       "Bash(PYTHONPATH=../CerebroCortex/src python3 *)",
-      "Bash(cargo test *)"
+      "Bash(cargo test *)",
+      "mcp__cerebro-cortex__episode_start",
+      "mcp__cerebro-cortex__remember",
+      "mcp__cerebro-cortex__store_procedure",
+      "mcp__cerebro-cortex__episode_add_step",
+      "mcp__cerebro-cortex__episode_end",
+      "mcp__cerebro-cortex__session_save",
+      "Bash(dpkg -l)",
+      "Bash(apt-cache show *)",
+      "Bash(cargo search *)",
+      "Bash(cargo info *)",
+      "Bash(curl -s https://raw.githubusercontent.com/asg017/sqlite-vec/main/Cargo.toml)",
+      "Bash(cargo add *)",
+      "Bash(cargo build *)",
+      "Bash(grep \"\\\\.py$\")"
     ]
   }
 }

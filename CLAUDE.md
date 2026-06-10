@@ -125,7 +125,7 @@ agentd never knows. Same 63 tools. Same MCP contract.
 | 6 | `engines/` (thalamus→neocortex) | All 8 deterministic engines pass | ✓ 34 engine unit tests pass |
 | 7 | `cortex.rs` | `remember()` + `recall()` end-to-end | ✓ 6 cortex pipeline tests pass |
 | 8 | `cerebro-mcp/` (core tools) | MCP handshake + remember/recall vs agentd | ✓ 8 dispatch tests pass |
-| 9 | Remaining 61 MCP tools | Full tool surface | ⬜ |
+| 9 | Remaining 61 MCP tools | Full tool surface | ⬛ 13/66 wired |
 | 10 | `engines/dream.rs` | All 6 phases, live LLM calls | ⬜ |
 | 11 | `cerebro-cli/` + `cerebro-api/` | CLI and REST parity | ⬜ |
 | 12 | DB compatibility | Rust reads a Python-generated `cerebro.db` | ⬜ |

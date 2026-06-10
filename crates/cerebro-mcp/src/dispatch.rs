@@ -120,6 +120,114 @@ async fn route(name: &str, args: &Value, brain: Arc<CerebroCortex>) -> anyhow::R
             }
         }
 
+        "delete_memory" => {
+            let id = args["memory_id"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("memory_id is required"))?;
+            let deleted = brain.storage.read().await
+                .sqlite.delete_memory(&MemoryId(id.to_string())).await?;
+            Ok(json!({ "deleted": deleted }))
+        }
+
+        "update_memory" => {
+            let id = args["memory_id"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("memory_id is required"))?;
+            let scope = agent_scope(args);
+            let storage = brain.storage.read().await;
+            let mut node = storage.sqlite.get_memory(&MemoryId(id.to_string()), &scope).await?
+                .ok_or_else(|| anyhow::anyhow!("memory not found: {id}"))?;
+            drop(storage);
+
+            let content_changed = args["content"].as_str().is_some();
+            if let Some(c) = args["content"].as_str()  { node.content = c.to_string(); }
+            if let Some(s) = args["salience"].as_f64()  { node.salience = s as f32; }
+            if let Some(arr) = args["tags"].as_array() {
+                node.tags = arr.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+            }
+
+            let storage = brain.storage.read().await;
+            storage.sqlite.update_memory(&node).await?;
+            if content_changed {
+                storage.vector.embed_and_store(&node.id, &node.content).await?;
+            }
+            Ok(serde_json::to_value(&node)?)
+        }
+
+        // Aliases — same underlying logic, different param names
+        "memory_store" | "memory_search" => {
+            if name == "memory_store" {
+                let content = args["content"].as_str()
+                    .ok_or_else(|| anyhow::anyhow!("content is required"))?.to_string();
+                let scope = agent_scope(args);
+                let node = brain.remember(content, None, None, None, scope).await?;
+                Ok(serde_json::to_value(&node)?)
+            } else {
+                let query = args["query"].as_str()
+                    .ok_or_else(|| anyhow::anyhow!("query is required"))?;
+                let k     = args["top_k"].as_u64().unwrap_or(10) as usize;
+                let scope = agent_scope(args);
+                let results = brain.recall(query, k, scope).await?;
+                let out: Vec<Value> = results.into_iter()
+                    .map(|(node, score)| json!({ "memory": node, "score": score }))
+                    .collect();
+                Ok(json!(out))
+            }
+        }
+
+        "memory_neighbors" => {
+            let id    = args["memory_id"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("memory_id is required"))?;
+            let scope = agent_scope(args);
+            let storage = brain.storage.read().await;
+            let neighbor_ids: Vec<MemoryId> = storage.graph
+                .neighbors(&MemoryId(id.to_string()))
+                .into_iter().map(|id| id.clone()).collect();
+            let nodes = storage.sqlite.get_memories_by_ids(&neighbor_ids, &scope).await?;
+            Ok(serde_json::to_value(&nodes)?)
+        }
+
+        "find_path" => {
+            let src = args["source_id"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("source_id is required"))?;
+            let tgt = args["target_id"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("target_id is required"))?;
+            let storage = brain.storage.read().await;
+            let path = brain.association.find_path(
+                &storage.graph, &MemoryId(src.to_string()), &MemoryId(tgt.to_string()),
+            );
+            match path {
+                Some(ids) => Ok(json!({ "found": true, "path": ids })),
+                None      => Ok(json!({ "found": false, "path": [] })),
+            }
+        }
+
+        "common_neighbors" => {
+            let a = args["memory_id_a"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("memory_id_a is required"))?;
+            let b = args["memory_id_b"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("memory_id_b is required"))?;
+            let scope   = agent_scope(args);
+            let storage = brain.storage.read().await;
+            let common  = brain.association.get_common_neighbors(
+                &storage.graph, &MemoryId(a.to_string()), &MemoryId(b.to_string()),
+            );
+            let ids: Vec<MemoryId> = common;
+            let nodes = storage.sqlite.get_memories_by_ids(&ids, &scope).await?;
+            Ok(serde_json::to_value(&nodes)?)
+        }
+
+        "cortex_stats" => {
+            let stats = brain.storage.read().await.sqlite.memory_stats().await?;
+            Ok(stats)
+        }
+
+        "memory_graph_stats" => {
+            let storage = brain.storage.read().await;
+            Ok(json!({
+                "node_count": storage.graph.graph.node_count(),
+                "edge_count": storage.graph.graph.edge_count(),
+            }))
+        }
+
         _ => Ok(json!({ "status": "not_yet_implemented", "tool": name })),
     }
 }

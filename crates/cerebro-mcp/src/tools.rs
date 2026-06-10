@@ -85,6 +85,116 @@ fn tool_schema(name: &str) -> Value {
             }
         }),
 
+        "delete_memory" => json!({
+            "name": "delete_memory",
+            "description": "Soft-delete a memory (recoverable via restore_memory).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "memory_id": { "type": "string", "description": "Memory UUID to delete" },
+                    "agent_id":  { "type": "string" }
+                },
+                "required": ["memory_id"]
+            }
+        }),
+
+        "update_memory" => json!({
+            "name": "update_memory",
+            "description": "Update fields of an existing memory. Only provided fields are changed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "memory_id": { "type": "string", "description": "Memory UUID to update" },
+                    "content":   { "type": "string" },
+                    "tags":      { "anyOf": [{"type":"array","items":{"type":"string"}},{"type":"string"}] },
+                    "salience":  { "type": "number" },
+                    "agent_id":  { "type": "string" }
+                },
+                "required": ["memory_id"]
+            }
+        }),
+
+        "memory_store" => json!({
+            "name": "memory_store",
+            "description": "Save information to memory (alias for 'remember').",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "content":   { "type": "string" },
+                    "agent_id":  { "type": "string" },
+                    "tags":      { "anyOf": [{"type":"array","items":{"type":"string"}},{"type":"string"}] }
+                },
+                "required": ["content"]
+            }
+        }),
+
+        "memory_search" => json!({
+            "name": "memory_search",
+            "description": "Search memories by meaning (alias for 'recall').",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query":    { "type": "string" },
+                    "top_k":   { "type": "integer" },
+                    "agent_id": { "type": "string" }
+                },
+                "required": ["query"]
+            }
+        }),
+
+        "memory_neighbors" => json!({
+            "name": "memory_neighbors",
+            "description": "Return all directly linked memories of a given memory.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "memory_id": { "type": "string" },
+                    "agent_id":  { "type": "string" }
+                },
+                "required": ["memory_id"]
+            }
+        }),
+
+        "find_path" => json!({
+            "name": "find_path",
+            "description": "Find the shortest directed path between two memories in the association graph.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "source_id": { "type": "string" },
+                    "target_id": { "type": "string" },
+                    "agent_id":  { "type": "string" }
+                },
+                "required": ["source_id","target_id"]
+            }
+        }),
+
+        "common_neighbors" => json!({
+            "name": "common_neighbors",
+            "description": "Find memories directly linked to both of two given memories.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "memory_id_a": { "type": "string" },
+                    "memory_id_b": { "type": "string" },
+                    "agent_id":    { "type": "string" }
+                },
+                "required": ["memory_id_a","memory_id_b"]
+            }
+        }),
+
+        "cortex_stats" => json!({
+            "name": "cortex_stats",
+            "description": "Return aggregate statistics: total memories, deleted, links, counts by type.",
+            "inputSchema": { "type": "object", "properties": {}, "required": [] }
+        }),
+
+        "memory_graph_stats" => json!({
+            "name": "memory_graph_stats",
+            "description": "Return the in-memory association graph node and edge counts.",
+            "inputSchema": { "type": "object", "properties": {}, "required": [] }
+        }),
+
         _ => json!({
             "name": name,
             "description": format!("(stub) {name}"),
