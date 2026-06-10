@@ -2,10 +2,12 @@ use std::sync::Arc;
 
 use cerebro::{
     models::AssociativeLink,
+    storage::ListFilter,
     types::{AgentId, LinkType, MemoryId, MemoryType, VisibilityScope},
     CerebroCortex,
 };
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 use crate::tools;
 
@@ -226,6 +228,412 @@ async fn route(name: &str, args: &Value, brain: Arc<CerebroCortex>) -> anyhow::R
                 "node_count": storage.graph.graph.node_count(),
                 "edge_count": storage.graph.graph.edge_count(),
             }))
+        }
+
+        // ------------------------------------------------------------------ //
+        // Session save / recall (FORGE-critical: tag-convention over episodic)
+        // ------------------------------------------------------------------ //
+
+        "session_save" => {
+            let content = args["content"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("content is required"))?.to_string();
+            let priority     = args["priority"].as_str().unwrap_or("medium");
+            let session_type = args["session_type"].as_str().unwrap_or("general");
+            let scope        = agent_scope(args);
+            let mut tags = vec![
+                "session_note".to_string(),
+                format!("priority:{priority}"),
+                format!("session_type:{session_type}"),
+            ];
+            if let Some(aid) = args["agent_id"].as_str().filter(|s| !s.is_empty()) {
+                tags.push(format!("agent:{aid}"));
+            }
+            let node = brain.remember(
+                content,
+                Some(MemoryType::Episodic),
+                Some(tags),
+                args["salience"].as_f64().map(|f| f as f32),
+                scope,
+            ).await?;
+            Ok(serde_json::to_value(&node)?)
+        }
+
+        "session_recall" => {
+            let query  = args["query"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("query is required"))?;
+            let k               = args["top_k"].as_u64().unwrap_or(10) as usize;
+            let priority_filter = args["priority"].as_str();
+            let type_filter     = args["session_type"].as_str();
+            let scope           = agent_scope(args);
+            // Over-fetch so filtering doesn't deplete results
+            let results = brain.recall(query, k * 5, scope).await?;
+            let out: Vec<Value> = results.into_iter()
+                .filter(|(n, _)| n.tags.iter().any(|t| t == "session_note"))
+                .filter(|(n, _)| priority_filter.map_or(true, |p|
+                    n.tags.iter().any(|t| t == &format!("priority:{p}"))))
+                .filter(|(n, _)| type_filter.map_or(true, |st|
+                    n.tags.iter().any(|t| t == &format!("session_type:{st}"))))
+                .take(k)
+                .map(|(node, score)| json!({ "memory": node, "score": score }))
+                .collect();
+            Ok(json!(out))
+        }
+
+        // ------------------------------------------------------------------ //
+        // CRUD — deleted-memory lifecycle
+        // ------------------------------------------------------------------ //
+
+        "list_deleted" => {
+            let scope = agent_scope(args);
+            let limit = args["limit"].as_u64().unwrap_or(50) as usize;
+            let nodes = brain.storage.read().await
+                .sqlite.list_deleted_memories(&scope, limit).await?;
+            Ok(serde_json::to_value(&nodes)?)
+        }
+
+        "restore_memory" => {
+            let id = args["memory_id"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("memory_id is required"))?;
+            let restored = brain.storage.read().await
+                .sqlite.restore_memory(&MemoryId(id.to_string())).await?;
+            Ok(json!({ "restored": restored }))
+        }
+
+        "purge_memory" => {
+            let id = args["memory_id"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("memory_id is required"))?;
+            let purged = brain.storage.read().await
+                .sqlite.purge_memory(&MemoryId(id.to_string())).await?;
+            Ok(json!({ "purged": purged }))
+        }
+
+        "purge_all_deleted" => {
+            let count = brain.storage.read().await
+                .sqlite.purge_all_deleted().await?;
+            Ok(json!({ "purged_count": count }))
+        }
+
+        "bulk_delete" => {
+            let ids: Vec<MemoryId> = args["memory_ids"].as_array()
+                .ok_or_else(|| anyhow::anyhow!("memory_ids (array) is required"))?
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| MemoryId(s.to_string())))
+                .collect();
+            let count = brain.storage.read().await
+                .sqlite.bulk_delete(&ids).await?;
+            Ok(json!({ "deleted_count": count }))
+        }
+
+        "export_memories" => {
+            let scope       = agent_scope(args);
+            let memory_type = serde_json::from_value(args["memory_type"].clone()).ok();
+            let limit       = args["limit"].as_u64().unwrap_or(1000) as usize;
+            let nodes = brain.storage.read().await
+                .sqlite.list_memories_scoped(&scope, &ListFilter {
+                    memory_type,
+                    limit,
+                    ..Default::default()
+                }).await?;
+            Ok(serde_json::to_value(&nodes)?)
+        }
+
+        // ------------------------------------------------------------------ //
+        // Agent registry
+        // ------------------------------------------------------------------ //
+
+        "register_agent" => {
+            let id = args["agent_id"].as_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| Uuid::new_v4().to_string());
+            let name = args["name"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("name is required"))?;
+            let description = args["description"].as_str();
+            let metadata = if args["metadata"].is_null() { json!(null) } else { args["metadata"].clone() };
+            brain.storage.read().await
+                .sqlite.register_agent(&id, name, description, &metadata).await?;
+            Ok(json!({ "agent_id": id, "status": "registered" }))
+        }
+
+        "list_agents" => {
+            let agents = brain.storage.read().await.sqlite.list_agents().await?;
+            Ok(json!(agents))
+        }
+
+        "share_memory" => {
+            let id      = args["memory_id"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("memory_id is required"))?;
+            let target  = args["target_agent_id"].as_str();
+            let updated = brain.storage.read().await
+                .sqlite.share_memory(&MemoryId(id.to_string()), target).await?;
+            Ok(json!({ "updated": updated }))
+        }
+
+        // ------------------------------------------------------------------ //
+        // Messaging (tag-routed: "to:{agent}", "from:{agent}")
+        // ------------------------------------------------------------------ //
+
+        "send_message" => {
+            let content  = args["content"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("content is required"))?.to_string();
+            let to_agent = args["to_agent_id"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("to_agent_id is required"))?;
+            let from_agent = args["from_agent_id"].as_str()
+                .or_else(|| args["agent_id"].as_str())
+                .unwrap_or("unknown");
+            let thread_id = args["thread_id"].as_str().map(str::to_string);
+            let scope     = agent_scope(args);
+            let tags = vec![
+                "message".to_string(),
+                format!("to:{to_agent}"),
+                format!("from:{from_agent}"),
+            ];
+            let mut node = brain.remember(
+                content, Some(MemoryType::Affective), Some(tags), None, scope,
+            ).await?;
+            if let Some(tid) = thread_id {
+                node.thread_id = Some(tid);
+                brain.storage.read().await.sqlite.update_memory(&node).await?;
+            }
+            Ok(serde_json::to_value(&node)?)
+        }
+
+        "check_inbox" => {
+            let agent_id = args["agent_id"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("agent_id is required"))?;
+            let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+            let nodes = brain.storage.read().await
+                .sqlite.check_inbox(agent_id, &VisibilityScope::global(), limit).await?;
+            Ok(serde_json::to_value(&nodes)?)
+        }
+
+        // ------------------------------------------------------------------ //
+        // Thread operations
+        // ------------------------------------------------------------------ //
+
+        "list_threads" => {
+            let scope   = agent_scope(args);
+            let threads = brain.storage.read().await.sqlite.list_threads(&scope).await?;
+            Ok(json!(threads))
+        }
+
+        "get_thread_memories" => {
+            let thread_id = args["thread_id"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("thread_id is required"))?;
+            let scope = agent_scope(args);
+            let nodes = brain.storage.read().await
+                .sqlite.get_thread_memories(thread_id, &scope).await?;
+            Ok(serde_json::to_value(&nodes)?)
+        }
+
+        "prune_thread" => {
+            let thread_id = args["thread_id"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("thread_id is required"))?;
+            let count = brain.storage.read().await.sqlite.prune_thread(thread_id).await?;
+            Ok(json!({ "pruned_count": count }))
+        }
+
+        // ------------------------------------------------------------------ //
+        // Tag operations
+        // ------------------------------------------------------------------ //
+
+        "list_tags" => {
+            let scope = agent_scope(args);
+            let tags  = brain.storage.read().await.sqlite.list_tags(&scope).await?;
+            Ok(json!(tags))
+        }
+
+        "delete_tag" => {
+            let tag   = args["tag"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("tag is required"))?;
+            let count = brain.storage.read().await
+                .sqlite.delete_tag_everywhere(tag).await?;
+            Ok(json!({ "updated_memories": count }))
+        }
+
+        "rename_tag" => {
+            let old_tag = args["old_tag"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("old_tag is required"))?;
+            let new_tag = args["new_tag"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("new_tag is required"))?;
+            let count = brain.storage.read().await
+                .sqlite.rename_tag_everywhere(old_tag, new_tag).await?;
+            Ok(json!({ "updated_memories": count }))
+        }
+
+        "merge_tags" => {
+            // merge source_tag into target_tag = rename source → target everywhere
+            let source_tag = args["source_tag"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("source_tag is required"))?;
+            let target_tag = args["target_tag"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("target_tag is required"))?;
+            let count = brain.storage.read().await
+                .sqlite.rename_tag_everywhere(source_tag, target_tag).await?;
+            Ok(json!({ "merged_memories": count, "merged_into": target_tag }))
+        }
+
+        // ------------------------------------------------------------------ //
+        // Analytics
+        // ------------------------------------------------------------------ //
+
+        "emotional_summary" => {
+            let scope = agent_scope(args);
+            let summary = brain.storage.read().await.sqlite.emotional_summary(&scope).await?;
+            Ok(summary)
+        }
+
+        "activation_at_risk" => {
+            let threshold = args["threshold"].as_f64().unwrap_or(0.7) as f32;
+            let limit     = args["limit"].as_u64().unwrap_or(20) as usize;
+            let scope     = agent_scope(args);
+            let at_risk   = brain.storage.read().await
+                .sqlite.activation_at_risk(&scope, threshold, limit).await?;
+            Ok(json!(at_risk))
+        }
+
+        "memory_health" => {
+            let scope  = agent_scope(args);
+            let health = brain.storage.read().await.sqlite.memory_health(&scope).await?;
+            Ok(health)
+        }
+
+        "activation_curve" => {
+            let id    = args["memory_id"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("memory_id is required"))?;
+            let scope = agent_scope(args);
+            let node  = brain.storage.read().await
+                .sqlite.get_memory(&MemoryId(id.to_string()), &scope).await?
+                .ok_or_else(|| anyhow::anyhow!("memory not found: {id}"))?;
+            Ok(json!({
+                "memory_id":        id,
+                "access_count":     node.access_count,
+                "access_times":     node.access_times,
+                "fsrs_stability":   node.strength.stability,
+                "fsrs_difficulty":  node.strength.difficulty,
+                "fsrs_last_review": node.strength.last_review,
+            }))
+        }
+
+        "activation_heatmap" => {
+            let scope   = agent_scope(args);
+            let heatmap = brain.storage.read().await
+                .sqlite.activation_heatmap(&scope).await?;
+            Ok(heatmap)
+        }
+
+        "check_near_duplicates" => {
+            let threshold = args["threshold"].as_f64().unwrap_or(0.9) as f32;
+            let limit     = args["limit"].as_u64().unwrap_or(50) as usize;
+            let scope     = agent_scope(args);
+            let (scope_sql, scope_params) = scope.sql_filter();
+
+            let storage    = brain.storage.read().await;
+            let candidates = storage.sqlite.list_memories_scoped(
+                &scope, &ListFilter { limit, ..Default::default() },
+            ).await?;
+
+            let mut pairs: Vec<Value> = Vec::new();
+            let mut seen: std::collections::HashSet<String> = Default::default();
+
+            for node in &candidates {
+                let results = storage.vector
+                    .search(&node.content, 5, scope_sql, &scope_params).await?;
+                for (result_id, sim) in results {
+                    if result_id != node.id && sim >= threshold {
+                        let (a, b) = if node.id.0 < result_id.0 {
+                            (node.id.0.clone(), result_id.0.clone())
+                        } else {
+                            (result_id.0.clone(), node.id.0.clone())
+                        };
+                        if seen.insert(format!("{a}:{b}")) {
+                            pairs.push(json!({
+                                "memory_id_a": a, "memory_id_b": b, "similarity": sim,
+                            }));
+                        }
+                    }
+                }
+            }
+            Ok(json!({ "duplicates": pairs, "threshold": threshold }))
+        }
+
+        // ------------------------------------------------------------------ //
+        // Episodes (tables already in schema)
+        // ------------------------------------------------------------------ //
+
+        "episode_start" => {
+            let ep_id     = format!("ep_{}", Uuid::new_v4().simple());
+            let title     = args["title"].as_str();
+            let agent_id  = args["agent_id"].as_str();
+            let thread_id = args["thread_id"].as_str();
+            brain.storage.read().await
+                .sqlite.create_episode(&ep_id, title, agent_id, thread_id).await?;
+            Ok(json!({ "episode_id": ep_id, "status": "started" }))
+        }
+
+        "episode_add_step" => {
+            let episode_id  = args["episode_id"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("episode_id is required"))?;
+            let step_index  = args["step_index"].as_i64().unwrap_or(0);
+            let description = args["description"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("description is required"))?;
+            let memory_id   = args["memory_id"].as_str();
+            brain.storage.read().await
+                .sqlite.add_episode_step(episode_id, step_index, description, memory_id).await?;
+            Ok(json!({ "status": "ok", "episode_id": episode_id, "step_index": step_index }))
+        }
+
+        "episode_end" => {
+            let episode_id = args["episode_id"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("episode_id is required"))?;
+            let summary = args["summary"].as_str();
+            let ended   = brain.storage.read().await
+                .sqlite.end_episode(episode_id, summary).await?;
+            Ok(json!({ "ended": ended, "episode_id": episode_id }))
+        }
+
+        "get_episode" => {
+            let episode_id = args["episode_id"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("episode_id is required"))?;
+            let ep = brain.storage.read().await
+                .sqlite.get_episode_raw(episode_id).await?;
+            match ep {
+                Some(v) => Ok(v),
+                None    => Err(anyhow::anyhow!("episode not found: {episode_id}")),
+            }
+        }
+
+        "list_episodes" => {
+            let agent_id = args["agent_id"].as_str();
+            let limit    = args["limit"].as_u64().unwrap_or(20) as usize;
+            let episodes = brain.storage.read().await
+                .sqlite.list_episodes(agent_id, limit).await?;
+            Ok(json!(episodes))
+        }
+
+        "get_episode_memories" => {
+            let episode_id = args["episode_id"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("episode_id is required"))?;
+            let scope   = agent_scope(args);
+            let storage = brain.storage.read().await;
+            let ids     = storage.sqlite.get_episode_memory_ids(episode_id).await?;
+            let nodes   = storage.sqlite.get_memories_by_ids(&ids, &scope).await?;
+            Ok(serde_json::to_value(&nodes)?)
+        }
+
+        // ------------------------------------------------------------------ //
+        // Audit log (table already in schema)
+        // ------------------------------------------------------------------ //
+
+        "audit_summary" => {
+            let summary = brain.storage.read().await.sqlite.audit_summary().await?;
+            Ok(summary)
+        }
+
+        "query_audit" => {
+            let limit         = args["limit"].as_u64().unwrap_or(50) as usize;
+            let agent_id_filt = args["agent_id"].as_str();
+            let entries       = brain.storage.read().await
+                .sqlite.query_audit(limit, agent_id_filt).await?;
+            Ok(json!(entries))
         }
 
         _ => Ok(json!({ "status": "not_yet_implemented", "tool": name })),

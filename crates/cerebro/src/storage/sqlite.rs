@@ -523,6 +523,639 @@ impl SqliteStore {
         }
         Ok(results)
     }
+
+    // -----------------------------------------------------------------------
+    // Deleted-memory helpers
+    // -----------------------------------------------------------------------
+
+    pub async fn list_deleted_memories(&self, scope: &VisibilityScope, limit: usize) -> Result<Vec<MemoryNode>> {
+        let conn = self.conn.lock().await;
+        let (scope_sql, scope_params) = scope.sql_filter();
+        let sql = format!(
+            "SELECT {SELECT_COLS} FROM memories WHERE {scope_sql} AND deleted_at IS NOT NULL \
+             ORDER BY deleted_at DESC LIMIT ?"
+        );
+        let limit_val = limit as i64;
+        let mut dp: Vec<&dyn rusqlite::ToSql> =
+            scope_params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        dp.push(&limit_val);
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(dp.as_slice(), row_to_raw)?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r?.into_memory_node()?); }
+        Ok(out)
+    }
+
+    pub async fn bulk_delete(&self, ids: &[MemoryId]) -> Result<usize> {
+        if ids.is_empty() { return Ok(0); }
+        let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "UPDATE memories SET deleted_at = ? WHERE id IN ({placeholders}) AND deleted_at IS NULL"
+        );
+        let conn = self.conn.lock().await;
+        let now = Utc::now().to_rfc3339();
+        let id_strs: Vec<String> = ids.iter().map(|id| id.0.clone()).collect();
+        let mut dp: Vec<&dyn rusqlite::ToSql> = vec![&now as &dyn rusqlite::ToSql];
+        for s in &id_strs { dp.push(s); }
+        Ok(conn.execute(&sql, dp.as_slice())?)
+    }
+
+    // -----------------------------------------------------------------------
+    // Agent registry
+    // -----------------------------------------------------------------------
+
+    pub async fn register_agent(
+        &self,
+        id: &str,
+        name: &str,
+        description: Option<&str>,
+        metadata: &serde_json::Value,
+    ) -> Result<()> {
+        let conn = self.conn.lock().await;
+        let now = Utc::now().to_rfc3339();
+        let meta_str = serde_json::to_string(metadata)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO agents \
+             (id, name, description, registered_at, last_seen, metadata) \
+             VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+            params![id, name, description, now, meta_str],
+        )?;
+        Ok(())
+    }
+
+    pub async fn list_agents(&self) -> Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, description, registered_at, last_seen, metadata \
+             FROM agents ORDER BY name"
+        )?;
+        let rows = stmt.query_map([], |r| Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, Option<String>>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, Option<String>>(4)?,
+            r.get::<_, String>(5)?,
+        )))?;
+        let mut agents = Vec::new();
+        for row in rows {
+            let (id, name, desc, reg_at, last_seen, meta_str) = row?;
+            let metadata: serde_json::Value =
+                serde_json::from_str(&meta_str).unwrap_or(serde_json::Value::Null);
+            agents.push(serde_json::json!({
+                "id": id, "name": name, "description": desc,
+                "registered_at": reg_at, "last_seen": last_seen,
+                "metadata": metadata,
+            }));
+        }
+        Ok(agents)
+    }
+
+    pub async fn share_memory(&self, memory_id: &MemoryId, target_agent_id: Option<&str>) -> Result<bool> {
+        let conn = self.conn.lock().await;
+        let changed = if let Some(aid) = target_agent_id {
+            conn.execute(
+                "UPDATE memories SET visibility='private', agent_id=?1 \
+                 WHERE id=?2 AND deleted_at IS NULL",
+                params![aid, memory_id.0],
+            )?
+        } else {
+            conn.execute(
+                "UPDATE memories SET visibility='shared', agent_id=NULL \
+                 WHERE id=?1 AND deleted_at IS NULL",
+                params![memory_id.0],
+            )?
+        };
+        Ok(changed > 0)
+    }
+
+    // -----------------------------------------------------------------------
+    // Thread operations
+    // -----------------------------------------------------------------------
+
+    pub async fn list_threads(&self, scope: &VisibilityScope) -> Result<Vec<String>> {
+        let conn = self.conn.lock().await;
+        let (scope_sql, scope_params) = scope.sql_filter();
+        let sql = format!(
+            "SELECT DISTINCT thread_id FROM memories \
+             WHERE {scope_sql} AND deleted_at IS NULL AND thread_id IS NOT NULL \
+             ORDER BY thread_id"
+        );
+        let dp: Vec<&dyn rusqlite::ToSql> =
+            scope_params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(dp.as_slice(), |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r?); }
+        Ok(out)
+    }
+
+    pub async fn get_thread_memories(
+        &self,
+        thread_id: &str,
+        scope: &VisibilityScope,
+    ) -> Result<Vec<MemoryNode>> {
+        let conn = self.conn.lock().await;
+        let (scope_sql, scope_params) = scope.sql_filter();
+        let sql = format!(
+            "SELECT {SELECT_COLS} FROM memories \
+             WHERE {scope_sql} AND deleted_at IS NULL AND thread_id = ? \
+             ORDER BY created_at ASC"
+        );
+        let tid = thread_id.to_string();
+        let mut dp: Vec<&dyn rusqlite::ToSql> =
+            scope_params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        dp.push(&tid as &dyn rusqlite::ToSql);
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(dp.as_slice(), row_to_raw)?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r?.into_memory_node()?); }
+        Ok(out)
+    }
+
+    pub async fn prune_thread(&self, thread_id: &str) -> Result<usize> {
+        let conn = self.conn.lock().await;
+        Ok(conn.execute(
+            "UPDATE memories SET deleted_at=?1 WHERE thread_id=?2 AND deleted_at IS NULL",
+            params![Utc::now().to_rfc3339(), thread_id],
+        )?)
+    }
+
+    // -----------------------------------------------------------------------
+    // Inbox (tag-based messaging: tag = "to:{agent_id}")
+    // -----------------------------------------------------------------------
+
+    pub async fn check_inbox(
+        &self,
+        agent_id: &str,
+        scope: &VisibilityScope,
+        limit: usize,
+    ) -> Result<Vec<MemoryNode>> {
+        let conn = self.conn.lock().await;
+        let (scope_sql, scope_params) = scope.sql_filter();
+        let tag_val = format!("to:{agent_id}");
+        let limit_val = limit as i64;
+        let sql = format!(
+            "SELECT {SELECT_COLS} FROM memories \
+             WHERE {scope_sql} AND deleted_at IS NULL \
+               AND EXISTS (SELECT 1 FROM json_each(tags) WHERE value = ?) \
+             ORDER BY created_at DESC LIMIT ?"
+        );
+        let mut dp: Vec<&dyn rusqlite::ToSql> =
+            scope_params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        dp.push(&tag_val as &dyn rusqlite::ToSql);
+        dp.push(&limit_val as &dyn rusqlite::ToSql);
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(dp.as_slice(), row_to_raw)?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r?.into_memory_node()?); }
+        Ok(out)
+    }
+
+    // -----------------------------------------------------------------------
+    // Tag operations (operate on memories.tags JSON array)
+    // -----------------------------------------------------------------------
+
+    pub async fn list_tags(&self, scope: &VisibilityScope) -> Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().await;
+        let (scope_sql, scope_params) = scope.sql_filter();
+        let sql = format!(
+            "SELECT value, COUNT(*) as cnt \
+             FROM memories, json_each(memories.tags) \
+             WHERE {scope_sql} AND deleted_at IS NULL \
+             GROUP BY value ORDER BY cnt DESC"
+        );
+        let dp: Vec<&dyn rusqlite::ToSql> =
+            scope_params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(dp.as_slice(), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (tag, cnt) = r?;
+            out.push(serde_json::json!({ "tag": tag, "count": cnt }));
+        }
+        Ok(out)
+    }
+
+    pub async fn delete_tag_everywhere(&self, tag: &str) -> Result<usize> {
+        let conn = self.conn.lock().await;
+        Ok(conn.execute(
+            "UPDATE memories \
+             SET tags = IFNULL(\
+                 (SELECT json_group_array(value) FROM json_each(tags) WHERE value != ?1), '[]') \
+             WHERE deleted_at IS NULL \
+               AND EXISTS (SELECT 1 FROM json_each(tags) WHERE value = ?1)",
+            params![tag],
+        )?)
+    }
+
+    pub async fn rename_tag_everywhere(&self, old_tag: &str, new_tag: &str) -> Result<usize> {
+        let conn = self.conn.lock().await;
+        Ok(conn.execute(
+            "UPDATE memories \
+             SET tags = (\
+                 SELECT json_group_array(CASE WHEN value = ?1 THEN ?2 ELSE value END) \
+                 FROM json_each(tags)) \
+             WHERE deleted_at IS NULL \
+               AND EXISTS (SELECT 1 FROM json_each(tags) WHERE value = ?1)",
+            params![old_tag, new_tag],
+        )?)
+    }
+
+    // -----------------------------------------------------------------------
+    // Analytics
+    // -----------------------------------------------------------------------
+
+    pub async fn emotional_summary(&self, scope: &VisibilityScope) -> Result<serde_json::Value> {
+        let conn = self.conn.lock().await;
+        let (scope_sql, scope_params) = scope.sql_filter();
+        let sql = format!(
+            "SELECT emotional_valence, COUNT(*), AVG(emotional_intensity) \
+             FROM memories WHERE {scope_sql} AND deleted_at IS NULL \
+             GROUP BY emotional_valence"
+        );
+        let dp: Vec<&dyn rusqlite::ToSql> =
+            scope_params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(dp.as_slice(), |r| Ok((
+            r.get::<_, Option<String>>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, f64>(2)?,
+        )))?;
+        let mut by_valence = serde_json::Map::new();
+        let (mut total, mut total_intensity) = (0i64, 0.0f64);
+        for r in rows {
+            let (valence, cnt, avg_i) = r?;
+            let key = valence.unwrap_or_else(|| "neutral".to_string());
+            by_valence.insert(key, serde_json::json!({ "count": cnt, "avg_intensity": avg_i }));
+            total += cnt;
+            total_intensity += avg_i * cnt as f64;
+        }
+        Ok(serde_json::json!({
+            "by_valence": by_valence,
+            "total_with_emotion": total,
+            "avg_intensity": if total > 0 { total_intensity / total as f64 } else { 0.0 },
+        }))
+    }
+
+    /// Memories whose FSRS retrievability falls below `threshold`.
+    /// R(t) = exp(-t / stability), where t = days since last review.
+    pub async fn activation_at_risk(
+        &self,
+        scope: &VisibilityScope,
+        threshold: f32,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().await;
+        let (scope_sql, scope_params) = scope.sql_filter();
+        let sql = format!(
+            "SELECT id, content, fsrs_stability, fsrs_last_review, salience, memory_type \
+             FROM memories \
+             WHERE {scope_sql} AND deleted_at IS NULL AND fsrs_last_review IS NOT NULL"
+        );
+        let dp: Vec<&dyn rusqlite::ToSql> =
+            scope_params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(dp.as_slice(), |r| Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, f64>(2)? as f32,
+            r.get::<_, String>(3)?,
+            r.get::<_, f64>(4)? as f32,
+            r.get::<_, String>(5)?,
+        )))?;
+        let now = Utc::now();
+        let mut at_risk: Vec<serde_json::Value> = Vec::new();
+        for r in rows {
+            let (id, content, stability, lr_str, salience, mem_type) = r?;
+            if let Ok(lr) = DateTime::parse_from_rfc3339(&lr_str) {
+                let days = (now - lr.with_timezone(&Utc)).num_seconds() as f32 / 86400.0;
+                let ret = (-days / stability.max(0.001)).exp();
+                if ret < threshold {
+                    at_risk.push(serde_json::json!({
+                        "id": id, "content": content,
+                        "retrievability": ret, "stability": stability,
+                        "salience": salience, "memory_type": mem_type,
+                    }));
+                }
+            }
+        }
+        at_risk.sort_by(|a, b| {
+            a["retrievability"].as_f64().unwrap_or(1.0)
+                .partial_cmp(&b["retrievability"].as_f64().unwrap_or(1.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        at_risk.truncate(limit);
+        Ok(at_risk)
+    }
+
+    pub async fn memory_health(&self, scope: &VisibilityScope) -> Result<serde_json::Value> {
+        let conn = self.conn.lock().await;
+        let (scope_sql, scope_params) = scope.sql_filter();
+
+        let stats_sql = format!(
+            "SELECT \
+               SUM(CASE WHEN deleted_at IS NULL THEN 1 ELSE 0 END), \
+               SUM(CASE WHEN deleted_at IS NOT NULL THEN 1 ELSE 0 END), \
+               AVG(CASE WHEN deleted_at IS NULL THEN salience ELSE NULL END), \
+               AVG(CASE WHEN deleted_at IS NULL THEN fsrs_stability ELSE NULL END) \
+             FROM memories WHERE {scope_sql}"
+        );
+        let (total, deleted, avg_sal, avg_stab): (i64, i64, f64, f64) = {
+            let dp: Vec<&dyn rusqlite::ToSql> =
+                scope_params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+            conn.query_row(&stats_sql, dp.as_slice(), |r| Ok((
+                r.get::<_, i64>(0).unwrap_or(0),
+                r.get::<_, i64>(1).unwrap_or(0),
+                r.get::<_, f64>(2).unwrap_or(0.0),
+                r.get::<_, f64>(3).unwrap_or(1.0),
+            )))?
+        };
+        let links: i64 = conn.query_row("SELECT COUNT(*) FROM links", [], |r| r.get(0))?;
+
+        let type_sql = format!(
+            "SELECT memory_type, COUNT(*) FROM memories \
+             WHERE {scope_sql} AND deleted_at IS NULL GROUP BY memory_type"
+        );
+        let mut by_type = serde_json::Map::new();
+        {
+            let dp: Vec<&dyn rusqlite::ToSql> =
+                scope_params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+            let mut stmt = conn.prepare(&type_sql)?;
+            let rows = stmt.query_map(dp.as_slice(), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })?;
+            for r in rows { let (t, cnt) = r?; by_type.insert(t, cnt.into()); }
+        }
+
+        Ok(serde_json::json!({
+            "total_memories": total,
+            "deleted_memories": deleted,
+            "total_links": links,
+            "avg_salience": avg_sal,
+            "avg_stability": avg_stab,
+            "by_type": by_type,
+        }))
+    }
+
+    pub async fn activation_heatmap(&self, scope: &VisibilityScope) -> Result<serde_json::Value> {
+        let conn = self.conn.lock().await;
+        let (scope_sql, scope_params) = scope.sql_filter();
+        let sql = format!(
+            "SELECT memory_type, strftime('%Y-%m', created_at) as month, COUNT(*) \
+             FROM memories WHERE {scope_sql} AND deleted_at IS NULL \
+             GROUP BY memory_type, month ORDER BY month ASC"
+        );
+        let dp: Vec<&dyn rusqlite::ToSql> =
+            scope_params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(dp.as_slice(), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+        })?;
+        let mut heatmap: std::collections::HashMap<
+            String,
+            serde_json::Map<String, serde_json::Value>,
+        > = Default::default();
+        for r in rows {
+            let (mt, month, cnt) = r?;
+            heatmap.entry(mt).or_default().insert(month, cnt.into());
+        }
+        Ok(serde_json::to_value(heatmap)?)
+    }
+
+    // -----------------------------------------------------------------------
+    // Episodes (table already in SCHEMA_SQL)
+    // -----------------------------------------------------------------------
+
+    pub async fn create_episode(
+        &self,
+        id: &str,
+        title: Option<&str>,
+        agent_id: Option<&str>,
+        thread_id: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO episodes (id, title, agent_id, thread_id, started_at, memory_ids, metadata) \
+             VALUES (?1, ?2, ?3, ?4, ?5, '[]', 'null')",
+            params![id, title, agent_id, thread_id, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub async fn add_episode_step(
+        &self,
+        episode_id: &str,
+        step_index: i64,
+        description: &str,
+        memory_id: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT OR REPLACE INTO episode_steps \
+             (episode_id, step_index, description, memory_id, timestamp) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![episode_id, step_index, description, memory_id, Utc::now().to_rfc3339()],
+        )?;
+        if let Some(mid) = memory_id {
+            conn.execute(
+                "UPDATE episodes SET memory_ids = json_insert(memory_ids, '$[#]', ?1) WHERE id = ?2",
+                params![mid, episode_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub async fn end_episode(&self, episode_id: &str, summary: Option<&str>) -> Result<bool> {
+        let conn = self.conn.lock().await;
+        Ok(conn.execute(
+            "UPDATE episodes SET ended_at=?1, summary=?2 WHERE id=?3 AND ended_at IS NULL",
+            params![Utc::now().to_rfc3339(), summary, episode_id],
+        )? > 0)
+    }
+
+    pub async fn get_episode_raw(&self, episode_id: &str) -> Result<Option<serde_json::Value>> {
+        let conn = self.conn.lock().await;
+        let ep = conn.query_row(
+            "SELECT id, title, agent_id, thread_id, started_at, ended_at, summary, memory_ids, metadata \
+             FROM episodes WHERE id = ?",
+            params![episode_id],
+            |r| Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, String>(8)?,
+            )),
+        );
+        match ep {
+            Ok((id, title, aid, tid, started_at, ended_at, summary, mem_ids_str, meta_str)) => {
+                let memory_ids: serde_json::Value =
+                    serde_json::from_str(&mem_ids_str).unwrap_or(serde_json::json!([]));
+                let metadata: serde_json::Value =
+                    serde_json::from_str(&meta_str).unwrap_or(serde_json::Value::Null);
+                let mut stmt = conn.prepare(
+                    "SELECT step_index, description, memory_id, timestamp \
+                     FROM episode_steps WHERE episode_id = ? ORDER BY step_index"
+                )?;
+                let step_rows = stmt.query_map(params![&id], |r| Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, String>(3)?,
+                )))?;
+                let mut steps = Vec::new();
+                for sr in step_rows {
+                    let (idx, desc, mid, ts) = sr?;
+                    steps.push(serde_json::json!({
+                        "step_index": idx, "description": desc,
+                        "memory_id": mid, "timestamp": ts,
+                    }));
+                }
+                Ok(Some(serde_json::json!({
+                    "id": id, "title": title, "agent_id": aid, "thread_id": tid,
+                    "started_at": started_at, "ended_at": ended_at, "summary": summary,
+                    "memory_ids": memory_ids, "metadata": metadata, "steps": steps,
+                })))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub async fn list_episodes(
+        &self,
+        agent_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().await;
+        let limit_val = limit as i64;
+        let mut episodes = Vec::new();
+        let row_to_ep = |r: &rusqlite::Row<'_>| -> rusqlite::Result<serde_json::Value> {
+            Ok(serde_json::json!({
+                "id":         r.get::<_, String>(0)?,
+                "title":      r.get::<_, Option<String>>(1)?,
+                "agent_id":   r.get::<_, Option<String>>(2)?,
+                "thread_id":  r.get::<_, Option<String>>(3)?,
+                "started_at": r.get::<_, String>(4)?,
+                "ended_at":   r.get::<_, Option<String>>(5)?,
+                "summary":    r.get::<_, Option<String>>(6)?,
+            }))
+        };
+        if let Some(aid) = agent_id {
+            let aid_s = aid.to_string();
+            let mut stmt = conn.prepare(
+                "SELECT id, title, agent_id, thread_id, started_at, ended_at, summary \
+                 FROM episodes WHERE agent_id = ?1 ORDER BY started_at DESC LIMIT ?2"
+            )?;
+            let rows = stmt.query_map(params![aid_s, limit_val], row_to_ep)?;
+            for r in rows { episodes.push(r?); }
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT id, title, agent_id, thread_id, started_at, ended_at, summary \
+                 FROM episodes ORDER BY started_at DESC LIMIT ?1"
+            )?;
+            let rows = stmt.query_map(params![limit_val], row_to_ep)?;
+            for r in rows { episodes.push(r?); }
+        }
+        Ok(episodes)
+    }
+
+    pub async fn get_episode_memory_ids(&self, episode_id: &str) -> Result<Vec<MemoryId>> {
+        let conn = self.conn.lock().await;
+        let mem_ids_str: String = conn.query_row(
+            "SELECT memory_ids FROM episodes WHERE id = ?",
+            params![episode_id],
+            |r| r.get(0),
+        ).unwrap_or_else(|_| "[]".to_string());
+        let mut ids: Vec<String> = serde_json::from_str(&mem_ids_str).unwrap_or_default();
+        let mut stmt = conn.prepare(
+            "SELECT memory_id FROM episode_steps \
+             WHERE episode_id = ? AND memory_id IS NOT NULL"
+        )?;
+        let step_ids = stmt.query_map(params![episode_id], |r| r.get::<_, String>(0))?;
+        for r in step_ids { ids.push(r?); }
+        let mut seen = std::collections::HashSet::new();
+        Ok(ids.into_iter().filter(|id| seen.insert(id.clone())).map(MemoryId).collect())
+    }
+
+    // -----------------------------------------------------------------------
+    // Audit log (table already in SCHEMA_SQL)
+    // -----------------------------------------------------------------------
+
+    pub async fn log_audit_event(
+        &self,
+        agent_id: Option<&str>,
+        action: &str,
+        memory_id: Option<&str>,
+        details: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO audit_log (timestamp, agent_id, action, memory_id, details) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![Utc::now().to_rfc3339(), agent_id, action, memory_id, details],
+        )?;
+        Ok(())
+    }
+
+    pub async fn query_audit(
+        &self,
+        limit: usize,
+        agent_id_filter: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().await;
+        let limit_val = limit as i64;
+        let row_to_entry = |r: &rusqlite::Row<'_>| -> rusqlite::Result<serde_json::Value> {
+            Ok(serde_json::json!({
+                "id":        r.get::<_, i64>(0)?,
+                "timestamp": r.get::<_, String>(1)?,
+                "agent_id":  r.get::<_, Option<String>>(2)?,
+                "action":    r.get::<_, String>(3)?,
+                "memory_id": r.get::<_, Option<String>>(4)?,
+                "details":   r.get::<_, Option<String>>(5)?,
+            }))
+        };
+        let mut out = Vec::new();
+        if let Some(aid) = agent_id_filter {
+            let aid_s = aid.to_string();
+            let mut stmt = conn.prepare(
+                "SELECT id, timestamp, agent_id, action, memory_id, details \
+                 FROM audit_log WHERE agent_id = ?1 ORDER BY timestamp DESC LIMIT ?2"
+            )?;
+            let rows = stmt.query_map(params![aid_s, limit_val], row_to_entry)?;
+            for r in rows { out.push(r?); }
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT id, timestamp, agent_id, action, memory_id, details \
+                 FROM audit_log ORDER BY timestamp DESC LIMIT ?1"
+            )?;
+            let rows = stmt.query_map(params![limit_val], row_to_entry)?;
+            for r in rows { out.push(r?); }
+        }
+        Ok(out)
+    }
+
+    pub async fn audit_summary(&self) -> Result<serde_json::Value> {
+        let conn = self.conn.lock().await;
+        let total: i64 =
+            conn.query_row("SELECT COUNT(*) FROM audit_log", [], |r| r.get(0))?;
+        let mut stmt = conn.prepare(
+            "SELECT action, COUNT(*) FROM audit_log GROUP BY action ORDER BY COUNT(*) DESC"
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        let mut by_action = serde_json::Map::new();
+        for r in rows { let (a, cnt) = r?; by_action.insert(a, cnt.into()); }
+        Ok(serde_json::json!({ "total_events": total, "by_action": by_action }))
+    }
 }
 
 const SCHEMA_SQL: &str = r#"

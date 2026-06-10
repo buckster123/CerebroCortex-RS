@@ -195,6 +195,433 @@ fn tool_schema(name: &str) -> Value {
             "inputSchema": { "type": "object", "properties": {}, "required": [] }
         }),
 
+        "session_save" => json!({
+            "name": "session_save",
+            "description": "Save a session summary to long-term episodic memory with priority and type tags. Used to create searchable session notes for FORGE and other agents.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "content":      { "type": "string", "description": "Session summary content" },
+                    "priority":     { "type": "string", "enum": ["LOW","MEDIUM","HIGH","CRITICAL"], "description": "Priority tag (default: medium)" },
+                    "session_type": { "type": "string", "description": "Session type tag e.g. technical, planning (default: general)" },
+                    "salience":     { "type": "number" },
+                    "agent_id":     { "type": "string" }
+                },
+                "required": ["content"]
+            }
+        }),
+
+        "session_recall" => json!({
+            "name": "session_recall",
+            "description": "Recall previously saved session notes. Filters to memories tagged session_note, optionally by priority or session_type.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query":        { "type": "string" },
+                    "top_k":        { "type": "integer" },
+                    "priority":     { "type": "string" },
+                    "session_type": { "type": "string" },
+                    "agent_id":     { "type": "string" }
+                },
+                "required": ["query"]
+            }
+        }),
+
+        "list_deleted" => json!({
+            "name": "list_deleted",
+            "description": "List soft-deleted memories that can be restored.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "limit":    { "type": "integer", "description": "Max results (default: 50)" },
+                    "agent_id": { "type": "string" }
+                },
+                "required": []
+            }
+        }),
+
+        "restore_memory" => json!({
+            "name": "restore_memory",
+            "description": "Restore a soft-deleted memory.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "memory_id": { "type": "string" }
+                },
+                "required": ["memory_id"]
+            }
+        }),
+
+        "purge_memory" => json!({
+            "name": "purge_memory",
+            "description": "Permanently delete a memory (irreversible). Prefer delete_memory for recoverable soft-delete.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "memory_id": { "type": "string" }
+                },
+                "required": ["memory_id"]
+            }
+        }),
+
+        "purge_all_deleted" => json!({
+            "name": "purge_all_deleted",
+            "description": "Permanently delete all soft-deleted memories (irreversible bulk purge).",
+            "inputSchema": { "type": "object", "properties": {}, "required": [] }
+        }),
+
+        "bulk_delete" => json!({
+            "name": "bulk_delete",
+            "description": "Soft-delete multiple memories at once.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "memory_ids": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["memory_ids"]
+            }
+        }),
+
+        "export_memories" => json!({
+            "name": "export_memories",
+            "description": "Export memories as JSON. Optionally filter by type.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "memory_type": { "type": "string", "enum": ["episodic","semantic","procedural","affective","prospective","schematic"] },
+                    "limit":       { "type": "integer", "description": "Max results (default: 1000)" },
+                    "agent_id":    { "type": "string" }
+                },
+                "required": []
+            }
+        }),
+
+        "register_agent" => json!({
+            "name": "register_agent",
+            "description": "Register an agent in the agent registry.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name":        { "type": "string" },
+                    "agent_id":    { "type": "string", "description": "Agent ID (auto-generated if omitted)" },
+                    "description": { "type": "string" },
+                    "metadata":    { "type": "object" }
+                },
+                "required": ["name"]
+            }
+        }),
+
+        "list_agents" => json!({
+            "name": "list_agents",
+            "description": "List all registered agents.",
+            "inputSchema": { "type": "object", "properties": {}, "required": [] }
+        }),
+
+        "share_memory" => json!({
+            "name": "share_memory",
+            "description": "Make a memory shared (globally visible) or transfer it to a specific agent.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "memory_id":       { "type": "string" },
+                    "target_agent_id": { "type": "string", "description": "If omitted, makes globally shared" }
+                },
+                "required": ["memory_id"]
+            }
+        }),
+
+        "send_message" => json!({
+            "name": "send_message",
+            "description": "Send a message to another agent by storing a memory tagged with to:{agent} and from:{agent}.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "content":      { "type": "string" },
+                    "to_agent_id":   { "type": "string" },
+                    "from_agent_id": { "type": "string" },
+                    "thread_id":     { "type": "string" },
+                    "agent_id":      { "type": "string" }
+                },
+                "required": ["content","to_agent_id"]
+            }
+        }),
+
+        "check_inbox" => json!({
+            "name": "check_inbox",
+            "description": "Check messages sent to a specific agent (memories tagged to:{agent_id}).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string" },
+                    "limit":    { "type": "integer", "description": "Max results (default: 20)" }
+                },
+                "required": ["agent_id"]
+            }
+        }),
+
+        "list_threads" => json!({
+            "name": "list_threads",
+            "description": "List distinct conversation thread IDs that have memories.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string" }
+                },
+                "required": []
+            }
+        }),
+
+        "get_thread_memories" => json!({
+            "name": "get_thread_memories",
+            "description": "Get all memories belonging to a specific conversation thread.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "thread_id": { "type": "string" },
+                    "agent_id":  { "type": "string" }
+                },
+                "required": ["thread_id"]
+            }
+        }),
+
+        "prune_thread" => json!({
+            "name": "prune_thread",
+            "description": "Soft-delete all memories in a conversation thread.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "thread_id": { "type": "string" }
+                },
+                "required": ["thread_id"]
+            }
+        }),
+
+        "list_tags" => json!({
+            "name": "list_tags",
+            "description": "List all tags used across memories with their counts.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string" }
+                },
+                "required": []
+            }
+        }),
+
+        "delete_tag" => json!({
+            "name": "delete_tag",
+            "description": "Remove a tag from all memories.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tag": { "type": "string" }
+                },
+                "required": ["tag"]
+            }
+        }),
+
+        "rename_tag" => json!({
+            "name": "rename_tag",
+            "description": "Rename a tag across all memories.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "old_tag": { "type": "string" },
+                    "new_tag": { "type": "string" }
+                },
+                "required": ["old_tag","new_tag"]
+            }
+        }),
+
+        "merge_tags" => json!({
+            "name": "merge_tags",
+            "description": "Merge source_tag into target_tag across all memories.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "source_tag": { "type": "string" },
+                    "target_tag": { "type": "string" }
+                },
+                "required": ["source_tag","target_tag"]
+            }
+        }),
+
+        "emotional_summary" => json!({
+            "name": "emotional_summary",
+            "description": "Summarise emotional valence distribution across memories.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string" }
+                },
+                "required": []
+            }
+        }),
+
+        "activation_at_risk" => json!({
+            "name": "activation_at_risk",
+            "description": "Return memories whose FSRS retrievability has dropped below a threshold.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "threshold": { "type": "number", "description": "Retrievability threshold 0-1 (default: 0.7)" },
+                    "limit":     { "type": "integer", "description": "Max results (default: 20)" },
+                    "agent_id":  { "type": "string" }
+                },
+                "required": []
+            }
+        }),
+
+        "memory_health" => json!({
+            "name": "memory_health",
+            "description": "Return overall memory health metrics: total, deleted, avg salience, avg stability, by-type breakdown.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string" }
+                },
+                "required": []
+            }
+        }),
+
+        "activation_curve" => json!({
+            "name": "activation_curve",
+            "description": "Return the access history and FSRS state for a specific memory.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "memory_id": { "type": "string" },
+                    "agent_id":  { "type": "string" }
+                },
+                "required": ["memory_id"]
+            }
+        }),
+
+        "activation_heatmap" => json!({
+            "name": "activation_heatmap",
+            "description": "Return memory creation counts grouped by type and month.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string" }
+                },
+                "required": []
+            }
+        }),
+
+        "check_near_duplicates" => json!({
+            "name": "check_near_duplicates",
+            "description": "Find pairs of memories with cosine similarity above a threshold.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "threshold": { "type": "number", "description": "Similarity threshold 0-1 (default: 0.9)" },
+                    "limit":     { "type": "integer", "description": "Number of recent memories to scan (default: 50)" },
+                    "agent_id":  { "type": "string" }
+                },
+                "required": []
+            }
+        }),
+
+        "episode_start" => json!({
+            "name": "episode_start",
+            "description": "Begin a new episode (a named sequence of steps).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title":     { "type": "string" },
+                    "agent_id":  { "type": "string" },
+                    "thread_id": { "type": "string" }
+                },
+                "required": []
+            }
+        }),
+
+        "episode_add_step" => json!({
+            "name": "episode_add_step",
+            "description": "Append a step to an episode, optionally linking a memory.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "episode_id":  { "type": "string" },
+                    "step_index":  { "type": "integer" },
+                    "description": { "type": "string" },
+                    "memory_id":   { "type": "string" }
+                },
+                "required": ["episode_id","description"]
+            }
+        }),
+
+        "episode_end" => json!({
+            "name": "episode_end",
+            "description": "Mark an episode as complete with an optional summary.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "episode_id": { "type": "string" },
+                    "summary":    { "type": "string" }
+                },
+                "required": ["episode_id"]
+            }
+        }),
+
+        "get_episode" => json!({
+            "name": "get_episode",
+            "description": "Retrieve a full episode including its steps.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "episode_id": { "type": "string" }
+                },
+                "required": ["episode_id"]
+            }
+        }),
+
+        "list_episodes" => json!({
+            "name": "list_episodes",
+            "description": "List episodes, optionally filtered by agent.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string" },
+                    "limit":    { "type": "integer", "description": "Max results (default: 20)" }
+                },
+                "required": []
+            }
+        }),
+
+        "get_episode_memories" => json!({
+            "name": "get_episode_memories",
+            "description": "Get all memories referenced by an episode.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "episode_id": { "type": "string" },
+                    "agent_id":   { "type": "string" }
+                },
+                "required": ["episode_id"]
+            }
+        }),
+
+        "audit_summary" => json!({
+            "name": "audit_summary",
+            "description": "Summarise audit log events by action type.",
+            "inputSchema": { "type": "object", "properties": {}, "required": [] }
+        }),
+
+        "query_audit" => json!({
+            "name": "query_audit",
+            "description": "Query audit log entries, optionally filtered by agent.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "limit":    { "type": "integer", "description": "Max results (default: 50)" },
+                    "agent_id": { "type": "string" }
+                },
+                "required": []
+            }
+        }),
+
         _ => json!({
             "name": name,
             "description": format!("(stub) {name}"),
