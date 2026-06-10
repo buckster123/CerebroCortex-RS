@@ -418,6 +418,27 @@ impl SqliteStore {
         Ok(results)
     }
 
+    /// Bulk-load memories by ID list — used by the recall pipeline.
+    pub async fn get_memories_by_ids(&self, ids: &[MemoryId], scope: &VisibilityScope) -> Result<Vec<MemoryNode>> {
+        if ids.is_empty() { return Ok(vec![]); }
+        let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let (scope_sql, scope_params) = scope.sql_filter();
+        let sql = format!(
+            "SELECT {SELECT_COLS} FROM memories \
+             WHERE id IN ({placeholders}) AND {scope_sql} AND deleted_at IS NULL"
+        );
+        let conn = self.conn.lock().await;
+        let id_strs: Vec<&str> = ids.iter().map(|id| id.0.as_str()).collect();
+        let mut dyn_params: Vec<&dyn rusqlite::ToSql> =
+            id_strs.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        for s in &scope_params { dyn_params.push(s); }
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(dyn_params.as_slice(), row_to_raw)?;
+        let mut results = Vec::new();
+        for row in rows { results.push(row?.into_memory_node()?); }
+        Ok(results)
+    }
+
     /// All non-deleted memory IDs — used by GraphStore::rebuild_from_db.
     pub async fn list_all_memory_ids(&self) -> Result<Vec<MemoryId>> {
         let conn = self.conn.lock().await;

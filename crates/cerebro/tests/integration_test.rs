@@ -718,3 +718,106 @@ mod graph_store {
         assert!(graph.neighbors(&a_id).is_empty());
     }
 }
+
+// =============================================================================
+// Step 7 — cortex.rs remember() + recall() end-to-end
+// =============================================================================
+
+#[cfg(test)]
+mod cortex_pipeline {
+    use cerebro::{
+        config::Config,
+        cortex::CerebroCortex,
+        models::AssociativeLink,
+        types::{LinkType, VisibilityScope},
+    };
+    use tempfile::TempDir;
+
+    async fn make_cortex() -> (CerebroCortex, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let config = Config {
+            db_path:       dir.path().join("test.db"),
+            anthropic_key: None,
+            embed_model:   "".into(),
+        };
+        let cortex = CerebroCortex::new(config).await.unwrap();
+        (cortex, dir)
+    }
+
+    #[tokio::test]
+    async fn remember_returns_enriched_node() {
+        let (cortex, _dir) = make_cortex().await;
+        let node = cortex.remember(
+            "Rust is a systems programming language focused on safety and performance.",
+            None, None, None,
+            VisibilityScope::global(),
+        ).await.unwrap();
+        assert!(!node.id.0.is_empty());
+        assert!(node.salience > 0.0);
+        // Temporal engine should have added concepts
+        let concepts = node.metadata["concepts"].as_array().expect("concepts array");
+        assert!(!concepts.is_empty(), "temporal engine should extract concepts");
+    }
+
+    #[tokio::test]
+    async fn thalamus_rejects_short_content() {
+        let (cortex, _dir) = make_cortex().await;
+        let result = cortex.remember("hi", None, None, None, VisibilityScope::global()).await;
+        assert!(result.is_err(), "content under 10 chars should be rejected");
+    }
+
+    #[tokio::test]
+    async fn recall_finds_remembered_node() {
+        let (cortex, _dir) = make_cortex().await;
+        let node = cortex.remember(
+            "sqlite vector storage is the primary persistence layer",
+            None, None, None,
+            VisibilityScope::global(),
+        ).await.unwrap();
+
+        // FTS5 search (fastembed disabled in tests)
+        let results = cortex.recall("sqlite vector storage", 5, VisibilityScope::global())
+            .await.unwrap();
+        assert!(!results.is_empty(), "recall should return at least one result");
+        assert_eq!(results[0].0.id, node.id, "remembered node should rank first");
+        assert!(results[0].1 > 0.0, "recall score should be positive");
+    }
+
+    #[tokio::test]
+    async fn recall_empty_when_no_match() {
+        let (cortex, _dir) = make_cortex().await;
+        let results = cortex.recall("completely unrelated query xyz", 5, VisibilityScope::global())
+            .await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn associate_creates_graph_edge() {
+        let (cortex, _dir) = make_cortex().await;
+        let a = cortex.remember(
+            "Rust memory safety prevents use after free vulnerabilities",
+            None, None, None, VisibilityScope::global(),
+        ).await.unwrap();
+        let b = cortex.remember(
+            "C++ requires manual memory management and is prone to leaks",
+            None, None, None, VisibilityScope::global(),
+        ).await.unwrap();
+
+        let link = AssociativeLink::new(a.id.clone(), b.id.clone(), LinkType::Semantic, 0.8);
+        cortex.associate(a.id.clone(), b.id.clone(), link).await.unwrap();
+
+        let storage = cortex.storage.read().await;
+        let neighbors = storage.graph.neighbors(&a.id);
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0], &b.id);
+    }
+
+    #[tokio::test]
+    async fn remember_increments_graph_node_count() {
+        let (cortex, _dir) = make_cortex().await;
+        cortex.remember("first memory about programming", None, None, None, VisibilityScope::global()).await.unwrap();
+        cortex.remember("second memory about databases and storage", None, None, None, VisibilityScope::global()).await.unwrap();
+        let storage = cortex.storage.read().await;
+        assert_eq!(storage.graph.graph.node_count(), 2);
+    }
+}

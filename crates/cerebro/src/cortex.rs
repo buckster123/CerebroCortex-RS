@@ -1,9 +1,11 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::Result;
+use petgraph::graph::NodeIndex;
 use tokio::sync::RwLock;
 
 use crate::{
+    activation::spread,
     config::Config,
     engines::{
         AffectEngine, DreamEngine, EpisodicEngine, ExecutiveEngine, GatingEngine,
@@ -11,7 +13,7 @@ use crate::{
     },
     models::{AssociativeLink, MemoryNode},
     storage::StorageCoordinator,
-    types::{MemoryId, MemoryType, VisibilityScope},
+    types::{MemoryId, MemoryType, Visibility, VisibilityScope},
 };
 
 /// CerebroCortex — top-level coordinator.
@@ -52,60 +54,121 @@ impl CerebroCortex {
     // Core operations (build-order step 7)
     // -----------------------------------------------------------------------
 
-    /// Store a new memory, running it through all relevant engines.
+    /// Store a new memory through the full cognitive pipeline.
+    ///
+    /// Pipeline: thalamus gate → amygdala emotion → temporal concepts
+    ///           → SQLite insert → vector embed → graph node
+    ///
+    /// Returns Err if thalamus rejects the content (too short / filtered).
     pub async fn remember(
         &self,
         content: impl Into<String>,
-        memory_type: MemoryType,
-        scope: VisibilityScope,
+        memory_type: Option<MemoryType>,
+        tags:        Option<Vec<String>>,
+        salience:    Option<f32>,
+        scope:       VisibilityScope,
     ) -> Result<MemoryNode> {
         let content = content.into();
-        let mut node = MemoryNode::new(content, memory_type);
 
-        // Amygdala: classify emotional valence and apply salience modulation
+        // Thalamus: gate and initialize parameters
+        let visibility = match &scope.agent_id {
+            None    => Visibility::Shared,
+            Some(_) => Visibility::Private,
+        };
+        let mut node = self.thalamus
+            .evaluate_input(&content, memory_type, tags, salience, scope.agent_id.clone(), visibility)
+            .ok_or_else(|| anyhow::anyhow!("content rejected by thalamus (too short or filtered)"))?;
+
+        // Amygdala: emotional classification and salience modulation
         node = self.amygdala.apply_emotion(node);
 
-        // Apply visibility scope
-        if let Some(ref agent_id) = scope.agent_id {
-            node.agent_id = Some(agent_id.clone());
-        }
+        // Temporal: extract and store semantic concepts in metadata
+        node = self.temporal.enrich_node(node);
 
-        let storage = self.storage.write().await;
+        // Persist across all three storage backends
+        let mut storage = self.storage.write().await;
         storage.sqlite.insert_memory(&node).await?;
-        // TODO: embed and store vector (step 4)
-        // TODO: add to graph (step 5)
+        storage.vector.embed_and_store(&node.id, &node.content).await?;
+        storage.graph.add_node(node.id.clone());
 
-        tracing::info!(id = %node.id.0, memory_type = ?node.memory_type, "memory stored");
+        tracing::info!(id = %node.id.0, memory_type = ?node.memory_type, salience = node.salience, "memory stored");
         Ok(node)
     }
 
     /// Recall memories matching a query string.
+    ///
+    /// Pipeline: vector/FTS5 search → spreading activation → bulk SQLite load
+    ///           → prefrontal ranking → top-k return
     pub async fn recall(
         &self,
         query: &str,
-        k: usize,
+        k:     usize,
         scope: VisibilityScope,
     ) -> Result<Vec<(MemoryNode, f32)>> {
-        // TODO: implement full recall pipeline (step 7):
-        //   1. vector search  → candidate IDs + similarity scores
-        //   2. ACT-R + FSRS   → activation scores per candidate
-        //   3. spreading activation from top candidates
-        //   4. weighted recall_score blend
-        //   5. threshold + sort + top-k
-        let _ = (query, k, scope);
-        Ok(vec![])
+        let storage = self.storage.read().await;
+        let (scope_sql, scope_params) = scope.sql_filter();
+
+        // 1. Vector / FTS5 candidates (over-fetch for spreading)
+        let candidates = storage.vector
+            .search(query, k * 5, scope_sql, &scope_params).await?;
+        if candidates.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // 2. Spreading activation from vector-search seeds
+        let seeds: Vec<NodeIndex> = candidates.iter()
+            .filter_map(|(id, _)| storage.graph.index.get(id).copied())
+            .collect();
+        let visible_nodes: HashMap<NodeIndex, bool> = storage.graph.index.values()
+            .map(|&idx| (idx, true))
+            .collect();
+        let activated = spread(&storage.graph.graph, &seeds, &scope, &visible_nodes);
+
+        // 3. Build score maps and union ID set
+        let sims_map: HashMap<MemoryId, f32> = candidates.into_iter().collect();
+        let assoc_map: HashMap<MemoryId, f32> = activated.into_iter()
+            .filter_map(|(idx, score)| {
+                storage.graph.graph.node_weight(idx).map(|id| (id.clone(), score))
+            })
+            .collect();
+
+        let mut all_ids: Vec<MemoryId> = sims_map.keys().cloned().collect();
+        for id in assoc_map.keys() {
+            if !sims_map.contains_key(id) {
+                all_ids.push(id.clone());
+            }
+        }
+
+        // 4. Bulk-load full nodes
+        let nodes = storage.sqlite.get_memories_by_ids(&all_ids, &scope).await?;
+
+        // 5. Rank and return top-k
+        let ranked = self.prefrontal.rank_results(&nodes, Some(&sims_map), Some(&assoc_map));
+        let node_map: HashMap<MemoryId, MemoryNode> =
+            nodes.into_iter().map(|n| (n.id.clone(), n)).collect();
+
+        let results = ranked.into_iter()
+            .take(k)
+            .filter_map(|(id, score)| node_map.get(&id).map(|n| (n.clone(), score)))
+            .collect();
+
+        Ok(results)
     }
 
     /// Associate two existing memories with a typed link.
+    ///
+    /// Writes to SQLite first (source of truth), then mirrors into the graph.
     pub async fn associate(
         &self,
-        source: MemoryId,
-        target: MemoryId,
-        link: AssociativeLink,
+        _source: MemoryId,
+        _target: MemoryId,
+        link:    AssociativeLink,
     ) -> Result<()> {
-        let storage = self.storage.write().await;
-        // TODO: insert link into SQLite + graph (step 5)
-        let _ = (source, target, link, storage);
+        let mut storage = self.storage.write().await;
+        storage.sqlite.insert_link(&link).await?;
+        if let Err(e) = storage.graph.add_edge(link) {
+            tracing::warn!("associate: graph edge not added — {e}");
+        }
         Ok(())
     }
 }
