@@ -636,6 +636,276 @@ async fn route(name: &str, args: &Value, brain: Arc<CerebroCortex>) -> anyhow::R
             Ok(json!(entries))
         }
 
+        // ------------------------------------------------------------------ //
+        // Intentions — prospective memories (TODOs, reminders)
+        // ------------------------------------------------------------------ //
+
+        "store_intention" => {
+            let content  = args["content"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("content required"))?;
+            let salience = args["salience"].as_f64().unwrap_or(0.7) as f32;
+            let scope    = agent_scope(args);
+            let mut tags = vec!["intention".to_string()];
+            if let Some(arr) = args["tags"].as_array() {
+                tags.extend(arr.iter().filter_map(|v| v.as_str().map(String::from)));
+            }
+            let node = brain.remember(
+                content, Some(MemoryType::Prospective), Some(tags), Some(salience), scope,
+            ).await?;
+            Ok(json!({ "id": node.id, "status": "ok", "salience": node.salience }))
+        }
+
+        "list_intentions" => {
+            let min_salience = args["min_salience"].as_f64().unwrap_or(0.3) as f32;
+            let limit        = args["limit"].as_u64().unwrap_or(50) as usize;
+            let scope        = agent_scope(args);
+            let filter       = ListFilter {
+                memory_type: Some(MemoryType::Prospective),
+                limit,
+                ..Default::default()
+            };
+            let nodes = brain.storage.read().await.sqlite
+                .list_memories_scoped(&scope, &filter).await?;
+            let filtered: Vec<_> = nodes.into_iter()
+                .filter(|n| n.salience >= min_salience)
+                .collect();
+            Ok(json!(filtered))
+        }
+
+        "resolve_intention" => {
+            let memory_id = args["memory_id"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("memory_id required"))?;
+            let scope   = agent_scope(args);
+            let mid     = MemoryId(memory_id.to_string());
+            let storage = brain.storage.read().await;
+            let mut node = storage.sqlite.get_memory(&mid, &scope).await?
+                .ok_or_else(|| anyhow::anyhow!("intention not found: {memory_id}"))?;
+            node.salience = 0.1;
+            node.tags.retain(|t| !t.starts_with("status:"));
+            node.tags.push("status:resolved".to_string());
+            storage.sqlite.update_memory(&node).await?;
+            Ok(json!({ "status": "ok", "resolved": memory_id }))
+        }
+
+        // ------------------------------------------------------------------ //
+        // Procedures — workflows, strategies, how-to guides
+        // ------------------------------------------------------------------ //
+
+        "store_procedure" => {
+            let content  = args["content"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("content required"))?;
+            let salience = args["salience"].as_f64().unwrap_or(0.8) as f32;
+            let scope    = agent_scope(args);
+            let mut tags = vec!["procedure".to_string()];
+            if let Some(arr) = args["tags"].as_array() {
+                tags.extend(arr.iter().filter_map(|v| v.as_str().map(String::from)));
+            }
+            let node = brain.remember(
+                content, Some(MemoryType::Procedural), Some(tags), Some(salience), scope,
+            ).await?;
+            Ok(json!({ "id": node.id, "status": "ok" }))
+        }
+
+        "list_procedures" => {
+            let min_salience = args["min_salience"].as_f64().unwrap_or(0.0) as f32;
+            let limit        = args["limit"].as_u64().unwrap_or(50) as usize;
+            let scope        = agent_scope(args);
+            let filter       = ListFilter {
+                memory_type: Some(MemoryType::Procedural),
+                limit,
+                ..Default::default()
+            };
+            let nodes = brain.storage.read().await.sqlite
+                .list_memories_scoped(&scope, &filter).await?;
+            let filtered: Vec<_> = nodes.into_iter()
+                .filter(|n| n.salience >= min_salience)
+                .collect();
+            Ok(json!(filtered))
+        }
+
+        "find_relevant_procedures" => {
+            let tags: Vec<String>     = args["tags"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            let concepts: Vec<String> = args["concepts"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            if tags.is_empty() && concepts.is_empty() {
+                return Ok(json!([]));
+            }
+            let max_results = args["limit"].as_u64().unwrap_or(5) as usize;
+            let scope       = agent_scope(args);
+            let filter      = ListFilter {
+                memory_type: Some(MemoryType::Procedural),
+                limit: 200,
+                ..Default::default()
+            };
+            let nodes = brain.storage.read().await.sqlite
+                .list_memories_scoped(&scope, &filter).await?;
+            let filtered: Vec<_> = nodes.into_iter()
+                .filter(|n| {
+                    let tag_hit = tags.iter().any(|t| n.tags.iter().any(|nt| nt == t));
+                    let meta_str = n.metadata.to_string();
+                    let concept_hit = concepts.iter().any(|c| meta_str.contains(c.as_str()));
+                    tag_hit || concept_hit
+                })
+                .take(max_results)
+                .collect();
+            Ok(json!(filtered))
+        }
+
+        "record_procedure_outcome" => {
+            let procedure_id = args["procedure_id"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("procedure_id required"))?;
+            let success = args["success"].as_bool()
+                .ok_or_else(|| anyhow::anyhow!("success (bool) required"))?;
+            let scope   = agent_scope(args);
+            let mid     = MemoryId(procedure_id.to_string());
+            let storage = brain.storage.read().await;
+            let mut node = storage.sqlite.get_memory(&mid, &scope).await?
+                .ok_or_else(|| anyhow::anyhow!("procedure not found: {procedure_id}"))?;
+            if success {
+                node.salience = (node.salience + 0.1).min(1.0);
+            } else {
+                node.salience = (node.salience + 0.02).min(1.0);
+                node.strength.difficulty = (node.strength.difficulty + 0.5).min(10.0);
+            }
+            storage.sqlite.update_memory(&node).await?;
+            Ok(json!({
+                "status":       "ok",
+                "procedure_id": procedure_id,
+                "success":      success,
+                "new_salience": node.salience,
+            }))
+        }
+
+        // ------------------------------------------------------------------ //
+        // Schemas — abstract patterns derived from multiple memories
+        // ------------------------------------------------------------------ //
+
+        "create_schema" => {
+            let content    = args["content"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("content required"))?;
+            let source_ids: Vec<String> = args["source_ids"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            let salience   = args["salience"].as_f64().unwrap_or(0.7) as f32;
+            let scope      = agent_scope(args);
+            let mut tags   = vec!["schema".to_string(), "support_count:0".to_string()];
+            if let Some(arr) = args["tags"].as_array() {
+                tags.extend(arr.iter().filter_map(|v| v.as_str().map(String::from)));
+            }
+            let mut node = brain.remember(
+                content, Some(MemoryType::Schematic), Some(tags), Some(salience), scope,
+            ).await?;
+            if !source_ids.is_empty() {
+                if let serde_json::Value::Object(ref mut map) = node.metadata {
+                    map.insert("derived_from".to_string(), json!(source_ids));
+                } else {
+                    node.metadata = json!({ "derived_from": source_ids });
+                }
+                brain.storage.read().await.sqlite.update_memory(&node).await?;
+            }
+            Ok(json!({ "id": node.id, "status": "ok" }))
+        }
+
+        "list_schemas" => {
+            let limit  = args["limit"].as_u64().unwrap_or(50) as usize;
+            let scope  = agent_scope(args);
+            let filter = ListFilter {
+                memory_type: Some(MemoryType::Schematic),
+                limit,
+                ..Default::default()
+            };
+            let nodes = brain.storage.read().await.sqlite
+                .list_memories_scoped(&scope, &filter).await?;
+            Ok(json!(nodes))
+        }
+
+        "find_matching_schemas" => {
+            let tags: Vec<String>     = args["tags"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            let concepts: Vec<String> = args["concepts"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            if tags.is_empty() && concepts.is_empty() {
+                return Ok(json!([]));
+            }
+            let max_results = args["limit"].as_u64().unwrap_or(5) as usize;
+            let scope       = agent_scope(args);
+            let filter      = ListFilter {
+                memory_type: Some(MemoryType::Schematic),
+                limit: 200,
+                ..Default::default()
+            };
+            let nodes = brain.storage.read().await.sqlite
+                .list_memories_scoped(&scope, &filter).await?;
+            let filtered: Vec<_> = nodes.into_iter()
+                .filter(|n| {
+                    let tag_hit = tags.iter().any(|t| n.tags.iter().any(|nt| nt == t));
+                    let meta_str = n.metadata.to_string();
+                    let concept_hit = concepts.iter().any(|c| meta_str.contains(c.as_str()));
+                    tag_hit || concept_hit
+                })
+                .take(max_results)
+                .collect();
+            Ok(json!(filtered))
+        }
+
+        "get_schema_sources" => {
+            let schema_id = args["schema_id"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("schema_id required"))?;
+            let scope   = agent_scope(args);
+            let mid     = MemoryId(schema_id.to_string());
+            let storage = brain.storage.read().await;
+            let node = storage.sqlite.get_memory(&mid, &scope).await?
+                .ok_or_else(|| anyhow::anyhow!("schema not found: {schema_id}"))?;
+            let sources: Vec<String> = node.metadata["derived_from"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            Ok(json!({ "schema_id": schema_id, "source_ids": sources }))
+        }
+
+        // ------------------------------------------------------------------ //
+        // Memory versions — content snapshots for undo / audit
+        // ------------------------------------------------------------------ //
+
+        "get_memory_versions" => {
+            let memory_id = args["memory_id"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("memory_id required"))?;
+            let limit    = args["limit"].as_u64().unwrap_or(10) as usize;
+            let versions = brain.storage.read().await.sqlite
+                .get_memory_versions_raw(memory_id, limit).await?;
+            Ok(json!(versions))
+        }
+
+        "restore_version" => {
+            let version_id = args["version_id"].as_i64()
+                .ok_or_else(|| anyhow::anyhow!("version_id (integer) required"))?;
+            let scope   = agent_scope(args);
+            let storage = brain.storage.read().await;
+            let ver = storage.sqlite.get_version_raw(version_id).await?
+                .ok_or_else(|| anyhow::anyhow!("version {version_id} not found"))?;
+            let memory_id_str = ver["memory_id"].as_str().unwrap_or("").to_string();
+            let mid = MemoryId(memory_id_str.clone());
+            let mut node = storage.sqlite.get_memory(&mid, &scope).await?
+                .ok_or_else(|| anyhow::anyhow!("memory {memory_id_str} not found"))?;
+            storage.sqlite.log_memory_version(
+                &node, args["agent_id"].as_str(), Some("auto-snapshot before restore"),
+            ).await?;
+            node.content  = ver["content"].as_str().unwrap_or("").to_string();
+            node.tags     = serde_json::from_str(ver["tags_json"].as_str().unwrap_or("[]"))
+                .unwrap_or_default();
+            node.salience = ver["salience"].as_f64().unwrap_or(0.5) as f32;
+            storage.sqlite.update_memory(&node).await?;
+            Ok(json!({
+                "status":       "ok",
+                "restored_to":  version_id,
+                "memory_id":    memory_id_str,
+            }))
+        }
+
         _ => Ok(json!({ "status": "not_yet_implemented", "tool": name })),
     }
 }

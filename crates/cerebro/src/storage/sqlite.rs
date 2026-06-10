@@ -1156,6 +1156,115 @@ impl SqliteStore {
         for r in rows { let (a, cnt) = r?; by_action.insert(a, cnt.into()); }
         Ok(serde_json::json!({ "total_events": total, "by_action": by_action }))
     }
+
+    // -----------------------------------------------------------------------
+    // Memory versions — snapshot content before each update
+    // -----------------------------------------------------------------------
+
+    pub async fn log_memory_version(
+        &self,
+        node: &MemoryNode,
+        edited_by: Option<&str>,
+        change_note: Option<&str>,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO memory_versions \
+             (memory_id, content, tags_json, salience, visibility, edited_by, edited_at, change_note) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                node.id.0,
+                node.content,
+                serde_json::to_string(&node.tags)?,
+                node.salience as f64,
+                enum_to_str(&node.visibility)?,
+                edited_by,
+                Utc::now().to_rfc3339(),
+                change_note,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub async fn get_memory_versions_raw(
+        &self,
+        memory_id: &str,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().await;
+        let limit_val = limit as i64;
+        let mut stmt = conn.prepare(
+            "SELECT id, memory_id, content, tags_json, salience, visibility, \
+             edited_by, edited_at, change_note \
+             FROM memory_versions WHERE memory_id = ? ORDER BY edited_at DESC LIMIT ?"
+        )?;
+        let rows = stmt.query_map(params![memory_id, limit_val], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, f64>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, Option<String>>(8)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (id, mid, content, tags_json, salience, visibility, edited_by, edited_at, change_note) = r?;
+            out.push(serde_json::json!({
+                "id":          id,
+                "memory_id":   mid,
+                "content":     content,
+                "tags_json":   tags_json,
+                "salience":    salience,
+                "visibility":  visibility,
+                "edited_by":   edited_by,
+                "edited_at":   edited_at,
+                "change_note": change_note,
+            }));
+        }
+        Ok(out)
+    }
+
+    pub async fn get_version_raw(&self, version_id: i64) -> Result<Option<serde_json::Value>> {
+        let conn = self.conn.lock().await;
+        let result = conn.query_row(
+            "SELECT id, memory_id, content, tags_json, salience, visibility, \
+             edited_by, edited_at, change_note \
+             FROM memory_versions WHERE id = ?",
+            params![version_id],
+            |r| Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, f64>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, Option<String>>(8)?,
+            )),
+        );
+        match result {
+            Ok((id, mid, content, tags_json, salience, visibility, edited_by, edited_at, change_note)) =>
+                Ok(Some(serde_json::json!({
+                    "id":          id,
+                    "memory_id":   mid,
+                    "content":     content,
+                    "tags_json":   tags_json,
+                    "salience":    salience,
+                    "visibility":  visibility,
+                    "edited_by":   edited_by,
+                    "edited_at":   edited_at,
+                    "change_note": change_note,
+                }))),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 const SCHEMA_SQL: &str = r#"
@@ -1258,6 +1367,21 @@ CREATE TABLE IF NOT EXISTS dream_reports (
     phases      TEXT NOT NULL DEFAULT '[]',
     metadata    TEXT NOT NULL DEFAULT 'null'
 );
+
+CREATE TABLE IF NOT EXISTS memory_versions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    memory_id   TEXT NOT NULL,
+    content     TEXT NOT NULL,
+    tags_json   TEXT NOT NULL DEFAULT '[]',
+    salience    REAL NOT NULL,
+    visibility  TEXT NOT NULL,
+    edited_by   TEXT,
+    edited_at   TEXT NOT NULL,
+    change_note TEXT,
+    FOREIGN KEY (memory_id) REFERENCES memories(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_versions_memory ON memory_versions(memory_id);
 
 -- FTS5 virtual table for keyword search (FTS5 fallback when vector search unavailable)
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(

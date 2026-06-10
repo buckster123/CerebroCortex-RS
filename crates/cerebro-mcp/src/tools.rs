@@ -622,6 +622,189 @@ fn tool_schema(name: &str) -> Value {
             }
         }),
 
+        "store_intention" => json!({
+            "name": "store_intention",
+            "description": "Save a TODO or reminder for future action. The system will surface it when relevant.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "content":  { "type": "string", "description": "The TODO or reminder content" },
+                    "tags":     { "anyOf": [{"type":"array","items":{"type":"string"}},{"type":"string"}], "description": "Tags for categorization" },
+                    "agent_id": { "type": "string", "description": "Agent storing this intention" },
+                    "salience": { "type": "number", "description": "Importance 0-1 (default: 0.7)" }
+                },
+                "required": ["content"]
+            }
+        }),
+
+        "list_intentions" => json!({
+            "name": "list_intentions",
+            "description": "List pending TODOs and reminders that have not been resolved.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "agent_id":    { "type": "string", "description": "Filter by agent" },
+                    "min_salience":{ "type": "number", "description": "Minimum importance threshold (default: 0.3)" },
+                    "limit":       { "type": "integer", "description": "Max results (default: 50)" }
+                },
+                "required": []
+            }
+        }),
+
+        "resolve_intention" => json!({
+            "name": "resolve_intention",
+            "description": "Mark a TODO or reminder as done.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "memory_id": { "type": "string", "description": "Memory ID of the intention to resolve" },
+                    "agent_id":  { "type": "string", "description": "Agent ID for access check" }
+                },
+                "required": ["memory_id"]
+            }
+        }),
+
+        "store_procedure" => json!({
+            "name": "store_procedure",
+            "description": "Store a workflow, strategy, or how-to guide. These are recalled when you need instructions for a task.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "content":      { "type": "string", "description": "The workflow or how-to content" },
+                    "tags":         { "anyOf": [{"type":"array","items":{"type":"string"}},{"type":"string"}], "description": "Tags for categorization" },
+                    "derived_from": { "anyOf": [{"type":"array","items":{"type":"string"}},{"type":"string"}], "description": "IDs of memories this procedure is derived from" },
+                    "agent_id":     { "type": "string", "description": "Agent storing this procedure" }
+                },
+                "required": ["content"]
+            }
+        }),
+
+        "list_procedures" => json!({
+            "name": "list_procedures",
+            "description": "List all stored workflows, strategies, and how-to guides.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "agent_id":    { "type": "string", "description": "Filter by agent" },
+                    "min_salience":{ "type": "number", "description": "Minimum importance threshold (default: 0.0)" },
+                    "limit":       { "type": "integer", "description": "Max results (default: 50)" }
+                },
+                "required": []
+            }
+        }),
+
+        "find_relevant_procedures" => json!({
+            "name": "find_relevant_procedures",
+            "description": "Find workflows and how-to guides matching given tags or concepts.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tags":     { "anyOf": [{"type":"array","items":{"type":"string"}},{"type":"string"}], "description": "Tags to match" },
+                    "concepts": { "anyOf": [{"type":"array","items":{"type":"string"}},{"type":"string"}], "description": "Concepts to match" },
+                    "limit":    { "type": "integer", "description": "Max results (default: 5)" },
+                    "agent_id": { "type": "string", "description": "Agent scope" }
+                },
+                "required": []
+            }
+        }),
+
+        "record_procedure_outcome" => json!({
+            "name": "record_procedure_outcome",
+            "description": "Record whether a procedure worked or failed. This improves future procedure recommendations.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "procedure_id": { "type": "string", "description": "Procedure memory ID" },
+                    "success":      { "type": "boolean", "description": "Whether the procedure succeeded" },
+                    "agent_id":     { "type": "string", "description": "Agent ID for access check" }
+                },
+                "required": ["procedure_id", "success"]
+            }
+        }),
+
+        "create_schema" => json!({
+            "name": "create_schema",
+            "description": "Create a general pattern or principle derived from multiple memories. Useful for capturing recurring themes or lessons learned.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "content":    { "type": "string", "description": "The pattern or principle to record" },
+                    "source_ids": { "anyOf": [{"type":"array","items":{"type":"string"}},{"type":"string"}], "description": "IDs of the memories this pattern is derived from" },
+                    "tags":       { "anyOf": [{"type":"array","items":{"type":"string"}},{"type":"string"}], "description": "Tags for categorization" },
+                    "agent_id":   { "type": "string", "description": "Agent creating this schema" },
+                    "salience":   { "type": "number", "description": "Importance 0-1 (default: 0.7)" }
+                },
+                "required": ["content", "source_ids"]
+            }
+        }),
+
+        "list_schemas" => json!({
+            "name": "list_schemas",
+            "description": "List all stored patterns and principles.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string", "description": "Filter by agent" },
+                    "limit":    { "type": "integer", "description": "Max results (default: 50)" }
+                },
+                "required": []
+            }
+        }),
+
+        "find_matching_schemas" => json!({
+            "name": "find_matching_schemas",
+            "description": "Find patterns and principles matching given tags or concepts.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tags":     { "anyOf": [{"type":"array","items":{"type":"string"}},{"type":"string"}], "description": "Tags to match" },
+                    "concepts": { "anyOf": [{"type":"array","items":{"type":"string"}},{"type":"string"}], "description": "Concepts to match" },
+                    "limit":    { "type": "integer", "description": "Max results (default: 5)" },
+                    "agent_id": { "type": "string", "description": "Agent scope" }
+                },
+                "required": []
+            }
+        }),
+
+        "get_schema_sources" => json!({
+            "name": "get_schema_sources",
+            "description": "Get the original memories that a pattern or principle was derived from.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "schema_id": { "type": "string", "description": "Schema memory ID" },
+                    "agent_id":  { "type": "string", "description": "Agent ID for access check" }
+                },
+                "required": ["schema_id"]
+            }
+        }),
+
+        "get_memory_versions" => json!({
+            "name": "get_memory_versions",
+            "description": "Get version history for a memory. Each content change creates a snapshot.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "memory_id": { "type": "string", "description": "Memory ID" },
+                    "limit":     { "type": "integer", "description": "Max versions to return (default: 10)" }
+                },
+                "required": ["memory_id"]
+            }
+        }),
+
+        "restore_version" => json!({
+            "name": "restore_version",
+            "description": "Restore a memory to a previous version snapshot.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "version_id": { "type": "integer", "description": "Version row ID from get_memory_versions" },
+                    "agent_id":   { "type": "string", "description": "Agent ID for access check" }
+                },
+                "required": ["version_id"]
+            }
+        }),
+
         _ => json!({
             "name": name,
             "description": format!("(stub) {name}"),
