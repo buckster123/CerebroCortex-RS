@@ -326,6 +326,21 @@ printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion
   /usr/local/bin/cerebro-mcp
 ```
 
+### Platform tiers
+
+The same binary, different env vars. No special builds per device.
+
+| Tier | Hardware | `CEREBRO_EMBED_MODEL` | RSS | Search |
+|------|----------|-----------------------|-----|--------|
+| **Nano** | Pi Zero 2W, any 512MB board | `""` (disabled) | ~23 MB | FTS5 keyword |
+| **Micro** | Pi 4 1-2GB | `BAAI/bge-small-en-v1.5` | ~275 MB | cosine ANN (384-dim) |
+| **Standard** | Pi 5, x86 mini-PC | `BAAI/bge-small-en-v1.5` | ~275 MB | cosine ANN |
+| **Pro** | x86 + GPU (CUDA/ROCm/CoreML) | `BAAI/bge-large-en-v1.5`* | ~500 MB | cosine ANN (1024-dim) |
+
+\* `bge-large` support and GPU ONNX execution providers are planned — CPU works everywhere today, GPU is additive.
+
+**Why this matters:** Pi 5 16GB now sells for $300+. The real target is the hardware sitting in drawers — last-gen mini-PCs, replaced Mac Minis, Pi 4s from the before-times. With `CEREBRO_EMBED_MODEL=""` the entire memory system runs in 23 MB RSS, leaving the rest for agentd, local inference, and the OS.
+
 ### Running without embeddings (Pi Zero W2 / 1 GB devices)
 
 Set `CEREBRO_EMBED_MODEL=""` — fastembed init is skipped, FTS5 handles all search. RSS stays at ~23 MB. Recall latency unchanged (~26 ms, pure FTS5 + spreading activation).
