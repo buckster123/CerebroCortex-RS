@@ -6,10 +6,10 @@ use tokio::sync::RwLock;
 use crate::{
     config::Config,
     engines::{
-        AffectEngine, EpisodicEngine, ExecutiveEngine, GatingEngine, LinkEngine,
-        ProceduralEngine, SchemaEngine, SemanticEngine, DreamEngine,
+        AffectEngine, DreamEngine, EpisodicEngine, ExecutiveEngine, GatingEngine,
+        LinkEngine, ProceduralEngine, SchemaEngine, SemanticEngine,
     },
-    models::{MemoryNode, AssociativeLink},
+    models::{AssociativeLink, MemoryNode},
     storage::StorageCoordinator,
     types::{MemoryId, MemoryType, VisibilityScope},
 };

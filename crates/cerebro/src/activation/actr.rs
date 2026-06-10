@@ -1,16 +1,15 @@
 use chrono::{DateTime, Utc};
-use rand::Rng;
 
-use crate::config::{ACTR_DECAY_RATE, ACTR_MIN_TIME_SECONDS, ACTR_NOISE};
+use crate::config::{ACTR_DECAY_RATE, ACTR_MIN_TIME_SECONDS};
 
-/// B(t) = ln( Σ t_k^{-d} ) + ε
-/// where t_k is seconds since k-th access and ε ~ Uniform(-noise, noise).
-/// Matches Python compute_actr_activation() in activation/strength.py.
+/// B(t) = ln( Σ t_k^{-d} )
+///
+/// Matches Python `base_level_activation()` in `activation/strength.py` exactly.
+/// NOTE: no noise here — noise (s parameter) lives in `recall_probability()`.
 pub fn base_level_activation(
     access_times: &[DateTime<Utc>],
     now: DateTime<Utc>,
     decay: f32,
-    noise: f32,
 ) -> f32 {
     if access_times.is_empty() {
         return f32::NEG_INFINITY;
@@ -18,18 +17,19 @@ pub fn base_level_activation(
     let sum: f32 = access_times
         .iter()
         .map(|t| {
-            let secs = (now - *t).num_seconds().max(1) as f32;
+            let secs = (now - *t).num_seconds() as f32;
             secs.max(ACTR_MIN_TIME_SECONDS).powf(-decay)
         })
         .sum();
-    let base = sum.ln();
-    let epsilon: f32 = rand::thread_rng().gen_range(-noise..noise);
-    base + epsilon
+    if sum <= 0.0 {
+        return f32::NEG_INFINITY;
+    }
+    sum.ln()
 }
 
-/// Convenience wrapper using default decay + noise from config.
+/// Convenience wrapper using default decay from config.
 pub fn actr_activation(access_times: &[DateTime<Utc>], now: DateTime<Utc>) -> f32 {
-    base_level_activation(access_times, now, ACTR_DECAY_RATE, ACTR_NOISE)
+    base_level_activation(access_times, now, ACTR_DECAY_RATE)
 }
 
 #[cfg(test)]
@@ -37,29 +37,56 @@ mod tests {
     use super::*;
     use chrono::Duration;
 
+    fn now_fixed() -> DateTime<Utc> {
+        // 2025-01-01T12:00:00Z = Unix 1735732800
+        chrono::DateTime::from_timestamp(1_735_732_800, 0).unwrap()
+    }
+
     #[test]
-    fn single_recent_access_is_finite() {
-        let now = Utc::now();
+    fn single_1s_access_is_zero() {
+        let now = now_fixed();
+        let times = vec![now - Duration::seconds(1)];
+        let b = base_level_activation(&times, now, 0.5);
+        // B = ln(1^{-0.5}) = ln(1) = 0.0
+        assert!((b - 0.0).abs() < 1e-5, "got {b}");
+    }
+
+    #[test]
+    fn single_60s_access() {
+        let now = now_fixed();
         let times = vec![now - Duration::seconds(60)];
-        let b = actr_activation(&times, now);
-        assert!(b.is_finite());
+        let b = base_level_activation(&times, now, 0.5);
+        let expected = -2.04717228_f32;
+        assert!((b - expected).abs() < 1e-4, "got {b}, expected {expected}");
     }
 
     #[test]
     fn empty_access_is_neg_inf() {
-        let b = actr_activation(&[], Utc::now());
+        let b = actr_activation(&[], chrono::Utc::now());
         assert_eq!(b, f32::NEG_INFINITY);
     }
 
     #[test]
     fn more_recent_access_wins() {
-        let now = Utc::now();
-        let recent  = vec![now - Duration::seconds(10)];
-        let stale   = vec![now - Duration::seconds(86400 * 30)];
-        // Run many times to average out noise
-        let avg = |times: &[DateTime<Utc>]| -> f32 {
-            (0..50).map(|_| base_level_activation(times, now, 0.5, 0.0)).sum::<f32>() / 50.0
-        };
-        assert!(avg(&recent) > avg(&stale));
+        let now = now_fixed();
+        let recent = vec![now - Duration::seconds(10)];
+        let stale  = vec![now - Duration::seconds(86400 * 30)];
+        assert!(
+            base_level_activation(&recent, now, 0.5) >
+            base_level_activation(&stale,  now, 0.5)
+        );
+    }
+
+    #[test]
+    fn three_access_case() {
+        let now = now_fixed();
+        let times = vec![
+            now - Duration::seconds(60),
+            now - Duration::seconds(3600),
+            now - Duration::seconds(86400),
+        ];
+        let b = base_level_activation(&times, now, 0.5);
+        let expected = -1.90268088_f32;
+        assert!((b - expected).abs() < 1e-4, "got {b}, expected {expected}");
     }
 }

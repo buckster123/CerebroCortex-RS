@@ -6,7 +6,11 @@
       "Bash(gh repo *)",
       "Bash(cargo check *)",
       "Bash(git remote *)",
-      "Bash(git add *)"
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(PYTHONPATH=../CerebroCortex/src python *)",
+      "Bash(PYTHONPATH=../CerebroCortex/src python3 *)",
+      "Bash(cargo test *)"
     ]
   }
 }
