@@ -36,11 +36,11 @@ impl CerebroCortex {
         let storage = StorageCoordinator::new(&config).await?;
         Ok(Self {
             storage:     Arc::new(RwLock::new(storage)),
-            thalamus:    GatingEngine::new(0.1),
+            thalamus:    GatingEngine::new(),
             amygdala:    AffectEngine::new(),
             temporal:    SemanticEngine::new(),
             hippocampus: EpisodicEngine::new(),
-            association: LinkEngine::new(0.3),
+            association: LinkEngine::new(),
             cerebellum:  ProceduralEngine::new(),
             prefrontal:  ExecutiveEngine::new(),
             neocortex:   SchemaEngine::new(),
@@ -62,11 +62,8 @@ impl CerebroCortex {
         let content = content.into();
         let mut node = MemoryNode::new(content, memory_type);
 
-        // Amygdala: classify emotional valence and apply salience boost
-        let valence   = self.amygdala.classify_valence(&node.content);
-        let boost     = self.amygdala.salience_boost(valence, node.emotional_intensity);
-        node.salience = (node.salience + boost).clamp(0.0, 1.0);
-        node.emotional_valence = Some(valence);
+        // Amygdala: classify emotional valence and apply salience modulation
+        node = self.amygdala.apply_emotion(node);
 
         // Apply visibility scope
         if let Some(ref agent_id) = scope.agent_id {

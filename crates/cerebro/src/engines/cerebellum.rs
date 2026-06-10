@@ -1,9 +1,19 @@
 /// ProceduralEngine — cerebellum.
 /// Stores and retrieves procedural memories: workflows, strategies, patterns.
-/// Tracks outcome history for procedure quality scoring.
-/// Mirrors Python engines/cerebellum.py.
+/// Storage operations are wired in cortex.rs (step 7).
+/// Mirrors Python engines/cerebellum.py ProceduralEngine.
 pub struct ProceduralEngine;
 
 impl ProceduralEngine {
     pub fn new() -> Self { Self }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn engine_constructs() {
+        let _ = ProceduralEngine::new();
+    }
 }
