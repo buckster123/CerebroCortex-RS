@@ -10,15 +10,16 @@ Read [ARCHITECTURE.md](ARCHITECTURE.md) before opening a PR — it explains the 
 
 CerebroCortex-RS is a **port, not a redesign.** Good PRs:
 
-- Implement a build-order step or a piece of one
 - Fix a deviation from the Python reference behaviour
 - Add a missing test (especially activation math fixtures)
 - Improve a doc that was wrong or incomplete
+- Performance improvements with verifiable benchmarks
+- Pi / embedded platform improvements (memory, startup, binary size)
 
 Out of scope for now:
 - New cognitive features (add them to the Python original first, then port)
 - New MCP tools not in the Python version
-- Changing the 63-tool interface (it's a contract with agentd)
+- Changing the 66-tool interface (it's a contract with agentd)
 - Vision extras / CCBS bootstrap modules — deferred to Phase 3
 
 ---
@@ -93,12 +94,18 @@ If you find a behavioural difference from the Python version, open an issue with
 
 ---
 
-## First release milestone
+## Status
 
-The first release (`v0.1.0`) is gated on:
-- Build-order steps 1–9 complete (full MCP tool surface, no dream engine yet)
-- Step 12: Rust reads a Python-generated `cerebro.db` without error
-- `cerebro-mcp` running on Pi under systemd, wired into agentd as the `cerebro` plugin
-- The Python version is retired from `plugins.toml`
+All 12 build-order steps are complete. The binary is production-deployed on a Pi 5 running ApexOS, handling live agent memory for multiple agents (FORGE, GROK, COMPOSER, CLAUDE-APEX). The Python `cerebro-mcp` plugin was hot-swapped without any agentd reconfiguration.
 
-Dream engine (step 10) is `v0.2.0`.
+**Verified on Pi 5 (Cortex-A76, arm64):**
+- Steady-state recall latency: ~26 ms (cosine ANN over 134 memories)
+- Full remember pipeline: ~76 ms (gate → emotion → concepts → SQLite + embed + graph)
+- RSS with BGE-small-en model loaded: ~275 MB
+- RSS with embedding disabled (`CEREBRO_EMBED_MODEL=""`): ~23 MB — suitable for Pi Zero W2
+
+**What's next (Phase 3 roadmap):**
+- `cognitive_bootstrap` / `ingest_file` / `describe_image` / `search_vision` — vision extras
+- Re-embed migrated Python memories (18 memories with `embedding = NULL`)
+- Scheduled `dream_run` on the Pi (cron or agentd trigger)
+- `cerebro-api` systemd service on Pi (REST dashboard, port 8767)

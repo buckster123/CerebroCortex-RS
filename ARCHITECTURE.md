@@ -15,7 +15,38 @@ CerebroCortex is a brain-analogous AI memory system. It models six memory types 
 - **9 brain-region engines** — each handles a cognitive function
 - **6-phase dream engine** — memory consolidation cycle (3 algorithmic + 3 LLM)
 
-The Rust port is a clean translation of the Python semantics. The cognitive architecture, MCP tool surface, and wire format are preserved exactly.
+The Rust port is a clean translation of the Python semantics. The cognitive architecture, MCP tool surface (66 tools), and wire format are preserved exactly.
+
+### Engine pipeline
+
+```mermaid
+flowchart LR
+    subgraph remember
+        TH[Thalamus\nsalience gate] --> AM[Amygdala\nemotion]
+        AM --> TE[Temporal\nconcepts]
+        TE --> HI[Hippocampus\nepisodic]
+        TE --> AS[Association\nHebbian links]
+    end
+    subgraph storage
+        SQ[(SQLite)] --- VE[sqlite-vec\nANN]
+        SQ --- GR[petgraph\ngraph]
+    end
+    subgraph recall
+        PF[Prefrontal\nranking] --> NC[Neocortex\nschemas]
+    end
+    remember --> storage --> recall
+```
+
+### Dream consolidation
+
+```mermaid
+flowchart LR
+    SWS["① SWS Replay\nalgorithmic"] --> PAT["② Pattern Extraction\nLLM"]
+    PAT --> SCH["③ Schema Formation\nLLM"]
+    SCH --> EMO["④ Emotional Reprocessing\nalgorithmic"]
+    EMO --> PRU["⑤ Pruning\nalgorithmic"]
+    PRU --> REM["⑥ REM Recombination\nLLM"]
+```
 
 ---
 
@@ -196,7 +227,7 @@ LLM call budget: `DREAM_MAX_LLM_CALLS = 20` per cycle per agent. Phases 2, 3, 6 
 
 ## MCP server
 
-`cerebro-mcp` exposes 63 tools over newline-delimited JSON-RPC on stdin/stdout. Stderr is for tracing logs. The protocol version is `"2024-11-05"`.
+`cerebro-mcp` exposes 66 tools over newline-delimited JSON-RPC on stdin/stdout. Stderr is for tracing logs. The protocol version is `"2024-11-05"`.
 
 **Tool categories:**
 - Core: `remember`, `recall`, `get_memory`, `update_memory`, `delete_memory`
@@ -215,24 +246,28 @@ LLM call budget: `DREAM_MAX_LLM_CALLS = 20` per cycle per agent. Phases 2, 3, 6 
 
 Tool descriptions are verbatim from Python `interfaces/mcp_server.py` — they are agent-facing strings and must not change.
 
+> **Note:** the Python server had 63 tools at the time the port began; the count grew to 66 as the Python version was updated in parallel. All 66 are wired in `cerebro-mcp/src/dispatch.rs`.
+
 ---
 
 ## Build order and gates
 
-| Step | Gate to pass before moving on |
-|------|-------------------------------|
-| 1 | `cargo test types_roundtrip` — all serde round-trips pass |
-| 2 | Run `gen_activation_fixtures.py`, then `cargo test activation_fixtures` — all within 1e-4 |
-| 3 | `cargo test storage_basic` — schema init, insert, scope-filtered get |
-| 4 | `cargo test storage_vector` — cosine search returns expected ordering |
-| 5 | `cargo test storage_graph` — neighbor traversal matches SQLite links |
-| 6 | `cargo test engines_*` — all 8 deterministic engines produce expected output |
-| 7 | `cargo test cortex` — `remember()` persists, `recall()` returns matching memory |
-| 8 | Manual: MCP handshake against agentd with `remember` + `recall` tools |
-| 9 | Manual: all 63 tools respond without panic |
-| 10 | Manual: dream cycle runs all 6 phases with live Anthropic key |
-| 11 | `cerebro stats` and REST `/health` respond correctly |
-| 12 | `cargo test db_compat` — Rust opens a Python-generated `cerebro.db` and reads memories |
+All 12 steps are complete and production-deployed.
+
+| Step | Gate | Status |
+|------|------|--------|
+| 1 | `cargo test types_roundtrip` — serde round-trips | ✓ |
+| 2 | `cargo test activation_fixtures` — ACT-R + FSRS + spreading within 1e-4 of Python | ✓ |
+| 3 | `cargo test storage_basic` — schema init, insert, scope-filtered get | ✓ |
+| 4 | `cargo test storage_vector` — cosine search returns expected ordering | ✓ |
+| 5 | `cargo test storage_graph` — neighbor traversal matches SQLite links | ✓ |
+| 6 | `cargo test engines_*` — all 8 deterministic engines pass | ✓ |
+| 7 | `cargo test cortex` — `remember()` persists, `recall()` returns matching memory | ✓ |
+| 8 | MCP handshake against agentd — `remember` + `recall` tools | ✓ |
+| 9 | All 66 tools respond without panic | ✓ |
+| 10 | Dream cycle runs all 6 phases with live Anthropic key | ✓ |
+| 11 | `cerebro stats` and REST `/health` respond correctly | ✓ |
+| 12 | `cargo test db_compat` — Rust opens a Python-generated `cerebro.db`, migrates, reads memories | ✓ |
 
 ---
 
