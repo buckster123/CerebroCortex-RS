@@ -43,9 +43,8 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Remember { content, memory_type } => {
-            let mt = serde_json::from_value(serde_json::Value::String(memory_type))
-                .unwrap_or(MemoryType::Semantic);
-            let node = brain.remember(content, mt, VisibilityScope::global()).await?;
+            let mt: Option<MemoryType> = serde_json::from_value(serde_json::Value::String(memory_type)).ok();
+            let node = brain.remember(content, mt, None, None, VisibilityScope::global()).await?;
             println!("stored: {}", node.id.0);
         }
         Command::Recall { query, top_k } => {

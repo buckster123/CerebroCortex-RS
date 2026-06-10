@@ -41,9 +41,14 @@ async fn main() -> Result<()> {
                 break;
             }
             Ok(msg) => {
+                // Notifications carry no "id" — never send a response to them.
+                let is_notification = msg["id"].is_null()
+                    || msg["method"].as_str().map(|m| m.starts_with("notifications/")).unwrap_or(false);
+                if is_notification { continue; }
+
                 let method = msg["method"].as_str().unwrap_or("").to_string();
                 let resp = match method.as_str() {
-                    "tools/list" => dispatch::tools_list(),
+                    "tools/list" => dispatch::tools_list(&msg),
                     "tools/call" => dispatch::dispatch_tool(msg, Arc::clone(&brain)).await,
                     _ => dispatch::method_not_found(&msg),
                 };

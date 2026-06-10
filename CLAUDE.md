@@ -124,7 +124,7 @@ agentd never knows. Same 63 tools. Same MCP contract.
 | 5 | `storage/graph.rs` | petgraph rebuild + neighbor traversal | ✓ 5 graph tests pass |
 | 6 | `engines/` (thalamus→neocortex) | All 8 deterministic engines pass | ✓ 34 engine unit tests pass |
 | 7 | `cortex.rs` | `remember()` + `recall()` end-to-end | ✓ 6 cortex pipeline tests pass |
-| 8 | `cerebro-mcp/` (core tools) | MCP handshake + remember/recall vs agentd | ⬜ |
+| 8 | `cerebro-mcp/` (core tools) | MCP handshake + remember/recall vs agentd | ✓ 8 dispatch tests pass |
 | 9 | Remaining 61 MCP tools | Full tool surface | ⬜ |
 | 10 | `engines/dream.rs` | All 6 phases, live LLM calls | ⬜ |
 | 11 | `cerebro-cli/` + `cerebro-api/` | CLI and REST parity | ⬜ |
@@ -137,6 +137,7 @@ Pass `agent_id: "FORGE"` to any Cerebro tool that accepts it so memories stay is
 
 ---
 
+**Step 8 done** — `cerebro-mcp` dispatch wired. Notification handling (skip response for `notifications/*`), id echoing fixed. `remember`, `recall`, `associate`, `get_memory` routes fully wired; full `inputSchema` for all four. 8 dispatch tests. Tool count corrected: 66 (not 63 — Python server has 66 as of 2026-06-10).
 **Step 7 done** — `cortex.rs` `remember()` + `recall()` + `associate()` fully wired. Pipeline: thalamus gate → amygdala → temporal → SQLite → vector embed → graph node; recall: FTS5/vec search → spreading activation → bulk SQLite load → prefrontal ranking. 6 new end-to-end tests. Total: 108 tests (68 unit + 40 integration).
 **Step 6 done** — all 8 deterministic engines implemented. Pure logic tested: thalamus gating/classify/salience, amygdala valence/arousal, temporal concept extraction/bigrams/enrich_node, association find_path/common_neighbors, prefrontal rank_results, neocortex tag helpers. Hippocampus/cerebellum stubbed (DB-driven, wired in step 7). 34 new unit tests.
 **Step 5 done** — `storage/graph.rs`: `rebuild_from_db()` loads all non-deleted memories as nodes and all live-endpoint links as edges. Soft-deleted nodes and links to deleted endpoints are excluded. 5 tests.
