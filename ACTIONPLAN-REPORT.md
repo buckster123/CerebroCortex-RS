@@ -12,6 +12,29 @@
   per-call crash isolation Python has. No data-loss or injection bugs found. The gaps are
   well-contained and individually fixable.
 
+## Resolution log — 2026-06-12 (Opus 4.8, post-audit fix session)
+
+Fixed and pushed to `main` (commits after `c00ed86`):
+
+| ID | Status | Notes |
+|----|--------|-------|
+| C-RS-001 | ✅ Fixed | `spread()` re-ported faithfully (seed weights, undirected BFS, sublinear accumulation, normalisation). **+5th divergence found & fixed**: was outgoing-only, Python is undirected (`mode="all"`). Verified by 7-graph fixture suite generated from the real Python `spreading_activation`, matched within 1e-4. |
+| C-RS-002 | ✅ Fixed | Per-call `tokio::spawn` panic boundary; a panicking handler → `-32603`, daemon keeps serving. Test trips a panic then succeeds on the next call. |
+| C-RS-003 | ✅ Fixed | Real scope-visibility map via new `SqliteStore::get_visibility_meta`; global scope short-circuits. Folded into the C-RS-001 re-port. |
+| C-RS-004 | ⚠️ Partial | Pre-phase stale-episode close (`close_stale_episodes`, 24h) ✅; `episodes_consolidated` populated from phase 1 ✅. **Resume-from-completed-phases deferred** (needs a persisted per-cycle phase table + a `cycle_id` on the `dream_run` tool surface). |
+| C-RS-005 | ✅ Fixed | `activation_bench` compiles (`retrievability` call updated to the 2-arg API). |
+| C-RS-006 | ✅ Fixed | `-32602` for arg-validation, `-32601` for not-implemented, `-32603` for internals; handshake guarded on `method == "initialize"`. |
+| C-RS-007 | ✅ Fixed | The 4 deferred Tier-7 tools stay advertised (surface parity = 66) but now return an honest `-32601` not-implemented error instead of a success stub. |
+| C-RS-008 | ✅ Fixed | Cross-phase LLM ceiling checks `effective_budget`, not the constant 20. |
+| C-RS-009 | ✅ Fixed | `graph_neighbors` now scope-filters; `stats`/`dream_status` unused agent param dropped (global). |
+| C-RS-010 | ✅ Fixed | `associate` validates both endpoints exist before writing — no more dangling orphan link rows. |
+| C-RS-011 | ⏸️ Deferred (documented) | MCP `resources`/`prompts` surfaces. Capabilities are advertised honestly (not claimed), so no broken promise. Port the 3 prompts only if an ApexOS consumer needs them — revisit in the integration pass. |
+| C-RS-012 | ✅ Fixed | "63 tools" drift reconciled to 66 (62 functional + 4 deferred) across doc, comment, and the renamed list test. |
+| C-RS-013 | ✅ Fixed | `cargo clippy --workspace --all-targets` and `cargo build --workspace` both warning-free. |
+| C-RS-014 | ⏸️ Deferred (documented) | Recall wire-shape vs consumers — a verification task explicitly scoped to the ApexOS-RS integration pass (out of scope this session, per the locked port-internals-only scope). |
+
+**Net**: 10 of 14 fully fixed, 1 partial (C-RS-004), 2 deliberate deferrals (C-RS-011, C-RS-014) tied to the ApexOS integration pass. Test count 118 → 126; clippy 37 warnings + bench error → 0.
+
 ## Summary by severity
 
 | Severity | Count | IDs |

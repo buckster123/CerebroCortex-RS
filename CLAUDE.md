@@ -204,6 +204,9 @@ This feeds the knowledge graph. Dream cycles (`dream_run`) then consolidate acro
 - Python ↔ Rust DB schema compat — verify same column names/types (step 12)
 - CCBS (Cognitive Bootstrap modules) — defer until core is solid
 - Vision extras (image, PDF, CLIP) — Phase 3 roadmap
+- Dream-cycle **resume** (skip completed phases) — needs a persisted per-cycle phase table + a `cycle_id` on the `dream_run` tool (audit C-RS-004; pre-phase cleanup + `episodes_consolidated` already shipped)
+- MCP `resources`/`prompts` surfaces (3 prompts) — port only if an ApexOS consumer needs them; capabilities are advertised honestly so nothing is broken (audit C-RS-011)
+- Recall wire-shape parity vs agentd — verify during the ApexOS-RS integration pass (audit C-RS-014)
 
 ---
 
