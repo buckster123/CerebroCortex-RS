@@ -24,7 +24,23 @@
       "Bash(curl -s https://raw.githubusercontent.com/asg017/sqlite-vec/main/Cargo.toml)",
       "Bash(cargo add *)",
       "Bash(cargo build *)",
-      "Bash(grep \"\\\\.py$\")"
+      "Bash(grep \"\\\\.py$\")",
+      "mcp__cerebro-cortex__recall",
+      "mcp__cerebro-cortex__get_memory",
+      "Bash(git push *)",
+      "mcp__cerebro-cortex__store_intention",
+      "mcp__cerebro-cortex__session_recall",
+      "Read(//home/andre/.cerebro-cortex/**)",
+      "Bash(sshpass *)",
+      "Bash(ssh *)",
+      "Bash(grep -E \"color|background|#[0-9a-fA-F]{3,6}|rgb|rgba|border-radius|font\" /home/andre/Projects/ApexOS/ui/style.css)",
+      "Bash(grep -E \"color|background|#[0-9a-fA-F]{3,6}|rgb|rgba|border-radius|font\" /home/andre/Projects/ApexOS/ui/desktop-style.css)",
+      "Bash(grep -E \"#[0-9a-fA-F]{3,6}|rgba|--\" /home/andre/Projects/ApexOS/ui/style.css)",
+      "Bash(pkg-config --exists fontconfig)",
+      "Bash(grep -v \"^$\")",
+      "Bash(lsblk /dev/sdb)",
+      "Read(//run/media/andre/ps8s-models/hailo-pi-backup/**)",
+      "Bash(sudo umount /run/media/andre/bootfs)"
     ]
   }
 }

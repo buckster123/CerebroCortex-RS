@@ -205,7 +205,7 @@ impl VectorStore {
         );
 
         let conn = self.conn.lock().await;
-        let mut dyn_params: Vec<&dyn rusqlite::ToSql> = vec![&safe_query, &k_i64];
+        let dyn_params: Vec<&dyn rusqlite::ToSql> = vec![&safe_query, &k_i64];
         // scope_params go between safe_query and k — but they're already inserted via scope_sql
         // which uses ? placeholders too. Push scope_params before k_i64.
         // Rebuild correctly:
@@ -249,5 +249,5 @@ fn init_fastembed(model_name: &str) -> Result<fastembed::TextEmbedding> {
         "BAAI/bge-small-en-v1.5" => EmbeddingModel::BGESmallENV15,
         other => anyhow::bail!("unsupported embed model: {other}"),
     };
-    Ok(TextEmbedding::try_new(InitOptions::new(model))?)
+    TextEmbedding::try_new(InitOptions::new(model))
 }

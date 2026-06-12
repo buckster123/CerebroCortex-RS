@@ -4,7 +4,7 @@ use anyhow::Result;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    routing::{delete, get, post, put},
+    routing::{delete, get, post},
     Json, Router,
 };
 use cerebro::{
@@ -76,7 +76,6 @@ struct RememberReq {
     tags:        Option<Vec<String>>,
     salience:    Option<f64>,
     agent_id:    Option<String>,
-    visibility:  Option<String>,
 }
 
 #[derive(Deserialize)]

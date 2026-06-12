@@ -1,12 +1,12 @@
-/// Integration tests — build-order gates.
-///
-/// Step 1: types serde round-trips
-/// Step 2: activation values match Python fixtures within 1e-4
-/// Step 3: SQLite schema init and CRUD (coming)
-///
-/// Fixture generation: `PYTHONPATH=../CerebroCortex/src python3 scripts/gen_activation_fixtures.py`
-/// using the CerebroCortex venv:
-///   `/home/andre/Projects/CerebroCortex/venv/bin/python3 scripts/gen_activation_fixtures.py`
+// Integration tests — build-order gates.
+//
+// Step 1: types serde round-trips
+// Step 2: activation values match Python fixtures within 1e-4
+// Step 3: SQLite schema init and CRUD (coming)
+//
+// Fixture generation: `PYTHONPATH=../CerebroCortex/src python3 scripts/gen_activation_fixtures.py`
+// using the CerebroCortex venv:
+//   `/home/andre/Projects/CerebroCortex/venv/bin/python3 scripts/gen_activation_fixtures.py`
 
 // =============================================================================
 // Step 1 — types serde round-trips
@@ -108,7 +108,7 @@ mod activation_fixtures {
         update_difficulty_on_recall, update_stability_on_lapse, update_stability_on_recall,
     };
     use chrono::{DateTime, Duration, TimeZone, Utc};
-    use serde::Deserialize;
+    
 
     // Fixed reference time matching the fixture generator: 2025-01-01T12:00:00Z
     fn now_fixed() -> DateTime<Utc> {

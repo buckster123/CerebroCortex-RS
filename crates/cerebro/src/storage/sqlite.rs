@@ -22,7 +22,14 @@ fn register_sqlite_vec() -> bool {
             use sqlite_vec::sqlite3_vec_init;
             // sqlite3_auto_extension expects void(*)(void); transmute is the
             // canonical way to bridge the extension init signature in Rust.
-            sqlite3_auto_extension(Some(std::mem::transmute(sqlite3_vec_init as *const ())));
+            type ExtInit = unsafe extern "C" fn(
+                *mut rusqlite::ffi::sqlite3,
+                *mut *const std::os::raw::c_char,
+                *const rusqlite::ffi::sqlite3_api_routines,
+            ) -> std::os::raw::c_int;
+            sqlite3_auto_extension(Some(std::mem::transmute::<*const (), ExtInit>(
+                sqlite3_vec_init as *const (),
+            )));
         }
         true
     })
@@ -793,7 +800,7 @@ impl SqliteStore {
 
     pub async fn bulk_delete(&self, ids: &[MemoryId]) -> Result<usize> {
         if ids.is_empty() { return Ok(0); }
-        let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(", ");
+        let placeholders = std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(", ");
         let sql = format!(
             "UPDATE memories SET deleted_at = ? WHERE id IN ({placeholders}) AND deleted_at IS NULL"
         );
