@@ -828,15 +828,19 @@ fn tool_schema(name: &str) -> Value {
             }
         }),
 
+        // Deferred Tier-7 tools (ingest_file, describe_image, search_vision,
+        // cognitive_bootstrap). Advertised for surface parity with Python, but
+        // calling them returns an honest "not implemented" error (see dispatch).
         _ => json!({
             "name": name,
-            "description": format!("(stub) {name}"),
+            "description": format!("(not yet implemented) {name}"),
             "inputSchema": { "type": "object", "properties": {}, "required": [] }
         }),
     }
 }
 
-/// All 63 tool names — derived from Python mcp_server.py tool registry.
+/// All 66 tool names (62 functional + 4 deferred Tier-7 stubs) — derived from
+/// Python mcp_server.py tool registry.
 pub const TOOL_NAMES: &[&str] = &[
     "remember",
     "recall",
