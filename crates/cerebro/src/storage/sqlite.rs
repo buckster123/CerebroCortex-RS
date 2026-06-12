@@ -1221,6 +1221,24 @@ impl SqliteStore {
         )? > 0)
     }
 
+    /// Auto-close episodes that were never ended and whose `started_at` is
+    /// older than `max_age_hours`. Mirrors Python `close_stale_episodes`
+    /// (`hippocampus.py`, EPISODE_AUTO_CLOSE_HOURS = 24). Returns the count
+    /// closed. Used by the dream engine's pre-phase cleanup (C-RS-004).
+    pub async fn close_stale_episodes(&self, max_age_hours: i64) -> Result<usize> {
+        let cutoff = (Utc::now() - chrono::Duration::hours(max_age_hours)).to_rfc3339();
+        let conn = self.conn.lock().await;
+        let n = conn.execute(
+            "UPDATE episodes \
+             SET ended_at = ?1, \
+                 title    = COALESCE(title, '(auto-closed)'), \
+                 summary  = COALESCE(summary, 'auto-closed: stale open episode') \
+             WHERE ended_at IS NULL AND started_at < ?2",
+            params![Utc::now().to_rfc3339(), cutoff],
+        )?;
+        Ok(n)
+    }
+
     pub async fn get_episode_raw(&self, episode_id: &str) -> Result<Option<serde_json::Value>> {
         let conn = self.conn.lock().await;
         let ep = conn.query_row(
@@ -1735,3 +1753,44 @@ CREATE INDEX IF NOT EXISTS idx_links_source      ON links(source_id);
 CREATE INDEX IF NOT EXISTS idx_links_target      ON links(target_id);
 CREATE INDEX IF NOT EXISTS idx_audit_ts          ON audit_log(timestamp);
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    // C-RS-004: pre-phase cleanup closes stale open episodes but leaves fresh
+    // ones (and already-ended ones) untouched.
+    #[tokio::test]
+    async fn close_stale_episodes_closes_only_old_open_ones() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteStore::open(&dir.path().join("t.db")).await.unwrap();
+        {
+            let conn = store.conn.lock().await;
+            let old = (Utc::now() - chrono::Duration::hours(48)).to_rfc3339();
+            // 48h-old open episode → stale
+            conn.execute(
+                "INSERT INTO episodes (id, started_at, memory_ids, metadata) VALUES ('ep_old', ?1, '[]', 'null')",
+                params![old],
+            ).unwrap();
+            // fresh open episode → not stale
+            conn.execute(
+                "INSERT INTO episodes (id, started_at, memory_ids, metadata) VALUES ('ep_new', ?1, '[]', 'null')",
+                params![Utc::now().to_rfc3339()],
+            ).unwrap();
+            // old but already ended → not touched
+            conn.execute(
+                "INSERT INTO episodes (id, started_at, ended_at, memory_ids, metadata) VALUES ('ep_done', ?1, ?2, '[]', 'null')",
+                params![old, Utc::now().to_rfc3339()],
+            ).unwrap();
+        }
+
+        let n = store.close_stale_episodes(24).await.unwrap();
+        assert_eq!(n, 1, "only the 48h-old open episode should be closed");
+
+        let old = store.get_episode_raw("ep_old").await.unwrap().unwrap();
+        assert!(!old["ended_at"].is_null(), "stale episode should be closed");
+        let fresh = store.get_episode_raw("ep_new").await.unwrap().unwrap();
+        assert!(fresh["ended_at"].is_null(), "fresh open episode stays open");
+    }
+}

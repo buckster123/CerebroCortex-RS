@@ -911,6 +911,36 @@ mod cortex_pipeline {
         let storage = cortex.storage.read().await;
         assert_eq!(storage.graph.graph.node_count(), 2);
     }
+
+    // C-RS-004: a dream cycle reports the episodes it consolidated in phase 1
+    // (SWS replay), no longer a hardcoded 0.
+    #[tokio::test]
+    async fn dream_run_reports_episodes_consolidated() {
+        use std::sync::Arc;
+        let (cortex, _dir) = make_cortex().await;
+
+        // Two memories tied together in one episode.
+        let a = cortex.remember("debugging an async deadlock in the scheduler",
+            None, None, None, VisibilityScope::global()).await.unwrap();
+        let b = cortex.remember("the deadlock was a lock-ordering inversion bug",
+            None, None, None, VisibilityScope::global()).await.unwrap();
+        {
+            let storage = cortex.storage.read().await;
+            storage.sqlite.create_episode("ep_dream_test", Some("debug"), None, None).await.unwrap();
+            storage.sqlite.add_episode_step("ep_dream_test", 0, "found", Some(&a.id.0)).await.unwrap();
+            storage.sqlite.add_episode_step("ep_dream_test", 1, "fixed", Some(&b.id.0)).await.unwrap();
+        }
+
+        let cortex = Arc::new(cortex);
+        // max_llm_calls=0 → LLM phases skip; phase 1 (algorithmic) still runs.
+        let report = cortex.dream.run_cycle(VisibilityScope::global(), Arc::clone(&cortex), 0)
+            .await.unwrap();
+
+        assert_eq!(report.episodes_consolidated, 1,
+            "one 2-memory episode should be consolidated, got {}", report.episodes_consolidated);
+        assert_eq!(report.phases.len(), 6, "all 6 phases should be present");
+    }
+
 }
 
 // =============================================================================
