@@ -213,8 +213,9 @@ async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
 
+// stats is a global endpoint — memory_stats aggregates the whole store
+// (C-RS-009: dropped the unused agent_id query param).
 async fn stats(
-    Query(q): Query<AgentQuery>,
     State(brain): State<Brain>,
 ) -> AppResult {
     let v = brain.storage.read().await.sqlite.memory_stats().await?;
@@ -516,9 +517,15 @@ async fn graph_neighbors(
     Query(q): Query<AgentQuery>,
     State(brain): State<Brain>,
 ) -> AppResult {
-    let storage   = brain.storage.read().await;
-    let neighbors = storage.graph.neighbors(&MemoryId(memory_id));
-    let ids: Vec<Value> = neighbors.iter().map(|id| json!(id.0)).collect();
+    // C-RS-009: honor agent scope — only return neighbors the caller can see,
+    // consistent with the recall routes (was returning every neighbor id).
+    let scope   = scope_from(q.agent_id.as_deref());
+    let storage = brain.storage.read().await;
+    let neighbor_ids: Vec<MemoryId> = storage.graph
+        .neighbors(&MemoryId(memory_id))
+        .into_iter().cloned().collect();
+    let visible = storage.sqlite.get_memories_by_ids(&neighbor_ids, &scope).await?;
+    let ids: Vec<Value> = visible.iter().map(|n| json!(n.id.0)).collect();
     Ok(Json(Value::Array(ids)))
 }
 
@@ -818,8 +825,10 @@ async fn dream_run(
     Ok(Json(serde_json::to_value(&report)?))
 }
 
+// dream_status is a global endpoint — the last dream report is not agent-scoped
+// (C-RS-009: dropped the unused agent_id query param rather than pretending to
+// honor it).
 async fn dream_status(
-    Query(q): Query<AgentQuery>,
     State(brain): State<Brain>,
 ) -> AppResult {
     let v = brain.storage.read().await.sqlite

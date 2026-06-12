@@ -912,6 +912,26 @@ mod cortex_pipeline {
         assert_eq!(storage.graph.graph.node_count(), 2);
     }
 
+    // C-RS-010: associating with a nonexistent endpoint must error and must NOT
+    // leave a dangling orphan row in `links`.
+    #[tokio::test]
+    async fn associate_rejects_nonexistent_endpoint() {
+        use cerebro::types::MemoryId;
+        let (cortex, _dir) = make_cortex().await;
+        let a = cortex.remember("a real memory about graph databases and edges",
+            None, None, None, VisibilityScope::global()).await.unwrap();
+
+        let bogus = MemoryId("mem_does_not_exist".into());
+        let link = AssociativeLink::new(a.id.clone(), bogus.clone(), LinkType::Semantic, 0.8);
+        let res = cortex.associate(a.id.clone(), bogus, link).await;
+        assert!(res.is_err(), "associate with bogus target should error");
+
+        // No edge persisted.
+        let storage = cortex.storage.read().await;
+        assert!(storage.graph.neighbors(&a.id).is_empty(),
+            "no edge should be created for a bogus endpoint");
+    }
+
     // C-RS-004: a dream cycle reports the episodes it consolidated in phase 1
     // (SWS replay), no longer a hardcoded 0.
     #[tokio::test]

@@ -185,6 +185,18 @@ impl CerebroCortex {
         link:    AssociativeLink,
     ) -> Result<()> {
         let mut storage = self.storage.write().await;
+
+        // C-RS-010: validate both endpoints exist (and are live) BEFORE writing,
+        // so a typo'd/nonexistent id can't leave a dangling orphan row in `links`
+        // that the graph silently skips. The graph index is rebuilt from
+        // non-deleted memories, so membership there == exists & not soft-deleted.
+        if !storage.graph.index.contains_key(&link.source_id) {
+            anyhow::bail!("associate: source memory does not exist: {}", link.source_id.0);
+        }
+        if !storage.graph.index.contains_key(&link.target_id) {
+            anyhow::bail!("associate: target memory does not exist: {}", link.target_id.0);
+        }
+
         storage.sqlite.insert_link(&link).await?;
         if let Err(e) = storage.graph.add_edge(link) {
             tracing::warn!("associate: graph edge not added — {e}");
