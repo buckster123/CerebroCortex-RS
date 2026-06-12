@@ -22,7 +22,10 @@ try:
         recall_probability,
     )
     from cerebro.config import ACTR_DECAY_RATE, ACTR_NOISE, ACTR_RETRIEVAL_THRESHOLD
-    from cerebro.activation.spreading import effective_link_weight
+    from cerebro.activation.spreading import effective_link_weight, spreading_activation
+    from cerebro.storage.graph_store import GraphStore
+    from cerebro.models.memory import MemoryNode
+    from cerebro.types import LinkType
 except ImportError as e:
     print(f"ERROR: cannot import cerebro: {e}", file=sys.stderr)
     print("Set PYTHONPATH to the Python CerebroCortex src/.", file=sys.stderr)
@@ -198,6 +201,92 @@ for w, age, halflife in link_decay_cases:
     })
 
 # ---------------------------------------------------------------------------
+# Spreading activation fixtures — ground truth from the REAL Python
+# spreading_activation() over fixed graphs.
+#
+# All links are created with last_activated=None (ensure_link default), so the
+# link-decay term is the identity (effective_link_weight returns stored weight)
+# and the whole computation is deterministic / time-independent. agent_id is
+# None, so no scope filtering participates — these isolate the spread MATH:
+# seed weighting, undirected BFS, per-hop decay, link-type weights, sublinear
+# accumulation, and [0,1] normalization. Default max_hops (=2).
+#
+# The Rust test (tests/integration_test.rs) rebuilds the identical petgraph
+# from `nodes`+`links`, runs `activation::spread`, and asserts each node's
+# activation matches `expected` within 1e-4.
+# ---------------------------------------------------------------------------
+import tempfile
+from pathlib import Path as _Path
+
+
+def _run_spread(nodes, links, seeds):
+    """Build a throwaway GraphStore, run real spreading_activation, return dict."""
+    with tempfile.TemporaryDirectory() as td:
+        store = GraphStore(db_path=_Path(td) / "fix.db")
+        store.initialize()
+        for nid in nodes:
+            store.add_node(MemoryNode(id=nid, content=f"content for {nid}"))
+        for (src, tgt, lt, w) in links:
+            store.ensure_link(src, tgt, LinkType(lt), weight=w)
+        seed_ids = [s[0] for s in seeds]
+        seed_weights = [s[1] for s in seeds]
+        result = spreading_activation(store, seed_ids, seed_weights)
+        store.close()
+        return result
+
+
+# Each case: (name, nodes, links[(src,tgt,link_type_value,weight)], seeds[(id,weight)])
+spreading_cases = [
+    # 1. Single lonely seed → normalizes to 1.0
+    ("single_seed", ["mem_s0"], [], [("mem_s0", 1.0)]),
+    # 2. Linear chain — hop decay + normalization (default 2 hops)
+    ("chain", ["mem_c0", "mem_c1", "mem_c2", "mem_c3"],
+     [("mem_c0", "mem_c1", "temporal", 0.8),
+      ("mem_c1", "mem_c2", "temporal", 0.8),
+      ("mem_c2", "mem_c3", "temporal", 0.8)],
+     [("mem_c0", 1.0)]),
+    # 3. Star with MIXED link types — exercises per-type weights
+    ("star_mixed", ["mem_h", "mem_l0", "mem_l1", "mem_l2"],
+     [("mem_h", "mem_l0", "causal", 0.8),
+      ("mem_h", "mem_l1", "semantic", 0.8),
+      ("mem_h", "mem_l2", "contradicts", 0.8)],
+     [("mem_h", 1.0)]),
+    # 4. Multiple seeds with DISTINCT weights — proves seeds are not all 1.0
+    ("multi_seed_weights", ["mem_a", "mem_b", "mem_x", "mem_y"],
+     [("mem_a", "mem_x", "semantic", 0.8),
+      ("mem_b", "mem_y", "semantic", 0.8)],
+     [("mem_a", 0.9), ("mem_b", 0.4)]),
+    # 5. Diamond convergence — D reached by two paths → sublinear accumulation
+    ("diamond", ["mem_da", "mem_db", "mem_dc", "mem_dd"],
+     [("mem_da", "mem_db", "semantic", 0.9),
+      ("mem_da", "mem_dc", "semantic", 0.9),
+      ("mem_db", "mem_dd", "semantic", 0.9),
+      ("mem_dc", "mem_dd", "semantic", 0.9)],
+     [("mem_da", 1.0)]),
+    # 6. UNDIRECTED traversal — link stored A->B, seed B; A must activate
+    ("undirected_reverse", ["mem_u0", "mem_u1"],
+     [("mem_u0", "mem_u1", "causal", 0.9)],
+     [("mem_u1", 1.0)]),
+    # 7. Strong vs weak link from same seed — weight ordering
+    ("weight_ordering", ["mem_w0", "mem_w1", "mem_w2"],
+     [("mem_w0", "mem_w1", "causal", 0.95),
+      ("mem_w0", "mem_w2", "contextual", 0.10)],
+     [("mem_w0", 1.0)]),
+]
+
+spreading_fixtures = []
+for name, nodes, links, seeds in spreading_cases:
+    expected = _run_spread(nodes, links, seeds)
+    spreading_fixtures.append({
+        "name":   name,
+        "nodes":  nodes,
+        "links":  [{"source": s, "target": t, "link_type": lt, "weight": w}
+                   for (s, t, lt, w) in links],
+        "seeds":  [{"id": sid, "weight": w} for (sid, w) in seeds],
+        "expected": expected,
+    })
+
+# ---------------------------------------------------------------------------
 # Verify Python formula matches expectations in comments
 # ---------------------------------------------------------------------------
 print("Verifying fixtures against known values...")
@@ -227,6 +316,7 @@ out = {
     "fsrs_update_difficulty": diff_fixtures,
     "recall_probability":  recall_prob_fixtures,
     "link_decay":          link_decay_fixtures,
+    "spreading":           spreading_fixtures,
 }
 
 path = Path(__file__).parent.parent / "crates" / "cerebro" / "tests" / "fixtures" / "activation.json"
@@ -240,3 +330,4 @@ print(f"  {len(stab_lapse_fixtures)} stability-on-lapse cases")
 print(f"  {len(diff_fixtures)} difficulty-update cases")
 print(f"  {len(recall_prob_fixtures)} recall-probability cases")
 print(f"  {len(link_decay_fixtures)} link-decay cases")
+print(f"  {len(spreading_fixtures)} spreading-activation cases")

@@ -1,4 +1,4 @@
-use std::{path::Path, sync::{Arc, OnceLock}};
+use std::{collections::HashMap, path::Path, sync::{Arc, OnceLock}};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     models::{AssociativeLink, MemoryNode, StrengthState},
-    types::{AgentId, LinkType, MemoryId, VisibilityScope},
+    types::{AgentId, LinkType, MemoryId, Visibility, VisibilityScope},
 };
 
 /// Register the sqlite-vec extension exactly once for the process.
@@ -710,6 +710,45 @@ impl SqliteStore {
             ids.push(MemoryId(row?));
         }
         Ok(ids)
+    }
+
+    /// Bulk-fetch `(visibility, agent_id)` for the given memory ids — used to
+    /// build the scope-visibility map that gates spreading activation (C-RS-003).
+    /// Mirrors Python `_build_visibility_cache`. Ids absent from the result are
+    /// not in the DB and are treated as visible (then filtered by the final
+    /// SQLite scope query), matching Python's `_check_access` fallthrough.
+    pub async fn get_visibility_meta(
+        &self,
+        ids: &[MemoryId],
+    ) -> Result<HashMap<MemoryId, (Visibility, Option<AgentId>)>> {
+        if ids.is_empty() { return Ok(HashMap::new()); }
+        let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT id, visibility, agent_id FROM memories \
+             WHERE id IN ({placeholders}) AND deleted_at IS NULL"
+        );
+        let conn = self.conn.lock().await;
+        let id_strs: Vec<&str> = ids.iter().map(|id| id.0.as_str()).collect();
+        let dyn_params: Vec<&dyn rusqlite::ToSql> =
+            id_strs.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(dyn_params.as_slice(), |row| {
+            let id:  String = row.get(0)?;
+            let vis: String = row.get(1)?;
+            let agent: Option<String> = row.get(2)?;
+            Ok((id, vis, agent))
+        })?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let (id, vis, agent) = row?;
+            let visibility = match vis.as_str() {
+                "private" => Visibility::Private,
+                "thread"  => Visibility::Thread,
+                _         => Visibility::Shared,
+            };
+            map.insert(MemoryId(id), (visibility, agent.map(AgentId)));
+        }
+        Ok(map)
     }
 
     /// All links whose both endpoints are non-deleted memories — for graph rebuild.

@@ -306,6 +306,97 @@ mod activation_fixtures {
             );
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Spreading activation fixtures (C-RS-001) — full-pipeline parity with the
+    // real Python spreading_activation() over fixed graphs. Covers seed
+    // weighting, undirected BFS, per-hop decay, link-type weights, sublinear
+    // accumulation, and [0,1] normalisation.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn spreading_all_fixture_cases() {
+        use cerebro::activation::spread;
+        use cerebro::models::AssociativeLink;
+        use cerebro::storage::graph::GraphStore;
+        use cerebro::types::{LinkType, MemoryId};
+
+        fn link_type(s: &str) -> LinkType {
+            match s {
+                "temporal"    => LinkType::Temporal,
+                "causal"      => LinkType::Causal,
+                "semantic"    => LinkType::Semantic,
+                "affective"   => LinkType::Affective,
+                "contextual"  => LinkType::Contextual,
+                "contradicts" => LinkType::Contradicts,
+                "supports"    => LinkType::Supports,
+                "derived_from"=> LinkType::DerivedFrom,
+                "part_of"     => LinkType::PartOf,
+                other         => panic!("unknown link_type {other}"),
+            }
+        }
+
+        let fixtures = load_fixtures();
+        let cases = fixtures["spreading"].as_array().unwrap();
+        assert!(!cases.is_empty(), "no spreading fixtures — regenerate fixtures");
+
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+
+            // Rebuild the identical graph.
+            let mut store = GraphStore::new();
+            for n in case["nodes"].as_array().unwrap() {
+                store.add_node(MemoryId(n.as_str().unwrap().to_string()));
+            }
+            for l in case["links"].as_array().unwrap() {
+                let link = AssociativeLink::new(
+                    MemoryId(l["source"].as_str().unwrap().to_string()),
+                    MemoryId(l["target"].as_str().unwrap().to_string()),
+                    link_type(l["link_type"].as_str().unwrap()),
+                    l["weight"].as_f64().unwrap() as f32,
+                );
+                store.add_edge(link).unwrap();
+            }
+
+            // Seeds (id, weight) → (NodeIndex, weight). All nodes visible.
+            let seeds: Vec<_> = case["seeds"].as_array().unwrap().iter()
+                .map(|s| {
+                    let id  = MemoryId(s["id"].as_str().unwrap().to_string());
+                    let idx = *store.index.get(&id).unwrap();
+                    (idx, s["weight"].as_f64().unwrap() as f32)
+                })
+                .collect();
+            let visible: std::collections::HashMap<_, _> =
+                store.index.values().map(|&idx| (idx, true)).collect();
+
+            let activated = spread(&store.graph, &seeds, &visible);
+
+            // Map NodeIndex → id, compare against expected per-node.
+            let got: std::collections::HashMap<String, f32> = activated.iter()
+                .map(|(&idx, &score)| (store.graph[idx].0.clone(), score))
+                .collect();
+
+            let expected = case["expected"].as_object().unwrap();
+
+            // Same node set (no extra/missing activated nodes).
+            assert_eq!(
+                got.len(), expected.len(),
+                "spreading '{name}': node count differs — got {:?}, expected {:?}",
+                got.keys().collect::<Vec<_>>(), expected.keys().collect::<Vec<_>>()
+            );
+
+            for (id, exp_v) in expected {
+                let exp = exp_v.as_f64().unwrap() as f32;
+                let g = *got.get(id).unwrap_or_else(||
+                    panic!("spreading '{name}': node {id} missing from result {got:?}"));
+                assert!(
+                    (g - exp).abs() < TOL,
+                    "spreading '{name}' node {id}: got {g}, expected {exp} (diff {})",
+                    (g - exp).abs()
+                );
+            }
+        }
+    }
 }
 
 // =============================================================================
