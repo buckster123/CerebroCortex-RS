@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::{
+    config::FSRS_INITIAL_DIFFICULTY,
     cortex::CerebroCortex,
-    models::AssociativeLink,
+    models::{AssociativeLink, MemoryNode},
     storage::ListFilter,
     types::{LinkType, MemoryLayer, MemoryType, VisibilityScope},
 };
@@ -24,6 +25,18 @@ const PRUNING_MAX_SALIENCE: f32 = 0.3;
 const REM_SAMPLE_SIZE: usize = 20;
 const REM_PAIR_CHECKS: usize = 10;
 const REM_MIN_CONN_STRENGTH: f32 = 0.4;
+// Evolutionary layer, build slice #1 (docs/evolutionary-layer.md): skill
+// distillation inside phase 3. A topical tag shared by at least this many
+// SUCCESSFUL procedures is a skill cluster worth abstracting. Lower than
+// CLUSTER_MIN_SIZE (3) — two graded-successful procedures already justify
+// "how this is done in general", and skills must be able to form on a young
+// brain that has only used a handful of procedures.
+const SKILL_CLUSTER_MIN_SIZE: usize = 2;
+// A procedure must score at least this on `procedure_fitness` to count as a
+// successful skill source. 0.8 = the store-default salience with zero recorded
+// failures; any failure (FSRS difficulty above the 5.0 baseline) drops a
+// procedure below the bar.
+const SKILL_MIN_FITNESS: f32 = 0.8;
 const EPISODE_AUTO_CLOSE_HOURS: i64 = 24; // Python config.py EPISODE_AUTO_CLOSE_HOURS
 
 const SYSTEM_DREAM: &str =
@@ -51,6 +64,16 @@ const PROMPT_FORM_SCHEMA: &str = "Analyze these related memories and form an abs
 {\"content\": \"Iterative refinement with user feedback produces better results than upfront design\", \
 \"tags\": [\"methodology\", \"development\"]}";
 
+const PROMPT_DISTILL_SKILL: &str = "These are concrete procedures the agent has used SUCCESSFULLY on real tasks. \
+Distil them into ONE abstract, reusable skill — the general way this kind of task is done.\n\
+\nSuccessful procedures:\n{procedures}\n\
+\nReturn JSON with:\n\
+- \"content\": The abstract skill (1-3 sentences, general enough to apply to new instances of this task, written as actionable guidance — not a summary of these specific runs)\n\
+- \"tags\": Relevant skill tags\n\
+\nReturn ONLY valid JSON object. Example:\n\
+{\"content\": \"To debug async Rust, first confirm the runtime is multi-threaded, then trace each .await for a held lock or missing poll before suspecting the logic itself\", \
+\"tags\": [\"debugging\", \"async\", \"rust\"]}";
+
 const PROMPT_REM_CONNECT: &str = "You are looking at two seemingly unrelated memories. \
 Find an unexpected but meaningful connection.\n\
 \nMemory A: {memory_a}\nMemory B: {memory_b}\n\
@@ -67,7 +90,8 @@ Find an unexpected but meaningful connection.\n\
 // 6 biologically-inspired consolidation phases:
 //   1. SWS Replay      — algorithmic: Hebbian link strengthening
 //   2. Pattern Extract — LLM: cluster → procedural memories
-//   3. Schema Formation— LLM: episodes → abstract principles
+//   3. Schema Formation— LLM: episodes → principles + successful procedure
+//                              clusters → abstract skills (evolutionary layer)
 //   4. Emotional Reproc— algorithmic: re-apply amygdala scores
 //   5. Pruning         — algorithmic: delete isolated stale sensory memories
 //   6. REM Recombine   — LLM: random pair sampling → new semantic links
@@ -254,7 +278,7 @@ impl DreamEngine {
             let mem_text: String = indices.iter().take(10).enumerate()
                 .map(|(i, &idx)| {
                     let content = &memories[idx].content;
-                    format!("[{}] {}", i, &content[..content.len().min(200)])
+                    format!("[{}] {}", i, truncate_chars(content, 200))
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -278,7 +302,7 @@ impl DreamEngine {
                                 .unwrap_or_else(|| vec![tag.clone()]);
 
                             // Basic dedup: skip if first 40 chars match any existing memory
-                            let prefix = &content[..content.len().min(40)];
+                            let prefix = truncate_chars(content, 40);
                             if memories.iter().any(|n| n.content.starts_with(prefix)) {
                                 continue;
                             }
@@ -315,7 +339,13 @@ impl DreamEngine {
 
     // -------------------------------------------------------------------------
     // Phase 3: Schema Formation — LLM-assisted
-    // For each episode, ask LLM to form an abstract principle
+    //
+    // Two consolidation passes into the `schematic` layer, sharing the phase
+    // LLM budget:
+    //   (a) episode → abstract principle (the original behavior)
+    //   (b) successful procedure-cluster → abstract SKILL (evolutionary layer,
+    //       build slice #1) — the Darwinian loop's consolidation step. See
+    //       docs/evolutionary-layer.md.
     // -------------------------------------------------------------------------
     async fn schema_formation(
         &self,
@@ -344,8 +374,13 @@ impl DreamEngine {
         let mut budget_remaining = budget;
         let mut total_schemas = 0usize;
 
+        // Reserve roughly half the phase budget for skill distillation (pass b)
+        // so an episode-rich brain still grows skills. Skills also consume any
+        // budget the episode pass leaves unused.
+        let skill_reserve = (budget / 2).max(1);
+
         for ep in &episodes {
-            if budget_remaining == 0 || *calls_used >= overall_budget { break; }
+            if budget_remaining <= skill_reserve || *calls_used >= overall_budget { break; }
 
             let ep_id = ep["id"].as_str().unwrap_or("");
             let mem_ids = cortex.storage.read().await.sqlite
@@ -361,7 +396,7 @@ impl DreamEngine {
             let mem_text: String = nodes.iter().take(10).enumerate()
                 .map(|(i, n)| {
                     let content = &n.content;
-                    format!("[{}] {}", i, &content[..content.len().min(200)])
+                    format!("[{}] {}", i, truncate_chars(content, 200))
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -408,10 +443,18 @@ impl DreamEngine {
                             } else {
                                 node.metadata = json!({ "derived_from": source_ids });
                             }
-                            let _ = cortex.storage.read().await.sqlite
-                                .update_memory(&node).await;
-                            total_schemas += 1;
-                            result.links_created += mem_ids.len();
+                            // CB-024: only count work that actually persisted.
+                            match cortex.storage.read().await.sqlite
+                                .update_memory(&node).await
+                            {
+                                Ok(_) => {
+                                    total_schemas += 1;
+                                    result.links_created += mem_ids.len();
+                                }
+                                Err(e) => tracing::warn!(
+                                    "Phase 3 schema persist failed for {}: {e}", node.id.0
+                                ),
+                            }
                         }
                     }
                 }
@@ -419,10 +462,132 @@ impl DreamEngine {
             }
         }
 
+        // ---- (b) Skill distillation: successful procedure clusters → skills --
+        // Load procedures and existing schemas once (the latter for dedup).
+        let procedures = cortex.storage.read().await.sqlite
+            .list_memories_scoped(scope, &ListFilter {
+                memory_type: Some(MemoryType::Procedural),
+                limit: 500,
+                ..Default::default()
+            })
+            .await?;
+
+        // Selection pressure: keep only outcome-successful procedures.
+        let successful: Vec<&MemoryNode> = procedures.iter()
+            .filter(|n| procedure_fitness(n) >= SKILL_MIN_FITNESS)
+            .collect();
+
+        // Cluster the survivors by topical tag (structural markers excluded).
+        let mut tag_map: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, node) in successful.iter().enumerate() {
+            for tag in &node.tags {
+                if is_structural_tag(tag) { continue; }
+                tag_map.entry(tag.clone()).or_default().push(i);
+            }
+        }
+
+        // Existing schemas — prefix-dedup so re-running dream doesn't duplicate
+        // a skill it already distilled.
+        let existing_schemas = cortex.storage.read().await.sqlite
+            .list_memories_scoped(scope, &ListFilter {
+                memory_type: Some(MemoryType::Schematic),
+                limit: 200,
+                ..Default::default()
+            })
+            .await?;
+
+        let clusters_total = tag_map.values().filter(|v| v.len() >= SKILL_CLUSTER_MIN_SIZE).count();
+        let mut total_skills = 0usize;
+
+        for (tag, indices) in &tag_map {
+            if indices.len() < SKILL_CLUSTER_MIN_SIZE { continue; }
+            if budget_remaining == 0 || *calls_used >= overall_budget { break; }
+
+            let proc_text: String = indices.iter().take(10).enumerate()
+                .map(|(i, &idx)| format!("[{}] {}", i, truncate_chars(&successful[idx].content, 200)))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let prompt = PROMPT_DISTILL_SKILL.replace("{procedures}", &proc_text);
+            match llm_call(&key, SYSTEM_DREAM, &prompt).await {
+                Ok(resp) => {
+                    *calls_used      += 1;
+                    result.llm_calls += 1;
+                    budget_remaining -= 1;
+                    result.memories_processed += indices.len().min(10);
+
+                    let skill = match parse_json_object(&resp) {
+                        Some(s) => s,
+                        None    => continue,
+                    };
+                    let content = skill["content"].as_str().unwrap_or("").trim();
+                    if content.len() < 10 { continue; }
+
+                    // Skip if the first 40 chars match an existing schema.
+                    let prefix = truncate_chars(content, 40);
+                    if existing_schemas.iter().any(|n| n.content.starts_with(prefix)) {
+                        continue;
+                    }
+
+                    let llm_tags: Vec<String> = skill["tags"].as_array()
+                        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                        .unwrap_or_default();
+
+                    let source_ids: Vec<String> = indices.iter()
+                        .map(|&idx| successful[idx].id.0.clone()).collect();
+                    // Skill salience tracks the mean fitness of its source
+                    // procedures, floored at 0.7 so a distilled skill always
+                    // outranks the raw memories it came from.
+                    let mean_fitness = indices.iter()
+                        .map(|&idx| procedure_fitness(successful[idx])).sum::<f32>()
+                        / indices.len() as f32;
+                    let skill_salience = mean_fitness.clamp(0.7, 0.95);
+
+                    let skill_tags = {
+                        let mut t = vec![
+                            "schema".to_string(),
+                            "skill".to_string(),
+                            "dream_distilled".to_string(),
+                            format!("support_count:{}", indices.len()),
+                            tag.clone(),
+                        ];
+                        t.extend(llm_tags);
+                        t
+                    };
+
+                    if let Ok(mut node) = cortex.remember(
+                        content.to_string(),
+                        Some(MemoryType::Schematic),
+                        Some(skill_tags),
+                        Some(skill_salience),
+                        scope.clone(),
+                    ).await {
+                        if let serde_json::Value::Object(ref mut map) = node.metadata {
+                            map.insert("derived_from".to_string(), json!(source_ids));
+                        } else {
+                            node.metadata = json!({ "derived_from": source_ids });
+                        }
+                        match cortex.storage.read().await.sqlite.update_memory(&node).await {
+                            Ok(_) => {
+                                total_skills += 1;
+                                result.links_created += source_ids.len();
+                            }
+                            Err(e) => tracing::warn!(
+                                "Phase 3 skill persist failed for {}: {e}", node.id.0
+                            ),
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!("Phase 3 skill LLM call failed: {e}"),
+            }
+        }
+
         result.schemas_extracted = total_schemas;
+        result.skills_distilled  = total_skills;
         result.notes = format!(
-            "Formed {} schemas from {} episodes (budget used: {}/{})",
-            total_schemas, episodes.len(), result.llm_calls, budget,
+            "Formed {} schemas from {} episodes; distilled {} skills from {} successful \
+             procedure clusters (budget used: {}/{})",
+            total_schemas, episodes.len(), total_skills, clusters_total, result.llm_calls, budget,
         );
         result.duration_secs = start.elapsed().as_secs_f64();
         Ok(result)
@@ -470,7 +635,11 @@ impl DreamEngine {
 
     // -------------------------------------------------------------------------
     // Phase 5: Pruning — algorithmic
-    // Soft-delete isolated, low-salience, stale sensory-layer memories
+    // Soft-delete two classes of stale memory:
+    //   A) isolated, low-salience sensory-layer memories (original rule)
+    //   B) `prune_candidate`-flagged memories — procedures demoted to the floor
+    //      by repeated failure (evolutionary layer, slice #3). This is what makes
+    //      the failure → demote → flag → retire selection loop actually retire.
     // -------------------------------------------------------------------------
     async fn pruning(
         &self,
@@ -490,25 +659,48 @@ impl DreamEngine {
             .await?;
 
         let mut pruned = 0usize;
+        let mut demoted_pruned = 0usize;
         for node in &all_memories {
-            if node.layer    != MemoryLayer::Sensory       { continue; }
-            if node.salience >  PRUNING_MAX_SALIENCE       { continue; }
-            if node.created_at > cutoff                    { continue; }
+            // Both prune classes require the memory to be stale.
+            if node.created_at > cutoff { continue; }
 
-            let links = cortex.storage.read().await.sqlite
-                .list_links_from(&node.id).await?;
-            if !links.is_empty() { continue; }
+            let prune_candidate = node.tags.iter().any(|t| t == "prune_candidate");
 
-            let _ = cortex.storage.read().await.sqlite
-                .delete_memory(&node.id).await;
-            pruned += 1;
+            let should_prune = if prune_candidate {
+                // Class B: explicitly demoted by repeated failure (slice #3) —
+                // retire regardless of layer or links; the flag IS the decision.
+                true
+            } else if node.layer == MemoryLayer::Sensory
+                && node.salience <= PRUNING_MAX_SALIENCE
+            {
+                // Class A: isolated, low-salience, stale sensory memory.
+                cortex.storage.read().await.sqlite
+                    .list_links_from(&node.id).await?.is_empty()
+            } else {
+                false
+            };
+            if !should_prune { continue; }
+
+            // CB-024: only count a prune that actually soft-deleted a live row.
+            match cortex.storage.read().await.sqlite
+                .delete_memory(&node.id).await
+            {
+                Ok(true)  => {
+                    pruned += 1;
+                    if prune_candidate { demoted_pruned += 1; }
+                }
+                Ok(false) => {} // no-op (already deleted) — don't over-count
+                Err(e)    => tracing::warn!(
+                    "Phase 5 prune failed for {}: {e}", node.id.0
+                ),
+            }
         }
 
         result.memories_processed = all_memories.len();
         result.memories_pruned    = pruned;
         result.notes = format!(
-            "Pruned {} isolated sensory memories (of {} scanned)",
-            pruned, all_memories.len(),
+            "Pruned {} memories of {} scanned ({} demoted procedures, {} isolated sensory)",
+            pruned, all_memories.len(), demoted_pruned, pruned - demoted_pruned,
         );
         result.duration_secs = start.elapsed().as_secs_f64();
         Ok(result)
@@ -714,6 +906,44 @@ fn parse_json_object(text: &str) -> Option<serde_json::Value> {
 }
 
 // ---------------------------------------------------------------------------
+// Helpers — truncation, procedure fitness, tag classification
+// ---------------------------------------------------------------------------
+
+/// Truncate `s` to at most `max_chars` characters on a char boundary.
+/// Byte-indexed slicing (`&s[..n]`) panics when `n` lands mid-multibyte-char
+/// (emoji, CJK, smart quotes); this is panic-safe.
+fn truncate_chars(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
+}
+
+/// Outcome-graded fitness of a procedure, in `[0,1]` — the selection signal for
+/// skill distillation (build slice #1). The only outcome signals on a node are
+/// salience (rises on every graded use: +0.1 success, decays on failure) and
+/// FSRS difficulty (rises on failure). So reward salience and penalise difficulty
+/// above the `FSRS_INITIAL_DIFFICULTY` (5.0) baseline: an unfailed procedure keeps
+/// its full salience, a repeatedly-failed one is driven toward zero and excluded.
+fn procedure_fitness(node: &MemoryNode) -> f32 {
+    let salience = node.salience.clamp(0.0, 1.0);
+    let span = (10.0 - FSRS_INITIAL_DIFFICULTY).max(f32::EPSILON);
+    let failure_penalty =
+        ((node.strength.difficulty - FSRS_INITIAL_DIFFICULTY).max(0.0) / span).clamp(0.0, 1.0);
+    (salience * (1.0 - failure_penalty)).clamp(0.0, 1.0)
+}
+
+/// True for tags that mark a memory's *role* rather than its *topic*. Excluded
+/// when clustering procedures into skills so clusters form on subject matter
+/// (e.g. "slint", "async") not on bookkeeping markers.
+fn is_structural_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "procedure" | "dream_extracted" | "schema" | "skill" | "dream_formed" | "dream_distilled"
+    ) || tag.starts_with("support_count:")
+}
+
+// ---------------------------------------------------------------------------
 // Report types — mirror Python DreamReport / PhaseReport
 // ---------------------------------------------------------------------------
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -734,6 +964,11 @@ pub struct PhaseResult {
     pub links_strengthened:   usize,
     pub memories_pruned:      usize,
     pub schemas_extracted:    usize,
+    /// Abstract skills distilled from successful procedure clusters in phase 3
+    /// (evolutionary layer). `#[serde(default)]` keeps older persisted reports
+    /// (which lack the field) deserialisable.
+    #[serde(default)]
+    pub skills_distilled:     usize,
     pub procedures_extracted: usize,
     pub episodes_consolidated: usize,
     pub llm_calls:            usize,
@@ -751,6 +986,7 @@ impl PhaseResult {
             links_strengthened:   0,
             memories_pruned:      0,
             schemas_extracted:    0,
+            skills_distilled:     0,
             procedures_extracted: 0,
             episodes_consolidated: 0,
             llm_calls:            0,
@@ -765,5 +1001,68 @@ impl PhaseResult {
         r.success = false;
         r.notes   = notes.into();
         r
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_structural_tag, procedure_fitness, truncate_chars, SKILL_MIN_FITNESS};
+    use crate::config::FSRS_INITIAL_DIFFICULTY;
+    use crate::models::MemoryNode;
+    use crate::types::MemoryType;
+
+    fn proc(salience: f32, difficulty: f32) -> MemoryNode {
+        let mut n = MemoryNode::new("how I did X", MemoryType::Procedural);
+        n.salience = salience;
+        n.strength.difficulty = difficulty;
+        n
+    }
+
+    #[test]
+    fn unfailed_default_procedure_passes_skill_bar() {
+        let n = proc(0.8, FSRS_INITIAL_DIFFICULTY);
+        assert!((procedure_fitness(&n) - 0.8).abs() < 1e-6);
+        assert!(procedure_fitness(&n) >= SKILL_MIN_FITNESS);
+    }
+
+    #[test]
+    fn a_failure_drops_fitness_below_the_bar() {
+        let n = proc(0.8, FSRS_INITIAL_DIFFICULTY + 0.5);
+        assert!(procedure_fitness(&n) < SKILL_MIN_FITNESS);
+    }
+
+    #[test]
+    fn chronic_failure_drives_fitness_toward_zero() {
+        let n = proc(0.9, 10.0);
+        assert!(procedure_fitness(&n) < 1e-6);
+    }
+
+    #[test]
+    fn high_salience_success_scores_highest() {
+        let strong = proc(0.95, FSRS_INITIAL_DIFFICULTY);
+        let weak   = proc(0.8, FSRS_INITIAL_DIFFICULTY);
+        assert!(procedure_fitness(&strong) > procedure_fitness(&weak));
+    }
+
+    #[test]
+    fn structural_tags_excluded_topical_kept() {
+        for t in ["procedure", "skill", "schema", "dream_distilled", "support_count:3"] {
+            assert!(is_structural_tag(t), "{t} should be structural");
+        }
+        for t in ["slint", "async", "debugging", "rust"] {
+            assert!(!is_structural_tag(t), "{t} should be topical");
+        }
+    }
+
+    #[test]
+    fn truncate_mid_emoji_does_not_panic() {
+        let s = "a🦀🦀🦀🦀";
+        for n in 0..=10 {
+            let out = truncate_chars(s, n);
+            assert!(s.starts_with(out));
+        }
+        assert_eq!(truncate_chars(s, 1), "a");
+        assert_eq!(truncate_chars(s, 2), "a🦀");
+        assert_eq!(truncate_chars(s, 100), s);
     }
 }
