@@ -48,6 +48,23 @@ impl MemoryNode {
             metadata:            serde_json::Value::Null,
         }
     }
+
+    /// Record an access at `at`, bumping `access_count` and appending to
+    /// `access_times` while enforcing the `MAX_STORED_TIMESTAMPS` cap (CB-030).
+    ///
+    /// The vec is the ACT-R retrieval history; keeping only the most-recent N
+    /// entries bounds per-row growth on the recall hot path without changing the
+    /// base-level-activation estimate (the oldest traces contribute least).
+    pub fn record_access(&mut self, at: DateTime<Utc>) {
+        self.access_count = self.access_count.saturating_add(1);
+        self.access_times.push(at);
+        let cap = crate::config::MAX_STORED_TIMESTAMPS;
+        if self.access_times.len() > cap {
+            // Drop the oldest, keep the `cap` most-recent timestamps.
+            let drop = self.access_times.len() - cap;
+            self.access_times.drain(0..drop);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
