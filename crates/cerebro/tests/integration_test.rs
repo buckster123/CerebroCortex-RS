@@ -981,7 +981,9 @@ mod cortex_pipeline {
 
         assert_eq!(report.episodes_consolidated, 1,
             "one 2-memory episode should be consolidated, got {}", report.episodes_consolidated);
-        assert_eq!(report.phases.len(), 6, "all 6 phases should be present");
+        // 8 phases since the exo-evolution port: the original 6 plus `variation`
+        // (E2) and `skill_competition` (E1) — see docs/evolutionary-layer.md.
+        assert_eq!(report.phases.len(), 8, "all 8 phases should be present");
     }
 
 }

@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
 use cerebro::{
+    config::PRUNE_CANDIDATE_SALIENCE,
+    engines::dream::{is_skill_champion, retrieval_rank},
     models::{AssociativeLink, MemoryNode},
     storage::ListFilter,
     types::{AgentId, LinkType, MemoryId, MemoryType, VisibilityScope},
@@ -11,12 +13,30 @@ use uuid::Uuid;
 
 use crate::tools;
 
-/// Evolutionary layer, slice #3: a procedure whose salience has decayed to (or
-/// below) this floor through repeated failure is tagged `prune_candidate` —
-/// selection pressure made concrete, so dream's pruning phase can retire it.
-/// Procedures start at salience 0.8; at −0.15 per failure this is reached after
-/// ~4 net failures, and any success clears the flag.
-const PRUNE_CANDIDATE_SALIENCE: f32 = 0.25;
+/// Append a graded outcome to a procedure's fitness ledger
+/// (`metadata.outcomes = {successes, failures}`) — the real win/loss evidence
+/// base the dream engine's niche competition ranks procedures on
+/// (docs/evolutionary-layer.md). This is *additive* to the salience/difficulty
+/// effects in `record_procedure_outcome`, which still drive ACT-R recall and the
+/// failure→`prune_candidate` path; the ledger is the count-based record that lets
+/// competition compute a confidence-aware (Wilson) success rate rather than infer
+/// fitness from salience alone.
+fn record_outcome_ledger(node: &mut MemoryNode, success: bool) {
+    if !node.metadata.is_object() {
+        node.metadata = json!({});
+    }
+    let map = node.metadata.as_object_mut().expect("metadata is an object");
+    let outcomes = map
+        .entry("outcomes")
+        .or_insert_with(|| json!({ "successes": 0, "failures": 0 }));
+    if !outcomes.is_object() {
+        *outcomes = json!({ "successes": 0, "failures": 0 });
+    }
+    let outcomes = outcomes.as_object_mut().expect("outcomes is an object");
+    let key = if success { "successes" } else { "failures" };
+    let cur = outcomes.get(key).and_then(Value::as_u64).unwrap_or(0);
+    outcomes.insert(key.to_string(), json!(cur + 1));
+}
 
 pub fn handle_initialize(req: &Value) -> Value {
     json!({
@@ -788,15 +808,24 @@ async fn route(name: &str, args: &Value, brain: Arc<CerebroCortex>) -> anyhow::R
             };
             let nodes = brain.storage.read().await.sqlite
                 .list_memories_scoped(&scope, &filter).await?;
-            let filtered: Vec<_> = nodes.into_iter()
+            let mut filtered: Vec<_> = nodes.into_iter()
                 .filter(|n| {
                     let tag_hit = tags.iter().any(|t| n.tags.iter().any(|nt| nt == t));
                     let meta_str = n.metadata.to_string();
                     let concept_hit = concepts.iter().any(|c| meta_str.contains(c.as_str()));
                     tag_hit || concept_hit
                 })
-                .take(max_results)
                 .collect();
+            // Champion-aware ordering (E1 follow-up). The tag/concept match above
+            // is a *binary* relevance gate — it imposes no order, so prior to this
+            // the surfaced `max_results` were whatever the DB happened to list
+            // first. Rank the matched set by the SAME fitness the dream
+            // competition uses (`retrieval_rank`): a niche champion leads, then by
+            // Wilson fitness, ungraded falling back to salience. So when several
+            // procedures fit a niche, the one competition crowned surfaces first.
+            filtered.sort_by(|a, b| retrieval_rank(b)
+                .partial_cmp(&retrieval_rank(a)).unwrap_or(std::cmp::Ordering::Equal));
+            filtered.truncate(max_results);
             Ok(json!(filtered))
         }
 
@@ -835,7 +864,11 @@ async fn route(name: &str, args: &Value, brain: Arc<CerebroCortex>) -> anyhow::R
                     node.tags.push("prune_candidate".to_string());
                 }
             }
+            // Record the win/loss in the fitness ledger (additive — the evidence
+            // base for the dream engine's niche competition).
+            record_outcome_ledger(&mut node, success);
             storage.sqlite.update_memory(&node).await?;
+            let outcomes = node.metadata.get("outcomes").cloned().unwrap_or(json!({}));
             Ok(json!({
                 "status":          "ok",
                 "procedure_id":    procedure_id,
@@ -843,6 +876,7 @@ async fn route(name: &str, args: &Value, brain: Arc<CerebroCortex>) -> anyhow::R
                 "new_salience":    node.salience,
                 "new_difficulty":  node.strength.difficulty,
                 "prune_candidate": node.tags.iter().any(|t| t == "prune_candidate"),
+                "outcomes":        outcomes,
             }))
         }
 
@@ -1098,8 +1132,16 @@ async fn assemble_bootstrap(
             .filter(|n| n.tags.iter().any(|t| t == "session_note")).collect();
         let skills: Vec<&MemoryNode> = hits.iter().map(|(n, _)| n)
             .filter(|n| is_skill(n)).collect();
-        let procedures: Vec<&MemoryNode> = hits.iter().map(|(n, _)| n)
+        let mut procedures: Vec<&MemoryNode> = hits.iter().map(|(n, _)| n)
             .filter(|n| n.memory_type == MemoryType::Procedural).collect();
+        // Champion-aware promotion (E1 follow-up). `recall` already ordered these
+        // by relevance/activation; keep that order but float a niche champion to
+        // the front of the relevant set so the procedure competition crowned is
+        // the one that makes the (capped-at-3) cut. A *stable* sort on the
+        // champion flag preserves recall's relevance ranking among equals, so a
+        // champion never displaces a strictly more-relevant procedure — it only
+        // wins ties — and fitness never overrides relevance for non-champions.
+        procedures.sort_by_key(|n| !is_skill_champion(n));
         let others: Vec<&MemoryNode> = hits.iter().map(|(n, _)| n)
             .filter(|n| n.memory_type != MemoryType::Procedural
                 && !n.tags.iter().any(|t| t == "session_note")
@@ -1234,6 +1276,108 @@ mod tests {
         let r = read(&dispatch_tool(outcome(true), Arc::clone(&brain)).await);
         assert!(!r["prune_candidate"].as_bool().unwrap(),
             "success must clear the prune_candidate flag");
+    }
+
+    #[tokio::test]
+    async fn record_procedure_outcome_builds_fitness_ledger() {
+        let (brain, _dir) = make_brain().await;
+
+        let store = json!({
+            "jsonrpc":"2.0","id":0,"method":"tools/call",
+            "params":{"name":"store_procedure","arguments":{
+                "content":"deploy by hot-swapping the single binary after systemctl stop",
+                "tags":["deploy"]
+            }}
+        });
+        let resp = dispatch_tool(store, Arc::clone(&brain)).await;
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let id = serde_json::from_str::<Value>(text).unwrap()["id"].as_str().unwrap().to_string();
+
+        let outcome = |success: bool| json!({
+            "jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"record_procedure_outcome","arguments":{
+                "procedure_id": id, "success": success
+            }}
+        });
+        let read = |resp: &Value| -> Value {
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+        };
+
+        // Two wins and a loss accumulate a 2/1 win-loss ledger in metadata.outcomes.
+        dispatch_tool(outcome(true), Arc::clone(&brain)).await;
+        dispatch_tool(outcome(true), Arc::clone(&brain)).await;
+        let r = read(&dispatch_tool(outcome(false), Arc::clone(&brain)).await);
+        assert_eq!(r["outcomes"]["successes"].as_u64().unwrap(), 2,
+            "two graded successes must be recorded");
+        assert_eq!(r["outcomes"]["failures"].as_u64().unwrap(), 1,
+            "one graded failure must be recorded");
+    }
+
+    // ---- exo-evolution E1 follow-up: champion-aware retrieval ---------------
+
+    #[tokio::test]
+    async fn find_relevant_procedures_surfaces_the_champion_first() {
+        let (brain, _dir) = make_brain().await;
+        let store = |content: &str, tags: Value| json!({
+            "jsonrpc":"2.0","id":0,"method":"tools/call",
+            "params":{"name":"store_procedure","arguments":{ "content": content, "tags": tags }}
+        });
+
+        // A plain niche procedure, stored FIRST (so unordered DB listing would
+        // surface it first)…
+        let r = dispatch_tool(store("deploy: scp the binary over and pray", json!(["deploy"])),
+            Arc::clone(&brain)).await;
+        assert!(r["error"].is_null(), "store should not error: {}", r["error"]);
+        // …and the niche CHAMPION, stored SECOND.
+        let r = dispatch_tool(store("deploy: stop service, hot-swap binary, start, tail journal",
+            json!(["deploy", "skill_champion"])), Arc::clone(&brain)).await;
+        assert!(r["error"].is_null(), "store should not error: {}", r["error"]);
+
+        let find = json!({
+            "jsonrpc":"2.0","id":7,"method":"tools/call",
+            "params":{"name":"find_relevant_procedures","arguments":{ "tags":["deploy"], "limit": 5 }}
+        });
+        let resp = dispatch_tool(find, Arc::clone(&brain)).await;
+        assert!(resp["error"].is_null(), "find should not error: {}", resp["error"]);
+        let text  = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let procs: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(procs.as_array().unwrap().len(), 2, "both niche procedures returned");
+        // The champion floats to the front despite being stored second.
+        assert!(procs[0]["tags"].as_array().unwrap().iter().any(|t| t == "skill_champion"),
+            "champion must surface first, got: {}", procs[0]);
+    }
+
+    #[tokio::test]
+    async fn cognitive_bootstrap_promotes_the_champion_in_procedures() {
+        let (brain, _dir) = make_brain().await;
+        let store = |content: &str, tags: Value| json!({
+            "jsonrpc":"2.0","id":0,"method":"tools/call",
+            "params":{"name":"store_procedure","arguments":{ "content": content, "tags": tags }}
+        });
+
+        // Two procedures both relevant to the query; the champion is stored first
+        // so that ordering — not insertion order — is what floats it to the top.
+        dispatch_tool(store("deploy the release by hot-swapping the systemd binary",
+            json!(["deploy", "skill_champion"])), Arc::clone(&brain)).await;
+        dispatch_tool(store("deploy the release by copying files over manually",
+            json!(["deploy"])), Arc::clone(&brain)).await;
+
+        let boot = json!({
+            "jsonrpc":"2.0","id":44,"method":"tools/call",
+            "params":{"name":"cognitive_bootstrap","arguments":{
+                "query":"deploy the release", "mode":"standard"
+            }}
+        });
+        let resp = dispatch_tool(boot, Arc::clone(&brain)).await;
+        assert!(resp["error"].is_null(), "bootstrap should not error: {}", resp["error"]);
+        let text   = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let result: Value = serde_json::from_str(text).unwrap();
+        let block  = result["assembled_block"].as_str().unwrap();
+
+        let champ_at = block.find("hot-swapping").expect("champion procedure must appear");
+        let rival_at = block.find("copying files").expect("rival procedure must appear");
+        assert!(champ_at < rival_at,
+            "champion must be listed ahead of the non-champion rival:\n{block}");
     }
 
     #[tokio::test]
@@ -1517,9 +1661,10 @@ mod tests {
         assert!(resp["error"].is_null(), "dream_run should not produce a protocol error: {}", resp["error"]);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         let result: Value = serde_json::from_str(text).unwrap();
-        // Report always has phases array (6 phases) and success field
+        // Report always has phases array (8 phases since the exo-evolution port:
+        // the original 6 plus `variation` and `skill_competition`) and success field
         assert!(result["phases"].is_array(), "dream report should have phases: {result}");
-        assert_eq!(result["phases"].as_array().unwrap().len(), 6);
+        assert_eq!(result["phases"].as_array().unwrap().len(), 8);
         assert!(result["success"].is_boolean());
     }
 }
