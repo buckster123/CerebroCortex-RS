@@ -83,3 +83,43 @@ impl Default for StrengthState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::MAX_STORED_TIMESTAMPS;
+
+    #[test]
+    fn record_access_caps_timestamps_and_keeps_most_recent() {
+        let mut node = MemoryNode::new("hi", MemoryType::Semantic);
+        // starts with a single creation timestamp
+        assert_eq!(node.access_times.len(), 1);
+
+        // push well past the cap with strictly-increasing timestamps
+        let base = Utc::now();
+        let total = MAX_STORED_TIMESTAMPS + 25;
+        for i in 0..total {
+            node.record_access(base + chrono::Duration::seconds(i as i64));
+        }
+
+        // access_count counts every recorded access (initial seed not counted)
+        assert_eq!(node.access_count as usize, total);
+        // the vec never exceeds the cap
+        assert_eq!(node.access_times.len(), MAX_STORED_TIMESTAMPS);
+        // and it retained the most-recent entries (last pushed is preserved)
+        let last = base + chrono::Duration::seconds((total - 1) as i64);
+        assert_eq!(*node.access_times.last().unwrap(), last);
+        // the oldest retained entry is exactly cap-1 back from the last
+        let oldest_kept = base
+            + chrono::Duration::seconds((total - MAX_STORED_TIMESTAMPS) as i64);
+        assert_eq!(node.access_times[0], oldest_kept);
+    }
+
+    #[test]
+    fn record_access_below_cap_appends() {
+        let mut node = MemoryNode::new("hi", MemoryType::Semantic);
+        node.record_access(Utc::now());
+        assert_eq!(node.access_times.len(), 2);
+        assert_eq!(node.access_count, 1);
+    }
+}

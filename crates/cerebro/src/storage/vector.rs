@@ -78,13 +78,10 @@ impl VectorStore {
             params![blob, memory_id.0],
         )?;
 
-        // Insert into vec0 index using the memories table's integer rowid
+        // Upsert into the vec0 index, keyed by the memories table's integer rowid
+        // (vec0 rejects INSERT OR REPLACE — see upsert_memory_vector).
         if self.vec_available {
-            conn.execute(
-                "INSERT OR REPLACE INTO memory_vectors(rowid, embedding)
-                 SELECT rowid, ?1 FROM memories WHERE id = ?2",
-                params![blob, memory_id.0],
-            )?;
+            upsert_memory_vector(&conn, memory_id, &blob)?;
         }
 
         Ok(embedding)
@@ -99,11 +96,7 @@ impl VectorStore {
             params![blob, memory_id.0],
         )?;
         if self.vec_available {
-            conn.execute(
-                "INSERT OR REPLACE INTO memory_vectors(rowid, embedding)
-                 SELECT rowid, ?1 FROM memories WHERE id = ?2",
-                params![blob, memory_id.0],
-            )?;
+            upsert_memory_vector(&conn, memory_id, &blob)?;
         }
         Ok(())
     }
@@ -192,36 +185,45 @@ impl VectorStore {
         scope_sql:    &str,
         scope_params: &[String],
     ) -> Result<Vec<(MemoryId, f32)>> {
-        // FTS5 MATCH requires the query to be a valid FTS5 expression.
-        // Wrap in quotes to treat as a phrase for safety; strip existing quotes.
-        let safe_query = query.replace('"', " ");
+        // Quote each token individually — FTS5 treats "word1" "word2" as implicit
+        // AND with no positional constraint, which matches the original semantics
+        // while safely neutralizing any FTS5 operators in the raw query string.
+        let safe_query: String = query
+            .split_whitespace()
+            .map(|w| format!("\"{}\"", w.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let safe_query = if safe_query.is_empty() { return Ok(Vec::new()); } else { safe_query };
         let k_i64 = k as i64;
 
+        // CB-014: surface FTS5's bm25() rank instead of a flat 0.5, so keyword
+        // relevance actually discriminates results when this score feeds
+        // recall_score (vector_sim, the largest weight) and the spreading seed.
+        // bm25() is more negative for a better match; map it monotonically into
+        // (0,1] via a logistic on the negated score so a better match scores higher.
         let sql = format!(
-            "SELECT m.id FROM memories_fts \
+            "SELECT m.id, bm25(memories_fts) FROM memories_fts \
              JOIN memories m ON m.id = memories_fts.id \
              WHERE memories_fts MATCH ? AND {scope_sql} AND m.deleted_at IS NULL \
              ORDER BY rank LIMIT ?"
         );
 
         let conn = self.conn.lock().await;
-        let dyn_params: Vec<&dyn rusqlite::ToSql> = vec![&safe_query, &k_i64];
-        // scope_params go between safe_query and k — but they're already inserted via scope_sql
-        // which uses ? placeholders too. Push scope_params before k_i64.
-        // Rebuild correctly:
-        drop(dyn_params);
-
         let mut all_params: Vec<&dyn rusqlite::ToSql> = vec![&safe_query];
         for s in scope_params { all_params.push(s); }
         all_params.push(&k_i64);
 
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(all_params.as_slice(), |row| row.get::<_, String>(0))?;
+        let rows = stmt.query_map(all_params.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+        })?;
 
         let mut results = Vec::new();
         for row in rows {
-            // FTS5 doesn't give a normalized [0,1] score easily; use 0.5 placeholder.
-            results.push((MemoryId(row?), 0.5_f32));
+            let (id, bm25) = row?;
+            // bm25 < 0 → relevance > 0.5 (good match); bm25 → 0 → relevance → 0.5.
+            let relevance = (1.0 / (1.0 + (bm25 as f32).exp())).clamp(0.0, 1.0);
+            results.push((MemoryId(id), relevance));
         }
         Ok(results)
     }
@@ -243,6 +245,33 @@ pub fn blob_to_vec(blob: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+/// Upsert a memory's row in the vec0 index, keyed by its integer rowid.
+///
+/// sqlite-vec's vec0 virtual table does **not** honor `INSERT OR REPLACE` — it
+/// raises "UNIQUE constraint failed on memory_vectors primary key" when the rowid
+/// already holds a vector (i.e. re-embedding an existing memory via update_memory).
+/// So delete the stale row then insert — the same convention `insert_memory` /
+/// `purge_memory` already use (CB-005). No-op if the memory row is gone (the
+/// SELECT yields no rowid). Caller holds the connection lock, so the pair is
+/// effectively atomic against other writers.
+fn upsert_memory_vector(
+    conn:      &rusqlite::Connection,
+    memory_id: &MemoryId,
+    blob:      &[u8],
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM memory_vectors WHERE rowid IN \
+         (SELECT rowid FROM memories WHERE id = ?1)",
+        params![memory_id.0],
+    )?;
+    conn.execute(
+        "INSERT INTO memory_vectors(rowid, embedding) \
+         SELECT rowid, ?1 FROM memories WHERE id = ?2",
+        params![blob, memory_id.0],
+    )?;
+    Ok(())
+}
+
 fn init_fastembed(model_name: &str) -> Result<fastembed::TextEmbedding> {
     use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
     let model = match model_name {
@@ -250,4 +279,39 @@ fn init_fastembed(model_name: &str) -> Result<fastembed::TextEmbedding> {
         other => anyhow::bail!("unsupported embed model: {other}"),
     };
     TextEmbedding::try_new(InitOptions::new(model))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::MemoryNode;
+    use crate::types::MemoryType;
+
+    async fn fresh_store() -> (SqliteStore, VectorStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let sqlite = SqliteStore::open(&dir.path().join("t.db")).await.unwrap();
+        let vector = VectorStore::new(&sqlite, "").await.unwrap(); // "" → no embedder
+        (sqlite, vector, dir)
+    }
+
+    /// Regression (reported by APEX, 2026-06-20): re-embedding an existing memory
+    /// must not fail. sqlite-vec's vec0 table rejects `INSERT OR REPLACE` (raises
+    /// "UNIQUE constraint failed on memory_vectors primary key" on an existing
+    /// rowid), which is exactly what `update_memory`'s re-embed hit. `store_raw_
+    /// embedding` shares the vec-upsert path with `embed_and_store`, so this covers
+    /// both without needing the ONNX model.
+    #[tokio::test]
+    async fn reembedding_an_existing_memory_succeeds() {
+        let (sqlite, vector, _dir) = fresh_store().await;
+        assert!(vector.vec_available, "vec0 must be available for this regression test");
+
+        let node = MemoryNode::new("a thermal frame caption", MemoryType::Episodic);
+        sqlite.insert_memory(&node).await.unwrap();
+
+        vector.store_raw_embedding(&node.id, &vec![0.1f32; 384]).await
+            .expect("first embed");
+        // The bug: this second write hit `UNIQUE constraint failed on memory_vectors`.
+        vector.store_raw_embedding(&node.id, &vec![0.9f32; 384]).await
+            .expect("re-embed of the same memory must succeed");
+    }
 }
