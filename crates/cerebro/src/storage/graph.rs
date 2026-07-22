@@ -57,6 +57,15 @@ impl GraphStore {
         idx
     }
 
+    pub fn remove_node(&mut self, id: &MemoryId) {
+        let Some(idx) = self.index.remove(id) else { return };
+        self.graph.remove_node(idx); // swaps the last node into `idx`
+        // If a node was swapped into `idx`, its map entry is now stale → repair it.
+        if let Some(swapped_id) = self.graph.node_weight(idx) {
+            self.index.insert(swapped_id.clone(), idx);
+        }
+    }
+
     pub fn add_edge(&mut self, link: AssociativeLink) -> anyhow::Result<()> {
         let src = self.index.get(&link.source_id).copied()
             .ok_or_else(|| anyhow::anyhow!("source {} not in graph", link.source_id.0))?;

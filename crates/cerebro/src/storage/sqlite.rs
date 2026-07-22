@@ -529,12 +529,20 @@ impl SqliteStore {
     }
 
     /// Soft-delete a memory. Returns true if the memory existed and was deleted.
-    pub async fn delete_memory(&self, id: &MemoryId) -> Result<bool> {
+    /// Soft-delete, scope-enforced (CB-018): the WHERE carries the caller's
+    /// `scope_sql`, so a scoped caller can only delete what it can see — the
+    /// scope lives IN the statement (atomic under the connection lock, no
+    /// check-then-act window). Global scope (`1=1`) preserves admin behaviour.
+    pub async fn delete_memory(&self, id: &MemoryId, scope: &VisibilityScope) -> Result<bool> {
+        let (scope_sql, scope_params) = scope.sql_filter();
         let conn = self.conn.lock().await;
-        let changed = conn.execute(
-            "UPDATE memories SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
-            params![Utc::now().to_rfc3339(), id.0],
-        )?;
+        let sql = format!(
+            "UPDATE memories SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL AND {scope_sql}"
+        );
+        let now = Utc::now().to_rfc3339();
+        let mut dp: Vec<&dyn rusqlite::ToSql> = vec![&now, &id.0];
+        for s in &scope_params { dp.push(s); }
+        let changed = conn.execute(&sql, dp.as_slice())?;
         // CB-020: the memories_au trigger now evicts a soft-deleted row from the
         // FTS5 index (it only re-inserts when deleted_at IS NULL), so the keyword
         // index shrinks on soft-delete and restore_memory's UPDATE re-indexes it.
@@ -690,8 +698,22 @@ impl SqliteStore {
     /// is keyed by the reusable integer rowid and has no FK/trigger, so an
     /// orphaned vector would bloat the index and, after rowid reuse, mis-rank
     /// a future memory. The FTS5 index is cleaned by the `memories_ad` trigger.
-    pub async fn purge_memory(&self, id: &MemoryId) -> Result<bool> {
+    /// Hard-delete, scope-enforced (CB-018). The visibility gate runs under the
+    /// SAME connection lock as the purge transaction, so there is no window for
+    /// the row to change between check and act. Purge reaches soft-deleted rows
+    /// too, so the gate deliberately does NOT filter on `deleted_at`.
+    pub async fn purge_memory(&self, id: &MemoryId, scope: &VisibilityScope) -> Result<bool> {
+        let (scope_sql, scope_params) = scope.sql_filter();
         let mut conn = self.conn.lock().await;
+        let visible = {
+            let sql = format!("SELECT 1 FROM memories WHERE id = ? AND {scope_sql}");
+            let mut dp: Vec<&dyn rusqlite::ToSql> = vec![&id.0];
+            for s in &scope_params { dp.push(s); }
+            conn.prepare(&sql)?.exists(dp.as_slice())?
+        };
+        if !visible {
+            return Ok(false);
+        }
         let tx = conn.transaction()?;
         if self.vec_available {
             tx.execute(
@@ -713,35 +735,54 @@ impl SqliteStore {
     ///
     /// Same dependent-row cleanup as `purge_memory` (CB-005 / CB-022), applied
     /// to the whole soft-deleted set inside one transaction.
-    pub async fn purge_all_deleted(&self) -> Result<usize> {
+    pub async fn purge_all_deleted(&self, scope: &VisibilityScope) -> Result<usize> {
+        // Scope-enforced (CB-018): a scoped caller empties only ITS OWN trash;
+        // the whole-store sweep stays an admin(global)-scope operation.
+        let (scope_sql, scope_params) = scope.sql_filter();
+        let doomed = format!("SELECT id FROM memories WHERE deleted_at IS NOT NULL AND {scope_sql}");
         let mut conn = self.conn.lock().await;
+        // Built AFTER the lock: a `&dyn ToSql` held across an await would make
+        // every calling future non-Send.
+        let dp: Vec<&dyn rusqlite::ToSql> =
+            scope_params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
         let tx = conn.transaction()?;
         if self.vec_available {
             tx.execute(
-                "DELETE FROM memory_vectors WHERE rowid IN \
-                 (SELECT rowid FROM memories WHERE deleted_at IS NOT NULL)",
-                [],
+                &format!("DELETE FROM memory_vectors WHERE rowid IN \
+                          (SELECT rowid FROM memories WHERE id IN ({doomed}))"),
+                dp.as_slice(),
             )?;
         }
+        // Two separate single-param statements (source/target) so the bound
+        // scope params appear exactly once per statement.
         tx.execute(
-            "DELETE FROM links WHERE source_id IN \
-               (SELECT id FROM memories WHERE deleted_at IS NOT NULL) \
-             OR target_id IN \
-               (SELECT id FROM memories WHERE deleted_at IS NOT NULL)",
-            [],
+            &format!("DELETE FROM links WHERE source_id IN ({doomed})"),
+            dp.as_slice(),
         )?;
-        let changed = tx.execute("DELETE FROM memories WHERE deleted_at IS NOT NULL", [])?;
+        tx.execute(
+            &format!("DELETE FROM links WHERE target_id IN ({doomed})"),
+            dp.as_slice(),
+        )?;
+        let changed = tx.execute(
+            &format!("DELETE FROM memories WHERE id IN ({doomed})"),
+            dp.as_slice(),
+        )?;
         tx.commit()?;
         Ok(changed)
     }
 
-    /// Restore a soft-deleted memory.
-    pub async fn restore_memory(&self, id: &MemoryId) -> Result<bool> {
+    /// Restore a soft-deleted memory, scope-enforced (CB-018): a scoped caller
+    /// can only resurrect what it could see (`scope_sql` touches only
+    /// visibility/agent_id, so the deleted row still matches its own scope).
+    pub async fn restore_memory(&self, id: &MemoryId, scope: &VisibilityScope) -> Result<bool> {
+        let (scope_sql, scope_params) = scope.sql_filter();
         let conn = self.conn.lock().await;
-        let changed = conn.execute(
-            "UPDATE memories SET deleted_at = NULL WHERE id = ? AND deleted_at IS NOT NULL",
-            params![id.0],
-        )?;
+        let sql = format!(
+            "UPDATE memories SET deleted_at = NULL WHERE id = ? AND deleted_at IS NOT NULL AND {scope_sql}"
+        );
+        let mut dp: Vec<&dyn rusqlite::ToSql> = vec![&id.0];
+        for s in &scope_params { dp.push(s); }
+        let changed = conn.execute(&sql, dp.as_slice())?;
         Ok(changed > 0)
     }
 
@@ -814,36 +855,43 @@ impl SqliteStore {
     /// Mirrors Python `_build_visibility_cache`. Ids absent from the result are
     /// not in the DB and are treated as visible (then filtered by the final
     /// SQLite scope query), matching Python's `_check_access` fallthrough.
+    /// Chunked at 500 ids per IN-clause (CB-008): a single un-chunked query
+    /// hard-failed past SQLite's ~32k bind-parameter limit, which recall would
+    /// have hit store-wide before the frontier bound; with the chunking, no
+    /// caller can hit the cliff regardless of input size.
     pub async fn get_visibility_meta(
         &self,
         ids: &[MemoryId],
     ) -> Result<HashMap<MemoryId, (Visibility, Option<AgentId>)>> {
         if ids.is_empty() { return Ok(HashMap::new()); }
-        let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-        let sql = format!(
-            "SELECT id, visibility, agent_id FROM memories \
-             WHERE id IN ({placeholders}) AND deleted_at IS NULL"
-        );
+        const CHUNK: usize = 500;
         let conn = self.conn.lock().await;
-        let id_strs: Vec<&str> = ids.iter().map(|id| id.0.as_str()).collect();
-        let dyn_params: Vec<&dyn rusqlite::ToSql> =
-            id_strs.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(dyn_params.as_slice(), |row| {
-            let id:  String = row.get(0)?;
-            let vis: String = row.get(1)?;
-            let agent: Option<String> = row.get(2)?;
-            Ok((id, vis, agent))
-        })?;
         let mut map = HashMap::new();
-        for row in rows {
-            let (id, vis, agent) = row?;
-            let visibility = match vis.as_str() {
-                "private" => Visibility::Private,
-                "thread"  => Visibility::Thread,
-                _         => Visibility::Shared,
-            };
-            map.insert(MemoryId(id), (visibility, agent.map(AgentId)));
+        for chunk in ids.chunks(CHUNK) {
+            let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let sql = format!(
+                "SELECT id, visibility, agent_id FROM memories \
+                 WHERE id IN ({placeholders}) AND deleted_at IS NULL"
+            );
+            let id_strs: Vec<&str> = chunk.iter().map(|id| id.0.as_str()).collect();
+            let dyn_params: Vec<&dyn rusqlite::ToSql> =
+                id_strs.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(dyn_params.as_slice(), |row| {
+                let id:  String = row.get(0)?;
+                let vis: String = row.get(1)?;
+                let agent: Option<String> = row.get(2)?;
+                Ok((id, vis, agent))
+            })?;
+            for row in rows {
+                let (id, vis, agent) = row?;
+                let visibility = match vis.as_str() {
+                    "private" => Visibility::Private,
+                    "thread"  => Visibility::Thread,
+                    _         => Visibility::Shared,
+                };
+                map.insert(MemoryId(id), (visibility, agent.map(AgentId)));
+            }
         }
         Ok(map)
     }
@@ -888,18 +936,30 @@ impl SqliteStore {
         Ok(out)
     }
 
-    pub async fn bulk_delete(&self, ids: &[MemoryId]) -> Result<usize> {
-        if ids.is_empty() { return Ok(0); }
+    /// Bulk soft-delete, scope-enforced (CB-018). Returns the ids ACTUALLY
+    /// deleted (RETURNING) — a scoped-out id is silently skipped, and the
+    /// coordinator must evict only the returned ids from the graph (evicting a
+    /// denied id would hide a live memory from spreading until restart).
+    pub async fn bulk_delete(&self, ids: &[MemoryId], scope: &VisibilityScope) -> Result<Vec<MemoryId>> {
+        if ids.is_empty() { return Ok(Vec::new()); }
+        let (scope_sql, scope_params) = scope.sql_filter();
         let placeholders = std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(", ");
         let sql = format!(
-            "UPDATE memories SET deleted_at = ? WHERE id IN ({placeholders}) AND deleted_at IS NULL"
+            "UPDATE memories SET deleted_at = ? \
+             WHERE id IN ({placeholders}) AND deleted_at IS NULL AND {scope_sql} \
+             RETURNING id"
         );
         let conn = self.conn.lock().await;
         let now = Utc::now().to_rfc3339();
         let id_strs: Vec<String> = ids.iter().map(|id| id.0.clone()).collect();
         let mut dp: Vec<&dyn rusqlite::ToSql> = vec![&now as &dyn rusqlite::ToSql];
         for s in &id_strs { dp.push(s); }
-        Ok(conn.execute(&sql, dp.as_slice())?)
+        for s in &scope_params { dp.push(s); }
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(dp.as_slice(), |r| r.get::<_, String>(0))?;
+        let mut deleted = Vec::new();
+        for r in rows { deleted.push(MemoryId(r?)); }
+        Ok(deleted)
     }
 
     // -----------------------------------------------------------------------
@@ -953,8 +1013,53 @@ impl SqliteStore {
         Ok(agents)
     }
 
-    pub async fn share_memory(&self, memory_id: &MemoryId, target_agent_id: Option<&str>) -> Result<bool> {
+    /// Re-scope a memory (share ↔ assign to an agent), OWNERSHIP-gated
+    /// (CB-018): a scoped caller may re-scope only a memory it OWNS. Before
+    /// this, `share_memory` set `visibility='private', agent_id=<arbitrary>`
+    /// on ANY id — seizing another agent's memory with one call. Rules:
+    /// - global/admin scope (no agent_id): anything, as before;
+    /// - scoped caller + row owned by the caller: allowed;
+    /// - scoped caller + row owned by someone else OR ownerless (a shared
+    ///   commons memory): refused LOUDLY — an Err, not a silent false, per
+    ///   the honest-signals doctrine (the caller must know it was denied,
+    ///   not conclude the memory doesn't exist).
+    ///
+    /// Invisible/absent row → Ok(false), as before.
+    pub async fn share_memory(
+        &self,
+        memory_id: &MemoryId,
+        target_agent_id: Option<&str>,
+        scope: &VisibilityScope,
+    ) -> Result<bool> {
+        let (scope_sql, scope_params) = scope.sql_filter();
         let conn = self.conn.lock().await;
+        // Ownership gate under the same connection lock (no check-then-act window).
+        let row: Option<Option<String>> = {
+            let sql = format!(
+                "SELECT agent_id FROM memories WHERE id = ? AND deleted_at IS NULL AND {scope_sql}"
+            );
+            let mut dp: Vec<&dyn rusqlite::ToSql> = vec![&memory_id.0];
+            for s in &scope_params { dp.push(s); }
+            let mut stmt = conn.prepare(&sql)?;
+            let mut rows = stmt.query_map(dp.as_slice(), |r| r.get::<_, Option<String>>(0))?;
+            match rows.next() {
+                Some(r) => Some(r?),
+                None    => None,
+            }
+        };
+        let Some(owner) = row else {
+            return Ok(false); // absent or not visible to the caller
+        };
+        if let Some(caller) = &scope.agent_id {
+            if owner.as_deref() != Some(caller.0.as_str()) {
+                anyhow::bail!(
+                    "share_memory refused: {} is not owned by {} — only the owning agent \
+                     (or the node admin) may re-scope a memory; a shared/ownerless memory \
+                     belongs to the commons",
+                    memory_id.0, caller.0
+                );
+            }
+        }
         let changed = if let Some(aid) = target_agent_id {
             conn.execute(
                 "UPDATE memories SET visibility='private', agent_id=?1 \
@@ -1015,12 +1120,20 @@ impl SqliteStore {
         Ok(out)
     }
 
-    pub async fn prune_thread(&self, thread_id: &str) -> Result<usize> {
+    /// Prune a thread, scope-enforced (CB-018): only the rows the caller can
+    /// see are deleted — another agent's private memories in the same thread
+    /// survive a scoped prune.
+    pub async fn prune_thread(&self, thread_id: &str, scope: &VisibilityScope) -> Result<usize> {
+        let (scope_sql, scope_params) = scope.sql_filter();
         let conn = self.conn.lock().await;
-        Ok(conn.execute(
-            "UPDATE memories SET deleted_at=?1 WHERE thread_id=?2 AND deleted_at IS NULL",
-            params![Utc::now().to_rfc3339(), thread_id],
-        )?)
+        let sql = format!(
+            "UPDATE memories SET deleted_at=?1 WHERE thread_id=?2 AND deleted_at IS NULL AND {scope_sql}"
+        );
+        let now = Utc::now().to_rfc3339();
+        let tid = thread_id.to_string();
+        let mut dp: Vec<&dyn rusqlite::ToSql> = vec![&now, &tid];
+        for s in &scope_params { dp.push(s); }
+        Ok(conn.execute(&sql, dp.as_slice())?)
     }
 
     // -----------------------------------------------------------------------
@@ -1081,29 +1194,42 @@ impl SqliteStore {
         Ok(out)
     }
 
-    pub async fn delete_tag_everywhere(&self, tag: &str) -> Result<usize> {
+    /// Tag removal, scope-enforced (CB-018): a scoped caller rewrites tags only
+    /// on memories it can see — global tag surgery (which the priority:/to:/
+    /// session_note conventions depend on) stays an admin-scope operation.
+    pub async fn delete_tag_everywhere(&self, tag: &str, scope: &VisibilityScope) -> Result<usize> {
+        let (scope_sql, scope_params) = scope.sql_filter();
         let conn = self.conn.lock().await;
-        Ok(conn.execute(
+        let sql = format!(
             "UPDATE memories \
              SET tags = IFNULL(\
                  (SELECT json_group_array(value) FROM json_each(tags) WHERE value != ?1), '[]') \
-             WHERE deleted_at IS NULL \
-               AND EXISTS (SELECT 1 FROM json_each(tags) WHERE value = ?1)",
-            params![tag],
-        )?)
+             WHERE deleted_at IS NULL AND {scope_sql} \
+               AND EXISTS (SELECT 1 FROM json_each(tags) WHERE value = ?1)"
+        );
+        let t = tag.to_string();
+        let mut dp: Vec<&dyn rusqlite::ToSql> = vec![&t];
+        for s in &scope_params { dp.push(s); }
+        Ok(conn.execute(&sql, dp.as_slice())?)
     }
 
-    pub async fn rename_tag_everywhere(&self, old_tag: &str, new_tag: &str) -> Result<usize> {
+    /// Tag rename, scope-enforced (CB-018) — see `delete_tag_everywhere`.
+    pub async fn rename_tag_everywhere(&self, old_tag: &str, new_tag: &str, scope: &VisibilityScope) -> Result<usize> {
+        let (scope_sql, scope_params) = scope.sql_filter();
         let conn = self.conn.lock().await;
-        Ok(conn.execute(
+        let sql = format!(
             "UPDATE memories \
              SET tags = (\
                  SELECT json_group_array(CASE WHEN value = ?1 THEN ?2 ELSE value END) \
                  FROM json_each(tags)) \
-             WHERE deleted_at IS NULL \
-               AND EXISTS (SELECT 1 FROM json_each(tags) WHERE value = ?1)",
-            params![old_tag, new_tag],
-        )?)
+             WHERE deleted_at IS NULL AND {scope_sql} \
+               AND EXISTS (SELECT 1 FROM json_each(tags) WHERE value = ?1)"
+        );
+        let ot = old_tag.to_string();
+        let nt = new_tag.to_string();
+        let mut dp: Vec<&dyn rusqlite::ToSql> = vec![&ot, &nt];
+        for s in &scope_params { dp.push(s); }
+        Ok(conn.execute(&sql, dp.as_slice())?)
     }
 
     // -----------------------------------------------------------------------
@@ -1446,6 +1572,17 @@ impl SqliteStore {
         for r in step_ids { ids.push(r?); }
         let mut seen = std::collections::HashSet::new();
         Ok(ids.into_iter().filter(|id| seen.insert(id.clone())).map(MemoryId).collect())
+    }
+
+    /// SQLite's cross-connection change counter (`PRAGMA data_version`): the
+    /// value changes when ANOTHER connection commits to the database, and is
+    /// deliberately UNCHANGED by this connection's own commits — exactly the
+    /// staleness signal the in-memory graph cache needs (CB-003): own writes
+    /// already update the graph incrementally; foreign writes (the other
+    /// front-end process over the same file) are what require a rebuild.
+    pub async fn data_version(&self) -> Result<i64> {
+        let conn = self.conn.lock().await;
+        Ok(conn.query_row("PRAGMA data_version", [], |r| r.get(0))?)
     }
 
     // -----------------------------------------------------------------------
