@@ -582,27 +582,34 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Persist ACT-R access reinforcement for a batch of recalled memories.
-    ///
-    /// Only `access_count` + `access_times` are written (a lean UPDATE, not the
-    /// full-row `update_memory`), so the recall hot path stays cheap. All updates
-    /// run in one transaction. Rows that are soft-deleted are skipped by the
-    /// `deleted_at IS NULL` guard. Called by `recall()` so retrieval strengthens
-    /// base-level activation ("recall sharpens memory").
+    /// Persist the recall-time reinforcement for each node: ACT-R access history
+    /// (`access_count`/`access_times`) AND the FSRS review state
+    /// (`fsrs_stability`/`fsrs_difficulty`/`fsrs_last_review`). One batched UPDATE
+    /// per node (a lean UPDATE, not the full-row `update_memory`) keeps the recall
+    /// hot path cheap. All updates run in one transaction. Rows that are
+    /// soft-deleted are skipped by the `deleted_at IS NULL` guard. Called by
+    /// `recall()` so retrieval strengthens base-level activation ("recall sharpens
+    /// memory"). `last_review` is RFC3339 (NULL when unset) to match the
+    /// read-side parse.
+    // Tuple = (id, access_count, access_times_json, fsrs_stability,
+    // fsrs_difficulty, fsrs_last_review_rfc3339) — an internal one-call record;
+    // a named struct buys nothing at the single (cortex::recall) build site.
+    #[allow(clippy::type_complexity)]
     pub async fn record_accesses(
         &self,
-        updates: &[(MemoryId, u32, String)],
+        updates: &[(MemoryId, u32, String, f32, f32, Option<String>)],
     ) -> Result<()> {
         if updates.is_empty() {
             return Ok(());
         }
         let mut conn = self.conn.lock().await;
         let tx = conn.transaction()?;
-        for (id, count, times_json) in updates {
+        for (id, count, times_json, stability, difficulty, last_review) in updates {
             tx.execute(
-                "UPDATE memories SET access_count = ?1, access_times = ?2 \
-                 WHERE id = ?3 AND deleted_at IS NULL",
-                params![*count as i64, times_json, id.0],
+                "UPDATE memories SET access_count = ?1, access_times = ?2, \
+                 fsrs_stability = ?3, fsrs_difficulty = ?4, fsrs_last_review = ?5 \
+                 WHERE id = ?6 AND deleted_at IS NULL",
+                params![*count as i64, times_json, *stability as f64, *difficulty as f64, last_review, id.0],
             )?;
         }
         tx.commit()?;
@@ -1609,9 +1616,10 @@ impl SqliteStore {
         &self,
         limit: usize,
         agent_id_filter: Option<&str>,
+        action_filter: Option<&str>,
+        since: Option<&str>,
     ) -> Result<Vec<serde_json::Value>> {
         let conn = self.conn.lock().await;
-        let limit_val = limit as i64;
         let row_to_entry = |r: &rusqlite::Row<'_>| -> rusqlite::Result<serde_json::Value> {
             Ok(serde_json::json!({
                 "id":        r.get::<_, i64>(0)?,
@@ -1622,23 +1630,39 @@ impl SqliteStore {
                 "details":   r.get::<_, Option<String>>(5)?,
             }))
         };
-        let mut out = Vec::new();
+        // Dynamic WHERE from the optional filters. Timestamps are RFC3339
+        // strings (lexicographically ordered), so `since` is a plain >= compare.
+        let mut clauses: Vec<&str> = Vec::new();
+        let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(aid) = agent_id_filter {
-            let aid_s = aid.to_string();
-            let mut stmt = conn.prepare(
-                "SELECT id, timestamp, agent_id, action, memory_id, details \
-                 FROM audit_log WHERE agent_id = ?1 ORDER BY timestamp DESC LIMIT ?2"
-            )?;
-            let rows = stmt.query_map(params![aid_s, limit_val], row_to_entry)?;
-            for r in rows { out.push(r?); }
-        } else {
-            let mut stmt = conn.prepare(
-                "SELECT id, timestamp, agent_id, action, memory_id, details \
-                 FROM audit_log ORDER BY timestamp DESC LIMIT ?1"
-            )?;
-            let rows = stmt.query_map(params![limit_val], row_to_entry)?;
-            for r in rows { out.push(r?); }
+            bound.push(Box::new(aid.to_string()));
+            clauses.push("agent_id = ?");
         }
+        if let Some(act) = action_filter {
+            bound.push(Box::new(act.to_string()));
+            clauses.push("action = ?");
+        }
+        if let Some(ts) = since {
+            bound.push(Box::new(ts.to_string()));
+            clauses.push("timestamp >= ?");
+        }
+        let where_sql = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {} ", clauses.join(" AND "))
+        };
+        bound.push(Box::new(limit as i64));
+        let sql = format!(
+            "SELECT id, timestamp, agent_id, action, memory_id, details \
+             FROM audit_log {where_sql}ORDER BY timestamp DESC LIMIT ?"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(bound.iter().map(|p| p.as_ref())),
+            row_to_entry,
+        )?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r?); }
         Ok(out)
     }
 
@@ -1655,6 +1679,75 @@ impl SqliteStore {
         let mut by_action = serde_json::Map::new();
         for r in rows { let (a, cnt) = r?; by_action.insert(a, cnt.into()); }
         Ok(serde_json::json!({ "total_events": total, "by_action": by_action }))
+    }
+
+    // -----------------------------------------------------------------------
+    // Retention (CB-021) — bound the three otherwise-forever tables
+    // -----------------------------------------------------------------------
+
+    /// Prune the three unbounded lifecycle tables on a never-reset brain:
+    /// `memory_versions` (full content copies — keep the newest
+    /// `versions_per_memory` PER memory), `dream_reports` (nightly since the
+    /// dream cron — keep the newest `dream_reports_keep`), and `audit_log`
+    /// (grows on every mutation since the write path went live — keep the
+    /// newest `audit_rows_keep`; it is the agent's self-history, so the caps
+    /// default generous). A cap of 0 means keep-forever for that table.
+    ///
+    /// When anything was pruned, ONE audit row records the sweep itself —
+    /// the same honesty rule as the history trim-seam marker: the timeline
+    /// may shorten, but never silently.
+    pub async fn retention_sweep(
+        &self,
+        versions_per_memory: usize,
+        dream_reports_keep: usize,
+        audit_rows_keep: usize,
+    ) -> Result<(usize, usize, usize)> {
+        let (versions, reports, audits) = {
+            let conn = self.conn.lock().await;
+            let versions = if versions_per_memory > 0 {
+                conn.execute(
+                    "DELETE FROM memory_versions WHERE id IN (
+                         SELECT id FROM (
+                             SELECT id, ROW_NUMBER() OVER (
+                                 PARTITION BY memory_id
+                                 ORDER BY edited_at DESC, id DESC
+                             ) AS rn FROM memory_versions
+                         ) WHERE rn > ?1
+                     )",
+                    params![versions_per_memory as i64],
+                )?
+            } else { 0 };
+            let reports = if dream_reports_keep > 0 {
+                conn.execute(
+                    "DELETE FROM dream_reports WHERE id NOT IN (
+                         SELECT id FROM dream_reports ORDER BY started_at DESC LIMIT ?1
+                     )",
+                    params![dream_reports_keep as i64],
+                )?
+            } else { 0 };
+            let audits = if audit_rows_keep > 0 {
+                conn.execute(
+                    "DELETE FROM audit_log WHERE id NOT IN (
+                         SELECT id FROM audit_log ORDER BY id DESC LIMIT ?1
+                     )",
+                    params![audit_rows_keep as i64],
+                )?
+            } else { 0 };
+            (versions, reports, audits)
+        }; // conn lock dropped before the audit write re-locks
+        if versions + reports + audits > 0 {
+            self.log_audit_event(
+                None,
+                "retention_sweep",
+                None,
+                Some(&format!(
+                    "pruned {versions} old memory version(s), {reports} dream report(s), \
+                     {audits} audit row(s) past the retention caps \
+                     ({versions_per_memory}/memory · {dream_reports_keep} reports · {audit_rows_keep} rows)"
+                )),
+            ).await?;
+        }
+        Ok((versions, reports, audits))
     }
 
     // -----------------------------------------------------------------------
