@@ -243,13 +243,17 @@ impl DreamEngine {
 
         // Persist to dream_reports table
         let report_id = format!("dream_{}", uuid::Uuid::new_v4().simple());
-        let _ = cortex.storage.read().await.sqlite
+        // CB-024: surface a failed report persist instead of silently dropping it.
+        if let Err(e) = cortex.storage.read().await.sqlite
             .save_dream_report(
                 &report_id,
                 scope.agent_id.as_ref().map(|a| a.0.as_str()),
                 &report,
             )
-            .await;
+            .await
+        {
+            tracing::warn!("dream report persist failed ({report_id}): {e}");
+        }
 
         Ok(report)
     }
@@ -701,9 +705,15 @@ impl DreamEngine {
                     .get_memory(mid, scope).await?
                 {
                     let enriched = cortex.amygdala.apply_emotion(node);
-                    let _ = cortex.storage.read().await.sqlite
-                        .update_memory(&enriched).await;
-                    result.memories_processed += 1;
+                    // CB-024: only count memories whose re-scored state persisted.
+                    match cortex.storage.read().await.sqlite
+                        .update_memory(&enriched).await
+                    {
+                        Ok(_)  => result.memories_processed += 1,
+                        Err(e) => tracing::warn!(
+                            "Phase 4 emotional persist failed for {}: {e}", enriched.id.0
+                        ),
+                    }
                 }
             }
         }
