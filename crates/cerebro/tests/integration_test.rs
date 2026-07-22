@@ -459,6 +459,132 @@ mod storage_basic {
     }
 
     #[tokio::test]
+    async fn destructive_ops_are_scope_enforced() {
+        // CB-018: a scoped caller can only destroy/restore what it can see.
+        let (mut store, _dir) = make_store().await;
+        let mut node = MemoryNode::new("alice's private plan", MemoryType::Semantic);
+        node.visibility = Visibility::Private;
+        node.agent_id   = Some(AgentId("alice".into()));
+        node.thread_id  = Some("thread-x".into());
+        let id = node.id.clone();
+        store.sqlite.insert_memory(&node).await.unwrap();
+        store.graph.add_node(id.clone());
+        let alice = VisibilityScope::for_agent(AgentId("alice".into()));
+        let bob   = VisibilityScope::for_agent(AgentId("bob".into()));
+
+        // Bob can't delete what he can't see — and the coordinator must NOT
+        // evict the graph node on a denied delete.
+        assert!(!store.delete_memory(&id, &bob).await.unwrap());
+        assert!(store.graph.index.contains_key(&id), "denied delete must not evict the graph node");
+        assert!(store.sqlite.get_memory(&id, &alice).await.unwrap().is_some());
+
+        // Bob can't purge it either — the row survives.
+        assert!(!store.sqlite.purge_memory(&id, &bob).await.unwrap());
+        assert!(store.sqlite.get_memory(&id, &alice).await.unwrap().is_some());
+
+        // Bulk delete under bob skips it; under alice it lands.
+        assert_eq!(store.bulk_delete(std::slice::from_ref(&id), &bob).await.unwrap(), 0);
+        assert_eq!(store.bulk_delete(std::slice::from_ref(&id), &alice).await.unwrap(), 1);
+
+        // Bob can't resurrect alice's deleted memory; alice can.
+        assert!(!store.sqlite.restore_memory(&id, &bob).await.unwrap());
+        assert!(store.sqlite.restore_memory(&id, &alice).await.unwrap());
+
+        // Scoped prune_thread: a shared row in the thread dies, alice's private
+        // row survives bob's prune.
+        let mut shared = MemoryNode::new("shared thread note", MemoryType::Semantic);
+        shared.thread_id = Some("thread-x".into());
+        store.sqlite.insert_memory(&shared).await.unwrap();
+        assert_eq!(store.sqlite.prune_thread("thread-x", &bob).await.unwrap(), 1);
+        assert!(store.sqlite.get_memory(&id, &alice).await.unwrap().is_some(),
+            "another agent's private memory survives a scoped thread prune");
+
+        // Scoped tag surgery: bob's rename doesn't touch alice's private tags.
+        let mut tagged = MemoryNode::new("alice's tagged secret", MemoryType::Semantic);
+        tagged.visibility = Visibility::Private;
+        tagged.agent_id   = Some(AgentId("alice".into()));
+        tagged.tags       = vec!["ritual".into()];
+        store.sqlite.insert_memory(&tagged).await.unwrap();
+        assert_eq!(store.sqlite.rename_tag_everywhere("ritual", "habit", &bob).await.unwrap(), 0);
+        assert_eq!(store.sqlite.delete_tag_everywhere("ritual", &bob).await.unwrap(), 0);
+        assert_eq!(store.sqlite.rename_tag_everywhere("ritual", "habit", &alice).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn share_memory_requires_ownership() {
+        // CB-018: only the owner (or admin/global) may re-scope a memory —
+        // before this, one call could seize any agent's memory by id.
+        let (store, _dir) = make_store().await;
+        let mut node = MemoryNode::new("alice's discovery", MemoryType::Semantic);
+        node.visibility = Visibility::Private;
+        node.agent_id   = Some(AgentId("alice".into()));
+        let id = node.id.clone();
+        store.sqlite.insert_memory(&node).await.unwrap();
+        let alice = VisibilityScope::for_agent(AgentId("alice".into()));
+        let bob   = VisibilityScope::for_agent(AgentId("bob".into()));
+
+        // Bob can't even see it → honest not-found (false), not an error.
+        assert!(!store.sqlite.share_memory(&id, Some("bob"), &bob).await.unwrap());
+
+        // Alice shares her own memory to the commons.
+        assert!(store.sqlite.share_memory(&id, None, &alice).await.unwrap());
+
+        // Now bob CAN see it (shared) — but seizing it is refused LOUDLY.
+        let err = store.sqlite.share_memory(&id, Some("bob"), &bob).await.unwrap_err();
+        assert!(err.to_string().contains("not owned by bob"), "got: {err}");
+        // Alice no longer owns it either (commons memory) — also refused.
+        assert!(store.sqlite.share_memory(&id, Some("alice"), &alice).await.is_err());
+
+        // The admin (global scope) may re-own — the fossil-heal/operator path.
+        assert!(store.sqlite.share_memory(&id, Some("alice"), &VisibilityScope::global()).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn remember_lands_in_graph_even_without_a_vector() {
+        // CB-007/CB-009: the embed runs lock-free before the write guard and a
+        // missing/failed embedding is non-fatal — the memory must still land in
+        // sqlite AND the in-memory graph (spreading activation reachability),
+        // and recall must find it through the FTS5 path (search_seeded(None)).
+        use cerebro::CerebroCortex;
+        let dir = TempDir::new().unwrap();
+        let config = Config {
+            db_path:       dir.path().join("test.db"),
+            anthropic_key: None,
+            embed_model:   "".into(), // no embedder → embed_lockfree yields None
+        };
+        let brain = CerebroCortex::new(config).await.unwrap();
+        let node = brain.remember(
+            "the mesh relay token rotates monthly", None, None, None,
+            VisibilityScope::global(),
+        ).await.unwrap();
+
+        // In the graph (CB-009's observable): reachable by spreading activation.
+        assert!(brain.storage.read().await.graph.index.contains_key(&node.id),
+            "memory must be a graph node immediately, not only after restart");
+
+        // Recall finds it via FTS5 despite no vector existing.
+        let hits = brain.recall("mesh relay token", 5, VisibilityScope::global()).await.unwrap();
+        assert!(hits.iter().any(|(n, _)| n.id == node.id),
+            "FTS5 recall must find the vector-less memory");
+    }
+
+    #[tokio::test]
+    async fn search_seeded_none_matches_plain_search() {
+        // CB-019 compat: with no query vector, search_seeded must behave exactly
+        // like search on the FTS5 path.
+        let (store, _dir) = make_store().await;
+        let node = MemoryNode::new("the quick brown fox jumps", MemoryType::Semantic);
+        store.sqlite.insert_memory(&node).await.unwrap();
+
+        let scope = VisibilityScope::global();
+        let (scope_sql, scope_params) = scope.sql_filter();
+        let plain  = store.vector.search("fox", 10, scope_sql, &scope_params).await.unwrap();
+        let seeded = store.vector.search_seeded("fox", 10, scope_sql, &scope_params, None).await.unwrap();
+        assert_eq!(plain, seeded);
+        assert!(!seeded.is_empty());
+    }
+
+    #[tokio::test]
     async fn get_memory_returns_none_for_missing_id() {
         let (store, _dir) = make_store().await;
         use cerebro::types::MemoryId;
@@ -508,7 +634,7 @@ mod storage_basic {
         let id   = node.id.clone();
         store.sqlite.insert_memory(&node).await.unwrap();
 
-        let deleted = store.sqlite.delete_memory(&id).await.unwrap();
+        let deleted = store.sqlite.delete_memory(&id, &VisibilityScope::global()).await.unwrap();
         assert!(deleted, "first delete returns true");
 
         // Should be invisible now
@@ -516,7 +642,7 @@ mod storage_basic {
         assert!(got.is_none(), "deleted memory must not appear in get_memory");
 
         // Second delete returns false (already deleted)
-        let deleted2 = store.sqlite.delete_memory(&id).await.unwrap();
+        let deleted2 = store.sqlite.delete_memory(&id, &VisibilityScope::global()).await.unwrap();
         assert!(!deleted2, "double-delete returns false");
     }
 
@@ -595,8 +721,8 @@ mod storage_basic {
         ).await.unwrap();
 
         // Soft-delete then purge the linked source — must not hit a FK error.
-        store.sqlite.delete_memory(&a_id).await.unwrap();
-        let purged = store.sqlite.purge_memory(&a_id).await.unwrap();
+        store.sqlite.delete_memory(&a_id, &VisibilityScope::global()).await.unwrap();
+        let purged = store.sqlite.purge_memory(&a_id, &VisibilityScope::global()).await.unwrap();
         assert!(purged, "purge of a linked memory should succeed");
 
         // The dependent link is gone too (both directions).
@@ -621,9 +747,9 @@ mod storage_basic {
         ).await.unwrap();
 
         // Soft-delete both ends, then bulk-purge — no FK error.
-        store.sqlite.delete_memory(&a_id).await.unwrap();
-        store.sqlite.delete_memory(&b_id).await.unwrap();
-        let n = store.sqlite.purge_all_deleted().await.unwrap();
+        store.sqlite.delete_memory(&a_id, &VisibilityScope::global()).await.unwrap();
+        store.sqlite.delete_memory(&b_id, &VisibilityScope::global()).await.unwrap();
+        let n = store.sqlite.purge_all_deleted(&VisibilityScope::global()).await.unwrap();
         assert_eq!(n, 2, "both soft-deleted memories purged");
         assert!(store.sqlite.list_links_from(&a_id).await.unwrap().is_empty());
     }
@@ -648,7 +774,7 @@ mod storage_basic {
         };
         assert_eq!(count_before, 1, "memory should be indexed before soft-delete");
 
-        store.sqlite.delete_memory(&id).await.unwrap();
+        store.sqlite.delete_memory(&id, &VisibilityScope::global()).await.unwrap();
         let count_after: i64 = {
             let conn = store.sqlite.shared_conn();
             let conn = conn.lock().await;
@@ -660,7 +786,7 @@ mod storage_basic {
         assert_eq!(count_after, 0, "soft-delete must evict the row from the FTS index");
 
         // Restore re-indexes (memories_au trigger re-inserts).
-        store.sqlite.restore_memory(&id).await.unwrap();
+        store.sqlite.restore_memory(&id, &VisibilityScope::global()).await.unwrap();
         let count_restored: i64 = {
             let conn = store.sqlite.shared_conn();
             let conn = conn.lock().await;
@@ -701,6 +827,21 @@ mod storage_basic {
         assert_eq!(all.len(), 1);
         let ret = all[0]["retrievability"].as_f64().unwrap();
         assert!((ret - 0.9).abs() < 0.02, "expected FSRS R≈0.90, got {ret}");
+    }
+
+    #[tokio::test]
+    async fn visibility_meta_chunks_past_the_parameter_limit_shape() {
+        // CB-008: get_visibility_meta chunks its IN-clause at 500 ids — 1,200
+        // ids = 3 chunks, all returned, none dropped at the seams.
+        let (store, _dir) = make_store().await;
+        let mut ids = Vec::new();
+        for i in 0..1200 {
+            let node = MemoryNode::new(format!("chunk fodder {i} padding text"), MemoryType::Semantic);
+            ids.push(node.id.clone());
+            store.sqlite.insert_memory(&node).await.unwrap();
+        }
+        let meta = store.sqlite.get_visibility_meta(&ids).await.unwrap();
+        assert_eq!(meta.len(), 1200, "every chunk's rows must land in the map");
     }
 }
 
@@ -815,7 +956,7 @@ mod vector_store {
         let node = MemoryNode::new("unique xyzzy content", MemoryType::Semantic);
         let id = node.id.clone();
         store.sqlite.insert_memory(&node).await.unwrap();
-        store.sqlite.delete_memory(&id).await.unwrap();
+        store.sqlite.delete_memory(&id, &VisibilityScope::global()).await.unwrap();
 
         let (scope_sql, scope_params) = VisibilityScope::global().sql_filter();
         let results = store.vector.search("xyzzy", 10, scope_sql, &scope_params).await.unwrap();
@@ -867,7 +1008,7 @@ mod graph_store {
         config::Config,
         models::{AssociativeLink, MemoryNode},
         storage::{graph::GraphStore, StorageCoordinator},
-        types::{LinkType, MemoryType},
+        types::{LinkType, MemoryType, VisibilityScope},
     };
     use tempfile::TempDir;
 
@@ -941,7 +1082,7 @@ mod graph_store {
         let b_id = b.id.clone();
         store.sqlite.insert_memory(&a).await.unwrap();
         store.sqlite.insert_memory(&b).await.unwrap();
-        store.sqlite.delete_memory(&b_id).await.unwrap();
+        store.sqlite.delete_memory(&b_id, &VisibilityScope::global()).await.unwrap();
 
         let graph = GraphStore::rebuild_from_db(&store.sqlite).await.unwrap();
         assert_eq!(graph.graph.node_count(), 1, "only non-deleted node expected");
@@ -963,7 +1104,7 @@ mod graph_store {
         store.sqlite.insert_link(&link).await.unwrap();
 
         // Delete b — the link's target disappears
-        store.sqlite.delete_memory(&b_id).await.unwrap();
+        store.sqlite.delete_memory(&b_id, &VisibilityScope::global()).await.unwrap();
 
         let graph = GraphStore::rebuild_from_db(&store.sqlite).await.unwrap();
         assert_eq!(graph.graph.node_count(), 1);
@@ -982,7 +1123,7 @@ mod cortex_pipeline {
         config::Config,
         cortex::CerebroCortex,
         models::AssociativeLink,
-        types::{LinkType, VisibilityScope},
+        types::{AgentId, LinkType, VisibilityScope},
     };
     use tempfile::TempDir;
 
@@ -1034,6 +1175,116 @@ mod cortex_pipeline {
         assert!(!results.is_empty(), "recall should return at least one result");
         assert_eq!(results[0].0.id, node.id, "remembered node should rank first");
         assert!(results[0].1 > 0.0, "recall score should be positive");
+    }
+
+    #[tokio::test]
+    async fn frontier_bounding_keeps_association_hits_and_scope_denial() {
+        // CB-008: the visibility map is now fetched for the seeds' reachable
+        // frontier only. Two properties must hold end-to-end:
+        // (1) an association-only hit (reachable purely through spreading, no
+        //     keyword match) still surfaces for a caller who may see it — i.e.
+        //     the frontier map isn't under-collected;
+        // (2) another agent's private memory one hop from a seed stays out of
+        //     a scoped recall — the C-RS-003 guarantee survives the bounding.
+        let (cortex, _dir) = make_cortex().await;
+        let alice = AgentId("alice".into());
+
+        let seed = cortex.remember(
+            "zeppelin navigation requires patient barometric discipline",
+            None, None, None, VisibilityScope::global(),
+        ).await.unwrap();
+        // Content deliberately shares NO keywords with the query — reachable
+        // only via the associative link.
+        let private = cortex.remember(
+            "meadow rituals and quiet unrelated things",
+            None, None, None, VisibilityScope::for_agent(alice.clone()),
+        ).await.unwrap();
+        cortex.associate(
+            seed.id.clone(), private.id.clone(),
+            AssociativeLink::new(seed.id.clone(), private.id.clone(), LinkType::Semantic, 1.0),
+        ).await.unwrap();
+
+        // Alice: the private neighbour arrives as an association-only hit.
+        let own = cortex.recall("zeppelin navigation", 10, VisibilityScope::for_agent(alice))
+            .await.unwrap();
+        assert!(own.iter().any(|(n, _)| n.id == private.id),
+            "association-only hit must survive frontier bounding for its owner");
+
+        // Bob: same query, the private neighbour never surfaces.
+        let other = cortex.recall("zeppelin navigation", 10,
+            VisibilityScope::for_agent(AgentId("bob".into()))).await.unwrap();
+        assert!(other.iter().any(|(n, _)| n.id == seed.id), "shared seed visible to bob");
+        assert!(!other.iter().any(|(n, _)| n.id == private.id),
+            "another agent's private memory must stay out of a scoped recall");
+    }
+
+    #[tokio::test]
+    async fn cross_process_graph_stays_fresh() {
+        // CB-003: two CerebroCortex instances over ONE db file — the real
+        // cerebro-mcp + cerebro-api deployment shape. Each holds its own
+        // in-memory graph; before the data_version refresh, a memory/link
+        // committed by one NEVER appeared in the other's graph until restart
+        // (missing association hits, false "memory does not exist" on
+        // associate). Both directions verified here.
+        let dir = TempDir::new().unwrap();
+        let config = Config {
+            db_path:       dir.path().join("shared.db"),
+            anthropic_key: None,
+            embed_model:   "".into(),
+        };
+        let a = CerebroCortex::new(config.clone()).await.unwrap();
+        let b = CerebroCortex::new(config).await.unwrap();
+
+        // A commits a seed + an association-only neighbour AFTER b booted.
+        let seed = a.remember(
+            "gyroscope calibration needs a perfectly level table",
+            None, None, None, VisibilityScope::global(),
+        ).await.unwrap();
+        let neighbor = a.remember(
+            "quiet meadow words sharing no query keywords",
+            None, None, None, VisibilityScope::global(),
+        ).await.unwrap();
+        a.associate(
+            seed.id.clone(), neighbor.id.clone(),
+            AssociativeLink::new(seed.id.clone(), neighbor.id.clone(), LinkType::Semantic, 1.0),
+        ).await.unwrap();
+
+        // B's recall sees A's link: the association-only hit arrives through
+        // B's refreshed graph (pre-fix its graph was empty).
+        let hits = b.recall("gyroscope calibration", 10, VisibilityScope::global())
+            .await.unwrap();
+        assert!(hits.iter().any(|(n, _)| n.id == neighbor.id),
+            "the other process's link must reach this process's spreading");
+
+        // B can associate onto ids A created (pre-fix: false 'does not exist').
+        let third = b.remember(
+            "level tables and spirit bubbles for calibration work",
+            None, None, None, VisibilityScope::global(),
+        ).await.unwrap();
+        b.associate(
+            seed.id.clone(), third.id.clone(),
+            AssociativeLink::new(seed.id.clone(), third.id.clone(), LinkType::Semantic, 1.0),
+        ).await.unwrap();
+
+        // …and A sees B's new memory+link on its next recall, symmetrically.
+        let hits = a.recall("gyroscope calibration", 10, VisibilityScope::global())
+            .await.unwrap();
+        assert!(hits.iter().any(|(n, _)| n.id == third.id),
+            "freshness must work in both directions");
+    }
+
+    #[tokio::test]
+    async fn own_writes_do_not_flag_the_graph_stale() {
+        // PRAGMA data_version moves only on FOREIGN commits — this process's
+        // own writes maintain the graph incrementally and must never trigger
+        // a rebuild (the property the whole CB-003 design leans on).
+        let (cortex, _dir) = make_cortex().await;
+        cortex.remember(
+            "own writes keep the graph warm without rebuilds",
+            None, None, None, VisibilityScope::global(),
+        ).await.unwrap();
+        assert!(!cortex.storage.read().await.graph_is_stale().await.unwrap(),
+            "an own-connection commit must not read as foreign");
     }
 
     #[tokio::test]

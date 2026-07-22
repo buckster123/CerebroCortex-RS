@@ -86,14 +86,61 @@ impl CerebroCortex {
         // Temporal: extract and store semantic concepts in metadata
         node = self.temporal.enrich_node(node);
 
-        // Persist across all three storage backends
+        // Embed OUTSIDE any storage lock (CB-007): inference is CPU-bound and
+        // needs only the embedder Arc — holding the write guard across it
+        // serialized every concurrent reader/writer on the embed latency.
+        // Failure is non-fatal by design (CB-009): the memory still lands in
+        // sqlite + FTS5 + graph, just without a vector.
+        let embedding = self.embed_lockfree(&node.content).await;
+
+        // Persist across all three storage backends. Graph node BEFORE the
+        // vector persist (CB-009): add_node is infallible, so a vector-store
+        // error can no longer orphan the memory out of spreading activation
+        // until the next restart.
         let mut storage = self.storage.write().await;
         storage.sqlite.insert_memory(&node).await?;
-        storage.vector.embed_and_store(&node.id, &node.content).await?;
         storage.graph.add_node(node.id.clone());
+        if let Some(vec) = embedding {
+            if let Err(e) = storage.vector.store_raw_embedding(&node.id, &vec).await {
+                tracing::warn!(id = %node.id.0,
+                    "embedding persist failed — memory stored without a vector (FTS5 still finds it): {e}");
+            }
+        }
 
         tracing::info!(id = %node.id.0, memory_type = ?node.memory_type, salience = node.salience, "memory stored");
         Ok(node)
+    }
+
+    /// Compute an embedding with NO storage lock held (CB-007/CB-019): clone
+    /// the embedder handle under a brief read guard, run inference lock-free.
+    /// `None` = no embedder (Nano tier) or a failed embed — logged, non-fatal;
+    /// callers degrade to FTS5/vector-less behaviour.
+    async fn embed_lockfree(&self, text: &str) -> Option<Vec<f32>> {
+        let embedder = self.storage.read().await.vector.embedder_handle()?;
+        let owned = text.to_string();
+        match tokio::task::spawn_blocking(move || {
+            embedder.embed(vec![owned], None).map(|mut v| v.remove(0))
+        }).await {
+            Ok(Ok(v))  => Some(v),
+            Ok(Err(e)) => { tracing::warn!("embedding failed (non-fatal): {e}"); None }
+            Err(e)     => { tracing::warn!("embedding task join failed (non-fatal): {e}"); None }
+        }
+    }
+
+    /// Refresh the in-memory graph if ANOTHER process committed to the shared
+    /// database since it was last built (CB-003 — cerebro-mcp and cerebro-api
+    /// each hold their own graph over one SQLite file). Two-phase: a cheap
+    /// `PRAGMA data_version` check under the read guard; only when stale do we
+    /// take the write guard and rebuild (which re-checks, so a racing caller
+    /// that already refreshed makes it a no-op). Own-process writes never
+    /// trigger this — the pragma only moves on foreign commits, and own writes
+    /// maintain the graph incrementally.
+    pub async fn refresh_graph_if_stale(&self) -> Result<()> {
+        let stale = self.storage.read().await.graph_is_stale().await?;
+        if stale {
+            self.storage.write().await.refresh_graph().await?;
+        }
+        Ok(())
     }
 
     /// Recall memories matching a query string.
@@ -106,12 +153,23 @@ impl CerebroCortex {
         k:     usize,
         scope: VisibilityScope,
     ) -> Result<Vec<(MemoryNode, f32)>> {
+        // Cross-process graph freshness (CB-003): pick up any memories/links
+        // the OTHER front-end committed, so spreading sees them and the
+        // association hits below aren't silently missing. One PRAGMA row when
+        // fresh; a rebuild only after a foreign commit.
+        self.refresh_graph_if_stale().await?;
+
+        // Embed the query BEFORE taking the read guard (CB-019): a held read
+        // guard blocks writers, so query inference under it stalled every
+        // concurrent remember/associate. A failed embed degrades to FTS5.
+        let query_vec = self.embed_lockfree(query).await;
+
         let storage = self.storage.read().await;
         let (scope_sql, scope_params) = scope.sql_filter();
 
         // 1. Vector / FTS5 candidates (over-fetch for spreading)
         let candidates = storage.vector
-            .search(query, k * 5, scope_sql, &scope_params).await?;
+            .search_seeded(query, k * 5, scope_sql, &scope_params, query_vec.as_deref()).await?;
         if candidates.is_empty() {
             return Ok(vec![]);
         }
@@ -123,19 +181,29 @@ impl CerebroCortex {
             .filter_map(|(id, sim)| storage.graph.index.get(id).map(|&idx| (idx, *sim)))
             .collect();
 
-        // Scope-visibility map (C-RS-003): a node participates in the spread only
-        // if the caller can see it, so another agent's private/thread memories
-        // can't shape the activations of nodes we *do* return. Global scope
-        // (agent_id == None) short-circuits to all-visible, matching Python's
-        // `agent_id is None` path in `_check_access`.
+        // Scope-visibility map (C-RS-003), bounded to the reachable frontier
+        // (CB-008): `spread` can only ever touch the seeds' undirected
+        // ≤MAX_HOPS neighbourhood, so that is ALL the visibility we fetch —
+        // previously this collected every graph id and ran one
+        // one-placeholder-per-memory IN query per recall (O(live-store) on the
+        // hot path, hard-failing past SQLite's ~32k parameter limit). Safe
+        // because spread treats a node missing from the map as NOT visible:
+        // under-collection could only weaken the spread, never leak. Global
+        // scope (agent_id == None) still short-circuits to all-visible —
+        // matching Python's `agent_id is None` path in `_check_access`.
+        let frontier = crate::activation::reachable_frontier(&storage.graph.graph, &seeds);
         let visible_nodes: HashMap<NodeIndex, bool> = if scope.agent_id.is_none() {
-            storage.graph.index.values().map(|&idx| (idx, true)).collect()
+            frontier.iter().map(|&idx| (idx, true)).collect()
         } else {
-            let all_ids: Vec<MemoryId> = storage.graph.index.keys().cloned().collect();
-            let vis_meta = storage.sqlite.get_visibility_meta(&all_ids).await?;
-            storage.graph.index.iter()
-                .map(|(id, &idx)| {
-                    let visible = match vis_meta.get(id) {
+            let frontier_ids: Vec<MemoryId> = frontier.iter()
+                .filter_map(|&idx| storage.graph.graph.node_weight(idx).cloned())
+                .collect();
+            let vis_meta = storage.sqlite.get_visibility_meta(&frontier_ids).await?;
+            frontier.iter()
+                .map(|&idx| {
+                    let visible = match storage.graph.graph.node_weight(idx)
+                        .and_then(|id| vis_meta.get(id))
+                    {
                         Some((vis, owner)) => scope.can_access(*vis, owner.as_ref()),
                         None => true, // not in DB → final SQLite filter handles it
                     };
@@ -205,6 +273,11 @@ impl CerebroCortex {
         link:    AssociativeLink,
     ) -> Result<()> {
         let mut storage = self.storage.write().await;
+        // Cross-process graph freshness (CB-003): without this, an id the
+        // OTHER front-end just committed fails the existence guard below with
+        // a false "memory does not exist". Already under the write guard, so
+        // refresh directly (no-op when nothing foreign was committed).
+        storage.refresh_graph().await?;
 
         // C-RS-010: validate both endpoints exist (and are live) BEFORE writing,
         // so a typo'd/nonexistent id can't leave a dangling orphan row in `links`

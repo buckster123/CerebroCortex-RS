@@ -2,8 +2,10 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
+    extract::{Path, Query, Request, State},
+    http::{header, StatusCode},
+    middleware::Next,
+    response::IntoResponse,
     routing::{delete, get, post},
     Json, Router,
 };
@@ -17,6 +19,18 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::info;
+
+/// Constant-time string equality for auth tokens. Guards on length first
+/// (lengths are not secret), then compares bytes via `subtle::ConstantTimeEq`
+/// so a mismatch does not leak the matching-prefix length through timing.
+fn ct_eq(a: &str, b: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.ct_eq(b).into()
+}
 
 // ---------------------------------------------------------------------------
 // State alias
@@ -300,7 +314,7 @@ async fn delete_memory(
     State(brain): State<Brain>,
 ) -> AppResult {
     let ok = brain.storage.read().await.sqlite
-        .delete_memory(&MemoryId(id.clone())).await?;
+        .delete_memory(&MemoryId(id.clone()), &VisibilityScope::global()).await?;
     Ok(Json(json!({ "deleted": ok })))
 }
 
@@ -574,7 +588,7 @@ async fn rename_tag(
     Json(req): Json<RenameTagReq>,
 ) -> AppResult {
     let count = brain.storage.read().await.sqlite
-        .rename_tag_everywhere(&req.old_tag, &req.new_tag).await?;
+        .rename_tag_everywhere(&req.old_tag, &req.new_tag, &VisibilityScope::global()).await?;
     Ok(Json(json!({ "updated": count })))
 }
 
@@ -585,7 +599,7 @@ async fn merge_tags(
     let mut total = 0usize;
     let storage = brain.storage.read().await;
     for src in &req.source_tags {
-        total += storage.sqlite.rename_tag_everywhere(src, &req.target_tag).await?;
+        total += storage.sqlite.rename_tag_everywhere(src, &req.target_tag, &VisibilityScope::global()).await?;
     }
     Ok(Json(json!({ "updated": total })))
 }
@@ -595,7 +609,7 @@ async fn delete_tag(
     State(brain): State<Brain>,
 ) -> AppResult {
     let count = brain.storage.read().await.sqlite
-        .delete_tag_everywhere(&tag).await?;
+        .delete_tag_everywhere(&tag, &VisibilityScope::global()).await?;
     Ok(Json(json!({ "removed_from": count })))
 }
 
@@ -746,7 +760,7 @@ async fn restore_trash(
     State(brain): State<Brain>,
 ) -> AppResult {
     let ok = brain.storage.read().await.sqlite
-        .restore_memory(&MemoryId(memory_id)).await?;
+        .restore_memory(&MemoryId(memory_id), &VisibilityScope::global()).await?;
     Ok(Json(json!({ "restored": ok })))
 }
 
@@ -755,14 +769,14 @@ async fn purge_trash(
     State(brain): State<Brain>,
 ) -> AppResult {
     let ok = brain.storage.read().await.sqlite
-        .purge_memory(&MemoryId(memory_id)).await?;
+        .purge_memory(&MemoryId(memory_id), &VisibilityScope::global()).await?;
     Ok(Json(json!({ "purged": ok })))
 }
 
 async fn purge_all_trash(
     State(brain): State<Brain>,
 ) -> AppResult {
-    let count = brain.storage.read().await.sqlite.purge_all_deleted().await?;
+    let count = brain.storage.read().await.sqlite.purge_all_deleted(&VisibilityScope::global()).await?;
     Ok(Json(json!({ "purged": count })))
 }
 
@@ -771,7 +785,7 @@ async fn bulk_delete(
     Json(req): Json<BulkDeleteReq>,
 ) -> AppResult {
     let ids: Vec<MemoryId> = req.ids.into_iter().map(MemoryId).collect();
-    let count = brain.storage.read().await.sqlite.bulk_delete(&ids).await?;
+    let count = brain.storage.read().await.sqlite.bulk_delete(&ids, &VisibilityScope::global()).await?.len();
     Ok(Json(json!({ "deleted": count })))
 }
 
@@ -806,7 +820,7 @@ async fn prune_thread(
     Path(thread_id): Path<String>,
     State(brain): State<Brain>,
 ) -> AppResult {
-    let count = brain.storage.read().await.sqlite.prune_thread(&thread_id).await?;
+    let count = brain.storage.read().await.sqlite.prune_thread(&thread_id, &VisibilityScope::global()).await?;
     Ok(Json(json!({ "deleted": count })))
 }
 
@@ -908,10 +922,55 @@ async fn main() -> Result<()> {
         .route("/dream/status",    get(dream_status))
         .with_state(brain);
 
+    // Token auth — CEREBRO_API_TOKEN, falling back to AGENTD_TOKEN (the shared
+    // secret on an ApexOS node, so those deployments work unchanged).
+    // Binds 127.0.0.1 by default; use CEREBRO_API_ADDR=0.0.0.0:8765 for LAN
+    // exposure — which then REQUIRES a token (refused below without one).
+    let api_token = Arc::new(
+        std::env::var("CEREBRO_API_TOKEN")
+            .or_else(|_| std::env::var("AGENTD_TOKEN"))
+            .unwrap_or_default(),
+    );
+    if api_token.is_empty() {
+        info!("cerebro-api: CEREBRO_API_TOKEN/AGENTD_TOKEN not set — auth disabled (127.0.0.1 only)");
+    }
+    let token_mw = api_token.clone();
+    let app = app.layer(axum::middleware::from_fn(
+        move |req: Request, next: Next| {
+            let tok = token_mw.clone();
+            async move {
+                if tok.is_empty() { return next.run(req).await; }
+                let from_header = req.headers()
+                    .get(header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.strip_prefix("Bearer "))
+                    .unwrap_or("");
+                if ct_eq(from_header, tok.as_str()) { return next.run(req).await; }
+                let from_query = req.uri().query().unwrap_or("")
+                    .split('&')
+                    .find_map(|p| p.strip_prefix("token="))
+                    .unwrap_or("");
+                if ct_eq(from_query, tok.as_str()) { return next.run(req).await; }
+                (StatusCode::UNAUTHORIZED, "invalid or missing token").into_response()
+            }
+        }
+    ));
+
     let addr = std::env::var("CEREBRO_API_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:8765".into());
+        .unwrap_or_else(|_| "127.0.0.1:8765".into());
+    // F036: an env typo must not silently re-open the unauthenticated-LAN hole.
+    if api_token.is_empty() {
+        if let Ok(sa) = addr.parse::<std::net::SocketAddr>() {
+            if !sa.ip().is_loopback() {
+                anyhow::bail!("refusing to bind {addr} without CEREBRO_API_TOKEN/AGENTD_TOKEN");
+            }
+        }
+    }
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("cerebro-api listening on {addr}");
+    if !api_token.is_empty() {
+        info!("cerebro-api dashboard: http://{addr}/?token=<token>  (bearer token required)");
+    }
     axum::serve(listener, app).await?;
     Ok(())
 }

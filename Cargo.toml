@@ -19,6 +19,7 @@ repository  = "https://github.com/buckster123/CerebroCortex-RS"
 dirs-next   = "2"
 # Temp dirs for tests
 tempfile    = "3"
+subtle      = "2"
 
 # Async
 tokio       = { version = "1", features = ["full"] }

@@ -8,6 +8,9 @@
 >
 > Severity legend: high = corruption/security/wrong results · medium = degraded behavior · low = polish.
 > Difficulty: clean = near-cherry-pick · adapt = re-work against this tree · entangled = needs listed deps.
+>
+> **Status: Wave 1 shipped (PR #4) · Wave 2 shipped (PR #5) — including `bc226ee` (graph
+> prune on delete, folded into the CB-018 port as a hard prerequisite). Waves 3–4 open.**
 
 ## Wave 1 — data integrity & panic fixes (do these before pointing -RS at a real DB)
 
