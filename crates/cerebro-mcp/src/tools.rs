@@ -108,7 +108,16 @@ fn tool_schema(name: &str) -> Value {
                     "content":   { "type": "string" },
                     "tags":      { "anyOf": [{"type":"array","items":{"type":"string"}},{"type":"string"}] },
                     "salience":  { "type": "number" },
-                    "agent_id":  { "type": "string" }
+                    "agent_id":  { "type": "string" },
+                    "visibility": {
+                        "type": "string",
+                        "enum": ["private", "shared", "thread"],
+                        "description": "Change visibility. share_memory stays the deliberate publish act; privatizing an owner-less memory requires set_agent_id (else it would be visible to no one)."
+                    },
+                    "set_agent_id": {
+                        "type": "string",
+                        "description": "Re-attribute ownership (e.g. heal an agent_id-null record). Caller-stamped for model calls — a model can only claim to itself."
+                    }
                 },
                 "required": ["memory_id"]
             }
@@ -122,7 +131,13 @@ fn tool_schema(name: &str) -> Value {
                 "properties": {
                     "content":   { "type": "string" },
                     "agent_id":  { "type": "string" },
-                    "tags":      { "anyOf": [{"type":"array","items":{"type":"string"}},{"type":"string"}] }
+                    "tags":      { "anyOf": [{"type":"array","items":{"type":"string"}},{"type":"string"}] },
+                    "memory_type": {
+                        "type": "string",
+                        "enum": ["episodic","semantic","procedural","affective","prospective","schematic"],
+                        "description": "Memory type (auto-classified if omitted)"
+                    },
+                    "salience": { "type": "number", "description": "Importance 0-1 (auto-estimated if omitted)" }
                 },
                 "required": ["content"]
             }
@@ -611,12 +626,18 @@ fn tool_schema(name: &str) -> Value {
 
         "query_audit" => json!({
             "name": "query_audit",
-            "description": "Query audit log entries, optionally filtered by agent.",
+            "description": "Your own action timeline: every successful mutating tool call \
+                            (remember/update/delete/episodes/procedures/dream_run/…) leaves one \
+                            row — 'what did I actually do, in order?' answered from one place. \
+                            Newest first; filter by agent, action (tool name), or since \
+                            (RFC3339 timestamp).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "limit":    { "type": "integer", "description": "Max results (default: 50)" },
-                    "agent_id": { "type": "string" }
+                    "agent_id": { "type": "string" },
+                    "action":   { "type": "string", "description": "Filter to one action (tool name, e.g. 'remember')" },
+                    "since":    { "type": "string", "description": "Only entries at/after this RFC3339 timestamp" }
                 },
                 "required": []
             }
@@ -695,12 +716,19 @@ fn tool_schema(name: &str) -> Value {
 
         "find_relevant_procedures" => json!({
             "name": "find_relevant_procedures",
-            "description": "Find workflows and how-to guides matching given tags or concepts.",
+            "description": "Find workflows and how-to guides. Two stages: normalized tag/concept \
+                            match (case and -/_ insensitive), then semantic recall widening when \
+                            exact matching leaves room (from `query`, or the tags/concepts as \
+                            query text). Champions rank first. The response reports how each \
+                            stage matched and how many procedures exist in scope — an empty \
+                            `procedures` with a nonzero `procedures_in_scope` means the matcher \
+                            may have missed, not that nothing exists.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "tags":     { "anyOf": [{"type":"array","items":{"type":"string"}},{"type":"string"}], "description": "Tags to match" },
-                    "concepts": { "anyOf": [{"type":"array","items":{"type":"string"}},{"type":"string"}], "description": "Concepts to match" },
+                    "tags":     { "anyOf": [{"type":"array","items":{"type":"string"}},{"type":"string"}], "description": "Tags to match (normalized: case and -/_ insensitive)" },
+                    "concepts": { "anyOf": [{"type":"array","items":{"type":"string"}},{"type":"string"}], "description": "Concepts to match (scans content + metadata, case-insensitive)" },
+                    "query":    { "type": "string", "description": "Free-text semantic match via recall, filtered to procedures" },
                     "limit":    { "type": "integer", "description": "Max results (default: 5)" },
                     "agent_id": { "type": "string", "description": "Agent scope" }
                 },

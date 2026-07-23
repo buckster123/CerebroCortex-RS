@@ -5,7 +5,7 @@ use cerebro::{
     engines::dream::{is_skill_champion, retrieval_rank},
     models::{AssociativeLink, MemoryNode},
     storage::ListFilter,
-    types::{AgentId, LinkType, MemoryId, MemoryType, VisibilityScope},
+    types::{AgentId, LinkType, MemoryId, MemoryType, Visibility, VisibilityScope},
     CerebroCortex,
 };
 use serde_json::{json, Value};
@@ -75,7 +75,23 @@ pub async fn dispatch_tool(msg: Value, brain: Arc<CerebroCortex>) -> Value {
         let params = &msg["params"];
         let name   = params["name"].as_str().unwrap_or("").to_string();
         let args   = params["arguments"].clone();
-        route(&name, &args, brain).await
+        let result = route(&name, &args, Arc::clone(&brain)).await;
+        // Self-history write (colony C3): the audit read tools shipped with the
+        // port but NOTHING ever called log_audit_event — query_audit was empty
+        // forever ("what did I actually do, in order?" had no answer). Every
+        // successful mutating tool call now leaves one row. Best-effort: an
+        // audit failure never fails the call it records.
+        if let (Ok(v), Some(action)) = (&result, audit_action(&name, &args)) {
+            let agent   = args["agent_id"].as_str().filter(|s| !s.is_empty());
+            let mid     = audit_memory_id(&args, v);
+            let details = audit_details(&args);
+            if let Err(e) = brain.storage.read().await.sqlite
+                .log_audit_event(agent, action, mid.as_deref(), details.as_deref()).await
+            {
+                tracing::warn!("audit write failed for {name}: {e}");
+            }
+        }
+        result
     });
 
     match handle.await {
@@ -104,6 +120,60 @@ pub async fn dispatch_tool(msg: Value, brain: Arc<CerebroCortex>) -> Value {
     }
 }
 
+/// Which tool calls write a self-history row (colony C3). Pure — unit-tested.
+///
+/// Mutating tools only: the audit log answers "what did I DO", so reads stay
+/// out (they'd bury the writes; access tracking already covers "what did I
+/// touch"). The action label is the tool name itself — `query_audit` output
+/// then reads as the agent's own verbs. `describe_image` mutates only when it
+/// remembers; `dream_run` is the one background mutation and very much belongs.
+fn audit_action(name: &str, args: &Value) -> Option<&'static str> {
+    const MUTATING: &[&str] = &[
+        "remember", "memory_store", "store_procedure", "store_intention",
+        "resolve_intention", "session_save", "update_memory", "delete_memory",
+        "restore_memory", "restore_version", "purge_memory", "purge_all_deleted",
+        "bulk_delete", "share_memory", "associate", "create_schema",
+        "episode_start", "episode_add_step", "episode_end",
+        "record_procedure_outcome", "merge_tags", "rename_tag", "delete_tag",
+        "prune_thread", "ingest_file", "register_agent", "send_message",
+        "dream_run",
+    ];
+    if name == "describe_image" {
+        return args["remember"].as_bool().unwrap_or(false).then_some("describe_image");
+    }
+    MUTATING.iter().find(|m| **m == name).copied()
+}
+
+/// Best-effort memory id for an audit row: the id the caller named, else the
+/// id the handler minted (remember returns the node → "id"; others return
+/// memory_id/procedure_id/episode_id/schema_id). Pure — unit-tested.
+fn audit_memory_id(args: &Value, result: &Value) -> Option<String> {
+    for key in ["memory_id", "procedure_id", "episode_id", "schema_id"] {
+        if let Some(s) = args[key].as_str() {
+            return Some(s.to_string());
+        }
+    }
+    for key in ["memory_id", "procedure_id", "episode_id", "schema_id", "id"] {
+        if let Some(s) = result[key].as_str() {
+            return Some(s.to_string());
+        }
+    }
+    None
+}
+
+/// Compact context for an audit row: a content/query preview, capped hard —
+/// the audit log is a timeline, not a second content store.
+fn audit_details(args: &Value) -> Option<String> {
+    let src = args["content"].as_str()
+        .or_else(|| args["session_summary"].as_str())
+        .or_else(|| args["description"].as_str())?;
+    let mut s: String = src.chars().take(120).collect();
+    if src.chars().count() > 120 {
+        s.push('…');
+    }
+    Some(s)
+}
+
 /// Map a handler error message to a JSON-RPC error code (C-RS-006).
 ///
 /// Per the audit's sanctioned "inspect the message" approach: every
@@ -129,6 +199,17 @@ pub fn method_not_found(req: &Value) -> Value {
     })
 }
 
+/// JSON-RPC parse error (-32700). Emitted per-frame for a malformed line so a
+/// single bad frame is isolated rather than fatal (CB-010). The spec mandates a
+/// null id when the request id can't be determined.
+pub fn parse_error() -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": Value::Null,
+        "error": { "code": -32700, "message": "Parse error" }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tool routing
 // ---------------------------------------------------------------------------
@@ -140,9 +221,8 @@ async fn route(name: &str, args: &Value, brain: Arc<CerebroCortex>) -> anyhow::R
                 .ok_or_else(|| anyhow::anyhow!("content is required"))?.to_string();
             let memory_type: Option<MemoryType> =
                 serde_json::from_value(args["memory_type"].clone()).ok();
-            let tags: Option<Vec<String>> = args["tags"].as_array().map(|arr| {
-                arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()
-            });
+            let tag_vec = coerce_str_list(&args["tags"]);
+            let tags = if tag_vec.is_empty() { None } else { Some(tag_vec) };
             let salience = args["salience"].as_f64().map(|f| f as f32);
             let scope    = agent_scope(args);
             let node = brain.remember(content, memory_type, tags, salience, scope).await?;
@@ -209,8 +289,35 @@ async fn route(name: &str, args: &Value, brain: Arc<CerebroCortex>) -> anyhow::R
             let content_changed = args["content"].as_str().is_some();
             if let Some(c) = args["content"].as_str()  { node.content = c.to_string(); }
             if let Some(s) = args["salience"].as_f64()  { node.salience = s as f32; }
-            if let Some(arr) = args["tags"].as_array() {
-                node.tags = arr.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+            if !args["tags"].is_null() {
+                node.tags = coerce_str_list(&args["tags"]);
+            }
+            // Ownership re-attribution (colony C1: fossils with agent_id null).
+            // Model-originated calls are safe by construction — the supervisor
+            // stamps agent_id with the caller's own identity, so a model can only
+            // claim a memory to itself; explicit reassignment is a DirectCall
+            // (daemon migration) privilege.
+            if let Some(a) = args["set_agent_id"].as_str().map(str::trim).filter(|a| !a.is_empty()) {
+                node.agent_id = Some(AgentId(a.to_string()));
+            }
+            // Visibility change (colony C1: privatize leaked evolution residue).
+            // share_memory remains the deliberate private→shared publish act; this
+            // is the general knob, and the orphan guard keeps a privatized memory
+            // reachable: private + no owner would be visible to no one.
+            if let Some(v) = args["visibility"].as_str() {
+                let vis = match v.to_lowercase().as_str() {
+                    "private" => Visibility::Private,
+                    "shared"  => Visibility::Shared,
+                    "thread"  => Visibility::Thread,
+                    other => anyhow::bail!("unknown visibility '{other}' (private|shared|thread)"),
+                };
+                if vis == Visibility::Private && node.agent_id.is_none() {
+                    anyhow::bail!(
+                        "refusing to privatize an owner-less memory (it would be visible to no one) — \
+                         pass set_agent_id to attribute it first"
+                    );
+                }
+                node.visibility = vis;
             }
 
             let storage = brain.storage.read().await;
@@ -226,8 +333,19 @@ async fn route(name: &str, args: &Value, brain: Arc<CerebroCortex>) -> anyhow::R
             if name == "memory_store" {
                 let content = args["content"].as_str()
                     .ok_or_else(|| anyhow::anyhow!("content is required"))?.to_string();
+                // TRUE alias of `remember`: honor memory_type / tags / salience.
+                // This dispatch used to drop them (None, None, None) while the schema
+                // documented them — the cause of the colony's C1 "evolution residue"
+                // finding: agentd's undo snapshots passed tags + type that never
+                // landed, so the fossils were untagged, mis-typed Procedural,
+                // auto-salienced ~1.0, and (via the missing agent_id) Shared.
+                let memory_type: Option<MemoryType> =
+                    serde_json::from_value(args["memory_type"].clone()).ok();
+                let tag_vec = coerce_str_list(&args["tags"]);
+                let tags = if tag_vec.is_empty() { None } else { Some(tag_vec) };
+                let salience = args["salience"].as_f64().map(|f| f as f32);
                 let scope = agent_scope(args);
-                let node = brain.remember(content, None, None, None, scope).await?;
+                let node = brain.remember(content, memory_type, tags, salience, scope).await?;
                 Ok(serde_json::to_value(&node)?)
             } else {
                 let query = args["query"].as_str()
@@ -713,8 +831,10 @@ async fn route(name: &str, args: &Value, brain: Arc<CerebroCortex>) -> anyhow::R
         "query_audit" => {
             let limit         = args["limit"].as_u64().unwrap_or(50) as usize;
             let agent_id_filt = args["agent_id"].as_str();
+            let action_filt   = args["action"].as_str().filter(|s| !s.is_empty());
+            let since         = args["since"].as_str().filter(|s| !s.is_empty());
             let entries       = brain.storage.read().await
-                .sqlite.query_audit(limit, agent_id_filt).await?;
+                .sqlite.query_audit(limit, agent_id_filt, action_filt, since).await?;
             Ok(json!(entries))
         }
 
@@ -728,9 +848,7 @@ async fn route(name: &str, args: &Value, brain: Arc<CerebroCortex>) -> anyhow::R
             let salience = args["salience"].as_f64().unwrap_or(0.7) as f32;
             let scope    = agent_scope(args);
             let mut tags = vec!["intention".to_string()];
-            if let Some(arr) = args["tags"].as_array() {
-                tags.extend(arr.iter().filter_map(|v| v.as_str().map(String::from)));
-            }
+            tags.extend(coerce_str_list(&args["tags"]));
             let node = brain.remember(
                 content, Some(MemoryType::Prospective), Some(tags), Some(salience), scope,
             ).await?;
@@ -779,12 +897,24 @@ async fn route(name: &str, args: &Value, brain: Arc<CerebroCortex>) -> anyhow::R
             let salience = args["salience"].as_f64().unwrap_or(0.8) as f32;
             let scope    = agent_scope(args);
             let mut tags = vec!["procedure".to_string()];
-            if let Some(arr) = args["tags"].as_array() {
-                tags.extend(arr.iter().filter_map(|v| v.as_str().map(String::from)));
-            }
-            let node = brain.remember(
+            tags.extend(coerce_str_list(&args["tags"]));
+            // CB-025: store_procedure advertises `derived_from` (also accept the
+            // sibling `source_ids` name) — mirror create_schema and persist the
+            // provenance into the procedure node's metadata so it is not silently
+            // discarded. Both shapes (array or bare string) are honored (CB-011).
+            let mut derived_from = coerce_str_list(&args["derived_from"]);
+            derived_from.extend(coerce_str_list(&args["source_ids"]));
+            let mut node = brain.remember(
                 content, Some(MemoryType::Procedural), Some(tags), Some(salience), scope,
             ).await?;
+            if !derived_from.is_empty() {
+                if let serde_json::Value::Object(ref mut map) = node.metadata {
+                    map.insert("derived_from".to_string(), json!(derived_from));
+                } else {
+                    node.metadata = json!({ "derived_from": derived_from });
+                }
+                brain.storage.read().await.sqlite.update_memory(&node).await?;
+            }
             Ok(json!({ "id": node.id, "status": "ok" }))
         }
 
@@ -801,19 +931,25 @@ async fn route(name: &str, args: &Value, brain: Arc<CerebroCortex>) -> anyhow::R
                 .list_memories_scoped(&scope, &filter).await?;
             let filtered: Vec<_> = nodes.into_iter()
                 .filter(|n| n.salience >= min_salience)
+                // Exclude evolution undo-snapshots: the soul.md rollback artifacts the
+                // evolution applier stores get mis-typed Procedural (their content embeds
+                // the full soul, which trips classify_type) and dominate by access count —
+                // they're rollback records, not skills. (APEX caught this via a goal.)
+                .filter(|n| !n.tags.iter().any(|t| t == "undo_snapshot"))
                 .collect();
             Ok(json!(filtered))
         }
 
         "find_relevant_procedures" => {
-            let tags: Vec<String>     = args["tags"].as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                .unwrap_or_default();
-            let concepts: Vec<String> = args["concepts"].as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                .unwrap_or_default();
-            if tags.is_empty() && concepts.is_empty() {
-                return Ok(json!([]));
+            let tags     = coerce_str_list(&args["tags"]);
+            let concepts = coerce_str_list(&args["concepts"]);
+            let query    = args["query"].as_str().unwrap_or("").trim().to_string();
+            if tags.is_empty() && concepts.is_empty() && query.is_empty() {
+                return Ok(json!({
+                    "procedures": [],
+                    "note": "nothing to match — pass tags/concepts for exact lookup \
+                             and/or query for semantic matching",
+                }));
             }
             let max_results = args["limit"].as_u64().unwrap_or(5) as usize;
             let scope       = agent_scope(args);
@@ -824,25 +960,80 @@ async fn route(name: &str, args: &Value, brain: Arc<CerebroCortex>) -> anyhow::R
             };
             let nodes = brain.storage.read().await.sqlite
                 .list_memories_scoped(&scope, &filter).await?;
-            let mut filtered: Vec<_> = nodes.into_iter()
+            let in_scope = nodes.iter()
+                .filter(|n| !n.tags.iter().any(|t| t == "undo_snapshot"))
+                .count();
+
+            // Stage 1 — exact-ish match, NORMALIZED (colony C6: exact string
+            // equality silently missed "mesh_recall" vs "mesh-recall" and
+            // case drift, on the tool the souls mandate reaching for first).
+            // Concepts scan content too, not just the metadata JSON string.
+            let mut matched: Vec<_> = nodes.into_iter()
                 .filter(|n| {
-                    let tag_hit = tags.iter().any(|t| n.tags.iter().any(|nt| nt == t));
-                    let meta_str = n.metadata.to_string();
-                    let concept_hit = concepts.iter().any(|c| meta_str.contains(c.as_str()));
+                    // Skip evolution undo-snapshots (rollback artifacts mis-typed Procedural).
+                    if n.tags.iter().any(|t| t == "undo_snapshot") { return false; }
+                    let tag_hit = tags.iter()
+                        .any(|t| n.tags.iter().any(|nt| norm_tag(nt) == norm_tag(t)));
+                    let meta_lc    = n.metadata.to_string().to_lowercase();
+                    let content_lc = n.content.to_lowercase();
+                    let concept_hit = concepts.iter().any(|c| {
+                        let c = c.to_lowercase();
+                        meta_lc.contains(c.as_str()) || content_lc.contains(c.as_str())
+                    });
                     tag_hit || concept_hit
                 })
                 .collect();
-            // Champion-aware ordering (E1 follow-up). The tag/concept match above
-            // is a *binary* relevance gate — it imposes no order, so prior to this
-            // the surfaced `max_results` were whatever the DB happened to list
-            // first. Rank the matched set by the SAME fitness the dream
-            // competition uses (`retrieval_rank`): a niche champion leads, then by
-            // Wilson fitness, ungraded falling back to salience. So when several
-            // procedures fit a niche, the one competition crowned surfaces first.
-            filtered.sort_by(|a, b| retrieval_rank(b)
+            let exact_hits = matched.len();
+
+            // Stage 2 — semantic widening through the SAME recall path that set
+            // the fuzzy expectations (C6): the explicit query, else the
+            // tags+concepts as query text. Only when exact matching left room,
+            // so a full exact answer costs nothing extra.
+            let mut semantic_hits = 0usize;
+            if matched.len() < max_results {
+                let qtext = if query.is_empty() {
+                    tags.iter().chain(concepts.iter()).cloned()
+                        .collect::<Vec<_>>().join(" ")
+                } else {
+                    query.clone()
+                };
+                if let Ok(results) = brain.recall(&qtext, max_results * 4, scope.clone()).await {
+                    for (node, _score) in results {
+                        if node.memory_type != MemoryType::Procedural { continue; }
+                        if node.tags.iter().any(|t| t == "undo_snapshot") { continue; }
+                        if matched.iter().any(|m| m.id == node.id) { continue; }
+                        matched.push(node);
+                        semantic_hits += 1;
+                    }
+                }
+            }
+
+            // Champion-aware ordering (E1 follow-up). The match stages are a
+            // *binary* relevance gate — rank the whole matched set by the SAME
+            // fitness the dream competition uses (`retrieval_rank`): a niche
+            // champion leads, then by Wilson fitness, ungraded falling back to
+            // salience. So when several procedures fit, the one competition
+            // crowned surfaces first — whichever stage found it.
+            matched.sort_by(|a, b| retrieval_rank(b)
                 .partial_cmp(&retrieval_rank(a)).unwrap_or(std::cmp::Ordering::Equal));
-            filtered.truncate(max_results);
-            Ok(json!(filtered))
+            matched.truncate(max_results);
+
+            // An empty result must be readable (C6): "nothing exists" and "the
+            // matcher missed" are different situations — say which is plausible.
+            let mut out = json!({
+                "procedures": matched,
+                "matched": { "exact": exact_hits, "semantic": semantic_hits },
+                "procedures_in_scope": in_scope,
+            });
+            if out["procedures"].as_array().is_some_and(|a| a.is_empty()) && in_scope > 0 {
+                out["note"] = json!(format!(
+                    "no match, but {in_scope} procedural memories exist in scope — an \
+                     empty result can mean the matcher missed, not that nothing exists. \
+                     Cross-check with recall or list_procedures; if the procedure you \
+                     expected is there, re-tag it to match how you look it up."
+                ));
+            }
+            Ok(out)
         }
 
         "record_procedure_outcome" => {
@@ -903,15 +1094,11 @@ async fn route(name: &str, args: &Value, brain: Arc<CerebroCortex>) -> anyhow::R
         "create_schema" => {
             let content    = args["content"].as_str()
                 .ok_or_else(|| anyhow::anyhow!("content required"))?;
-            let source_ids: Vec<String> = args["source_ids"].as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                .unwrap_or_default();
+            let source_ids = coerce_str_list(&args["source_ids"]);
             let salience   = args["salience"].as_f64().unwrap_or(0.7) as f32;
             let scope      = agent_scope(args);
             let mut tags   = vec!["schema".to_string(), "support_count:0".to_string()];
-            if let Some(arr) = args["tags"].as_array() {
-                tags.extend(arr.iter().filter_map(|v| v.as_str().map(String::from)));
-            }
+            tags.extend(coerce_str_list(&args["tags"]));
             let mut node = brain.remember(
                 content, Some(MemoryType::Schematic), Some(tags), Some(salience), scope,
             ).await?;
@@ -940,12 +1127,8 @@ async fn route(name: &str, args: &Value, brain: Arc<CerebroCortex>) -> anyhow::R
         }
 
         "find_matching_schemas" => {
-            let tags: Vec<String>     = args["tags"].as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                .unwrap_or_default();
-            let concepts: Vec<String> = args["concepts"].as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                .unwrap_or_default();
+            let tags     = coerce_str_list(&args["tags"]);
+            let concepts = coerce_str_list(&args["concepts"]);
             if tags.is_empty() && concepts.is_empty() {
                 return Ok(json!([]));
             }
@@ -1220,11 +1403,35 @@ async fn assemble_bootstrap(
 // Helper: build a VisibilityScope from an agent_id argument
 // ---------------------------------------------------------------------------
 
+/// Coerce an `anyOf:[array,string]` schema field into `Vec<String>` (CB-011).
+///
+/// The inputSchemas advertise these fields as either a JSON array of strings or
+/// a bare string, but the handlers historically read only `.as_array()`, so a
+/// schema-sanctioned `"tags": "urgent"` was silently dropped. This honors both
+/// shapes: a string becomes a single-element vec; an array keeps its string
+/// elements; anything else (null/number/object) yields an empty vec.
+fn coerce_str_list(v: &Value) -> Vec<String> {
+    if let Some(arr) = v.as_array() {
+        arr.iter().filter_map(|e| e.as_str().map(String::from)).collect()
+    } else if let Some(s) = v.as_str() {
+        vec![s.to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
 fn agent_scope(args: &Value) -> VisibilityScope {
     match args["agent_id"].as_str() {
         Some(id) if !id.is_empty() => VisibilityScope::for_agent(AgentId(id.to_string())),
         _ => VisibilityScope::global(),
     }
+}
+
+/// Canonical form for procedure-lookup tag comparison (colony C6): lowercase
+/// with `-`/`_`/space folded to one separator, so "Mesh_Recall" == "mesh-recall"
+/// == "mesh recall". Lookup-side only — stored tags are never rewritten.
+fn norm_tag(t: &str) -> String {
+    t.trim().to_lowercase().replace(['_', ' '], "-")
 }
 
 /// Canonicalize a session priority to uppercase (the schema enum case), so the
@@ -1363,11 +1570,194 @@ mod tests {
         let resp = dispatch_tool(find, Arc::clone(&brain)).await;
         assert!(resp["error"].is_null(), "find should not error: {}", resp["error"]);
         let text  = resp["result"]["content"][0]["text"].as_str().unwrap();
-        let procs: Value = serde_json::from_str(text).unwrap();
-        assert_eq!(procs.as_array().unwrap().len(), 2, "both niche procedures returned");
+        let result: Value = serde_json::from_str(text).unwrap();
+        let procs = result["procedures"].as_array().unwrap();
+        assert_eq!(procs.len(), 2, "both niche procedures returned");
         // The champion floats to the front despite being stored second.
         assert!(procs[0]["tags"].as_array().unwrap().iter().any(|t| t == "skill_champion"),
             "champion must surface first, got: {}", procs[0]);
+        assert_eq!(result["matched"]["exact"].as_u64(), Some(2));
+    }
+
+    // ---- colony C6: the silent-miss fixes ----------------------------------
+
+    #[tokio::test]
+    async fn find_relevant_procedures_matches_normalized_tags() {
+        // apex2's C6: a well-tagged procedure returned [] because the matcher
+        // was exact string equality — "mesh_recall" vs "Mesh-Recall" missed.
+        let (brain, _dir) = make_brain().await;
+        let r = dispatch_tool(json!({
+            "jsonrpc":"2.0","id":0,"method":"tools/call",
+            "params":{"name":"store_procedure","arguments":{
+                "content": "to query the colony: mesh_recall with a short query, group hits per peer",
+                "tags": ["mesh_recall", "Federation"]
+            }}
+        }), Arc::clone(&brain)).await;
+        assert!(r["error"].is_null(), "store should not error: {}", r["error"]);
+
+        for asked in ["Mesh-Recall", "mesh recall", "FEDERATION"] {
+            let resp = dispatch_tool(json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"find_relevant_procedures","arguments":{ "tags":[asked] }}
+            }), Arc::clone(&brain)).await;
+            let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+            let result: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(result["procedures"].as_array().unwrap().len(), 1,
+                "normalized tag '{asked}' must match, got: {result}");
+        }
+    }
+
+    #[tokio::test]
+    async fn find_relevant_procedures_empty_result_is_honest() {
+        // An empty result over a non-empty procedure store must SAY the matcher
+        // may have missed — "no match" and "nothing exists" are different states.
+        let (brain, _dir) = make_brain().await;
+        dispatch_tool(json!({
+            "jsonrpc":"2.0","id":0,"method":"tools/call",
+            "params":{"name":"store_procedure","arguments":{
+                "content": "deploy: stop service, hot-swap binary, start, tail journal",
+                "tags": ["deploy"]
+            }}
+        }), Arc::clone(&brain)).await;
+
+        let resp = dispatch_tool(json!({
+            "jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"find_relevant_procedures","arguments":{ "tags":["zzz-unrelated-topic"] }}
+        }), Arc::clone(&brain)).await;
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let result: Value = serde_json::from_str(text).unwrap();
+        assert!(result["procedures"].as_array().unwrap().is_empty());
+        assert_eq!(result["procedures_in_scope"].as_u64(), Some(1));
+        let note = result["note"].as_str().unwrap_or_default();
+        assert!(note.contains("matcher missed") || note.contains("matcher may"),
+            "empty result must state the matcher may have missed, got: {note}");
+    }
+
+    #[tokio::test]
+    async fn find_relevant_procedures_widens_semantically_via_query() {
+        // No tag overlap at all — the free-text query must still find the
+        // procedure through the recall path (FTS in tests), filtered to
+        // procedural type, and report it as a semantic hit.
+        let (brain, _dir) = make_brain().await;
+        dispatch_tool(json!({
+            "jsonrpc":"2.0","id":0,"method":"tools/call",
+            "params":{"name":"store_procedure","arguments":{
+                "content": "hotfix rollout: push through the mesh relay pipeline node by node",
+                "tags": ["ops"]
+            }}
+        }), Arc::clone(&brain)).await;
+
+        let resp = dispatch_tool(json!({
+            "jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"find_relevant_procedures","arguments":{
+                "query": "mesh relay pipeline"
+            }}
+        }), Arc::clone(&brain)).await;
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let result: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(result["procedures"].as_array().unwrap().len(), 1,
+            "semantic query must reach the procedure, got: {result}");
+        assert_eq!(result["matched"]["semantic"].as_u64(), Some(1));
+        assert_eq!(result["matched"]["exact"].as_u64(), Some(0));
+    }
+
+    // ---- colony C3: the audit log actually gets written now ----------------
+
+    #[tokio::test]
+    async fn mutations_write_the_audit_trail_reads_do_not() {
+        let (brain, _dir) = make_brain().await;
+        let call = |name: &str, args: Value| json!({
+            "jsonrpc":"2.0","id":0,"method":"tools/call",
+            "params":{"name":name,"arguments":args}
+        });
+
+        // Two mutations + one read.
+        let r = dispatch_tool(call("remember", json!({
+            "content": "the mesh relay needs its token refreshed monthly",
+            "agent_id": "APEX"
+        })), Arc::clone(&brain)).await;
+        assert!(r["error"].is_null(), "remember: {}", r["error"]);
+        let r = dispatch_tool(call("store_intention", json!({
+            "content": "refresh the relay token", "agent_id": "APEX"
+        })), Arc::clone(&brain)).await;
+        assert!(r["error"].is_null(), "store_intention: {}", r["error"]);
+        let r = dispatch_tool(call("recall", json!({
+            "query": "relay token", "agent_id": "APEX"
+        })), Arc::clone(&brain)).await;
+        assert!(r["error"].is_null(), "recall: {}", r["error"]);
+
+        // The trail holds exactly the two mutations, newest first, attributed.
+        let resp = dispatch_tool(call("query_audit", json!({})), Arc::clone(&brain)).await;
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let entries: Value = serde_json::from_str(text).unwrap();
+        let entries = entries.as_array().unwrap();
+        assert_eq!(entries.len(), 2, "two mutations, zero reads: {entries:?}");
+        assert_eq!(entries[0]["action"], "store_intention");
+        assert_eq!(entries[1]["action"], "remember");
+        assert_eq!(entries[1]["agent_id"], "APEX");
+        assert!(entries[1]["memory_id"].as_str().is_some_and(|s| !s.is_empty()),
+            "the minted memory id must be recorded: {}", entries[1]);
+        assert!(entries[1]["details"].as_str().unwrap().contains("mesh relay"));
+
+        // Action filter narrows to one verb.
+        let resp = dispatch_tool(call("query_audit", json!({ "action": "remember" })),
+            Arc::clone(&brain)).await;
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let only: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(only.as_array().unwrap().len(), 1);
+        assert_eq!(only[0]["action"], "remember");
+
+        // A future `since` excludes everything; a past one keeps all.
+        let resp = dispatch_tool(call("query_audit", json!({ "since": "2999-01-01T00:00:00Z" })),
+            Arc::clone(&brain)).await;
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let none: Value = serde_json::from_str(text).unwrap();
+        assert!(none.as_array().unwrap().is_empty());
+        let resp = dispatch_tool(call("query_audit", json!({ "since": "2020-01-01T00:00:00Z" })),
+            Arc::clone(&brain)).await;
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let all: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(all.as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn audit_action_gates_mutations_only() {
+        assert_eq!(audit_action("remember", &json!({})), Some("remember"));
+        assert_eq!(audit_action("dream_run", &json!({})), Some("dream_run"));
+        assert_eq!(audit_action("recall", &json!({})), None);
+        assert_eq!(audit_action("query_audit", &json!({})), None);
+        assert_eq!(audit_action("find_relevant_procedures", &json!({})), None);
+        // describe_image mutates only when it remembers.
+        assert_eq!(audit_action("describe_image", &json!({})), None);
+        assert_eq!(audit_action("describe_image", &json!({"remember": true})),
+            Some("describe_image"));
+    }
+
+    #[test]
+    fn audit_memory_id_prefers_args_then_result() {
+        let id = audit_memory_id(&json!({"memory_id": "mem_a"}), &json!({"id": "mem_b"}));
+        assert_eq!(id.as_deref(), Some("mem_a"));
+        let id = audit_memory_id(&json!({}), &json!({"id": "mem_b"}));
+        assert_eq!(id.as_deref(), Some("mem_b"));
+        let id = audit_memory_id(&json!({}), &json!({"episode_id": "ep_1"}));
+        assert_eq!(id.as_deref(), Some("ep_1"));
+        assert_eq!(audit_memory_id(&json!({}), &json!({"status": "ok"})), None);
+    }
+
+    #[test]
+    fn audit_details_previews_and_caps() {
+        let long = "x".repeat(300);
+        let d = audit_details(&json!({"content": long})).unwrap();
+        assert_eq!(d.chars().count(), 121, "120 chars + ellipsis");
+        assert!(d.ends_with('…'));
+        assert!(audit_details(&json!({"limit": 5})).is_none());
+    }
+
+    #[test]
+    fn norm_tag_folds_case_and_separators() {
+        assert_eq!(norm_tag("Mesh_Recall"), norm_tag("mesh-recall"));
+        assert_eq!(norm_tag(" mesh recall "), norm_tag("MESH-RECALL"));
+        assert_ne!(norm_tag("mesh"), norm_tag("mesh-recall"), "no substring over-match");
     }
 
     #[tokio::test]
@@ -1697,6 +2087,141 @@ mod tests {
         assert_eq!(normalize_priority("Medium"), "MEDIUM");
         assert_eq!(normalize_priority("MEDIUM"), "MEDIUM");
         assert_eq!(normalize_priority("high"), "HIGH");
+    }
+
+    // CB-011: anyOf[array,string] coercion — a bare string is a single-element
+    // vec, an array keeps its strings, other shapes are empty.
+    #[test]
+    fn coerce_str_list_accepts_array_and_bare_string() {
+        assert_eq!(coerce_str_list(&json!(["a", "b"])), vec!["a", "b"]);
+        assert_eq!(coerce_str_list(&json!("urgent")), vec!["urgent"]);
+        assert!(coerce_str_list(&Value::Null).is_empty());
+        assert!(coerce_str_list(&json!(42)).is_empty());
+        // mixed array drops non-strings
+        assert_eq!(coerce_str_list(&json!(["a", 1, "b"])), vec!["a", "b"]);
+    }
+
+    // CB-010: parse_error is a well-formed JSON-RPC -32700 with a null id.
+    #[test]
+    fn parse_error_is_jsonrpc_minus_32700_with_null_id() {
+        let e = parse_error();
+        assert_eq!(e["jsonrpc"], "2.0");
+        assert_eq!(e["error"]["code"], -32700);
+        assert!(e["id"].is_null());
+    }
+
+    // CB-011: remember with a bare-string `tags` must actually store the tag,
+    // not silently drop it (the schema advertises anyOf[array,string]).
+    #[tokio::test]
+    async fn dispatch_remember_accepts_bare_string_tag() {
+        let (brain, _dir) = make_brain().await;
+        let msg = json!({
+            "jsonrpc":"2.0","id":20,"method":"tools/call",
+            "params":{"name":"remember","arguments":{
+                "content":"a memory tagged with a single bare-string tag value",
+                "tags":"urgent"
+            }}
+        });
+        let resp = dispatch_tool(msg, brain).await;
+        assert!(resp["error"].is_null(), "unexpected error: {}", resp["error"]);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let node: Value = serde_json::from_str(text).unwrap();
+        let tags = node["tags"].as_array().unwrap();
+        assert!(tags.iter().any(|t| t == "urgent"),
+            "bare-string tag must be stored, got {:?}", tags);
+    }
+
+    // CB-025: store_procedure must persist `derived_from` provenance (mirrors
+    // create_schema), accepting a bare string too (CB-011).
+    #[tokio::test]
+    async fn dispatch_store_procedure_persists_derived_from() {
+        let (brain, _dir) = make_brain().await;
+        let msg = json!({
+            "jsonrpc":"2.0","id":21,"method":"tools/call",
+            "params":{"name":"store_procedure","arguments":{
+                "content":"how to safely hot-swap the cerebro-mcp binary on the Pi",
+                "derived_from":"mem-123"
+            }}
+        });
+        let resp = dispatch_tool(msg, Arc::clone(&brain)).await;
+        assert!(resp["error"].is_null(), "unexpected error: {}", resp["error"]);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let result: Value = serde_json::from_str(text).unwrap();
+        let id = result["id"].as_str().unwrap();
+
+        // Read the stored node back and confirm provenance landed in metadata.
+        let scope = VisibilityScope::global();
+        let node = brain.storage.read().await.sqlite
+            .get_memory(&MemoryId(id.to_string()), &scope).await.unwrap().unwrap();
+        let sources = node.metadata["derived_from"].as_array().unwrap();
+        assert!(sources.iter().any(|s| s == "mem-123"),
+            "derived_from must be persisted, got {:?}", node.metadata);
+    }
+
+    // C1 residue: memory_store is a TRUE alias of remember — its documented
+    // memory_type / tags / salience args must land, not be silently dropped.
+    #[tokio::test]
+    async fn dispatch_memory_store_honors_documented_args() {
+        let (brain, _dir) = make_brain().await;
+        let msg = json!({
+            "jsonrpc":"2.0","id":22,"method":"tools/call",
+            "params":{"name":"memory_store","arguments":{
+                "content":"undo snapshot of the previous soul kernel before rewrite",
+                "memory_type":"episodic",
+                "tags":"undo_snapshot",
+                "salience":0.25
+            }}
+        });
+        let resp = dispatch_tool(msg, brain).await;
+        assert!(resp["error"].is_null(), "unexpected error: {}", resp["error"]);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let node: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(node["memory_type"], "episodic", "memory_type must land");
+        assert!(node["tags"].as_array().unwrap().iter().any(|t| t == "undo_snapshot"),
+            "tags must land, got {:?}", node["tags"]);
+        assert!((node["salience"].as_f64().unwrap() - 0.25).abs() < 1e-6,
+            "salience must land, got {}", node["salience"]);
+    }
+
+    // C1 residue: update_memory's orphan guard — privatizing an owner-less
+    // memory is refused (it would be visible to no one) until set_agent_id
+    // attributes it, after which the same call succeeds.
+    #[tokio::test]
+    async fn update_memory_orphan_guard_refuses_ownerless_privatize() {
+        let (brain, _dir) = make_brain().await;
+        let store = json!({
+            "jsonrpc":"2.0","id":23,"method":"tools/call",
+            "params":{"name":"remember","arguments":{
+                "content":"an owner-less shared memory that someone tries to privatize"
+            }}
+        });
+        let resp = dispatch_tool(store, Arc::clone(&brain)).await;
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let id = serde_json::from_str::<Value>(text).unwrap()["id"].as_str().unwrap().to_string();
+
+        let privatize = json!({
+            "jsonrpc":"2.0","id":24,"method":"tools/call",
+            "params":{"name":"update_memory","arguments":{
+                "memory_id": id, "visibility":"private"
+            }}
+        });
+        let resp = dispatch_tool(privatize, Arc::clone(&brain)).await;
+        assert!(!resp["error"].is_null(),
+            "privatizing an owner-less memory must be refused");
+
+        let heal = json!({
+            "jsonrpc":"2.0","id":25,"method":"tools/call",
+            "params":{"name":"update_memory","arguments":{
+                "memory_id": id, "visibility":"private", "set_agent_id":"FORGE"
+            }}
+        });
+        let resp = dispatch_tool(heal, Arc::clone(&brain)).await;
+        assert!(resp["error"].is_null(),
+            "attributed privatize must succeed: {}", resp["error"]);
+        let node: Value = serde_json::from_str(
+            resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(node["visibility"], "private");
+        assert_eq!(node["agent_id"], "FORGE");
     }
 
     #[tokio::test]

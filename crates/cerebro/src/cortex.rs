@@ -78,7 +78,11 @@ impl CerebroCortex {
         };
         let mut node = self.thalamus
             .evaluate_input(&content, memory_type, tags, salience, scope.agent_id.clone(), visibility)
-            .ok_or_else(|| anyhow::anyhow!("content rejected by thalamus (too short or filtered)"))?;
+            .ok_or_else(|| anyhow::anyhow!(
+                "content rejected by thalamus (under 10 chars, or over the 64 KiB \
+                 single-memory cap — one memory is a note, not a document dump; \
+                 split it or ingest_file it)"
+            ))?;
 
         // Amygdala: emotional classification and salience modulation
         node = self.amygdala.apply_emotion(node);
@@ -249,13 +253,21 @@ impl CerebroCortex {
         // carry the updated access history so the caller sees a consistent view.
         let now = Utc::now();
         for (node, _) in results.iter_mut() {
-            node.record_access(now);
+            node.record_access(now);        // ACT-R: a retrieval IS an access
+            node.record_recall_review(now); // FSRS: successful review (stability/difficulty + last_review)
         }
-        let reinforcements: Vec<(MemoryId, u32, String)> = results.iter()
+        let reinforcements: Vec<(MemoryId, u32, String, f32, f32, Option<String>)> = results.iter()
             .map(|(n, _)| {
                 let times = serde_json::to_string(&n.access_times)
                     .unwrap_or_else(|_| "[]".to_string());
-                (n.id.clone(), n.access_count, times)
+                (
+                    n.id.clone(),
+                    n.access_count,
+                    times,
+                    n.strength.stability,
+                    n.strength.difficulty,
+                    n.strength.last_review.map(|dt| dt.to_rfc3339()),
+                )
             })
             .collect();
         storage.sqlite.record_accesses(&reinforcements).await?;

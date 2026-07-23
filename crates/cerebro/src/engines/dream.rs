@@ -38,6 +38,44 @@ const SKILL_CLUSTER_MIN_SIZE: usize = 2;
 // procedure below the bar.
 const SKILL_MIN_FITNESS: f32 = 0.8;
 const EPISODE_AUTO_CLOSE_HOURS: i64 = 24; // Python config.py EPISODE_AUTO_CLOSE_HOURS
+
+/// Retention caps for the pre-phase sweep (CB-021): the three lifecycle tables
+/// that otherwise grow forever on a never-reset brain. Defaults are generous —
+/// ~10 full-content snapshots per edited memory, ~3 months of nightly dream
+/// reports, and >1 year of self-history at typical mutation rates (the audit
+/// log is the agent's own timeline; bounding it is a window, not an erasure —
+/// and the sweep writes an audit row naming what it pruned). Env knobs
+/// `CEREBRO_RETAIN_VERSIONS` / `_DREAM_REPORTS` / `_AUDIT_ROWS`; 0 = keep
+/// that table forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionCaps {
+    pub versions_per_memory: usize,
+    pub dream_reports:       usize,
+    pub audit_rows:          usize,
+}
+
+impl RetentionCaps {
+    pub const DEFAULT: RetentionCaps = RetentionCaps {
+        versions_per_memory: 10,
+        dream_reports:       90,
+        audit_rows:          20_000,
+    };
+
+    /// Pure parse — unit-tested. Unset/garbage → the default; an explicit
+    /// numeric (including 0 = keep forever) wins.
+    pub fn from_env() -> Self {
+        let knob = |name: &str, default: usize| {
+            std::env::var(name).ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(default)
+        };
+        RetentionCaps {
+            versions_per_memory: knob("CEREBRO_RETAIN_VERSIONS", Self::DEFAULT.versions_per_memory),
+            dream_reports:       knob("CEREBRO_RETAIN_DREAM_REPORTS", Self::DEFAULT.dream_reports),
+            audit_rows:          knob("CEREBRO_RETAIN_AUDIT_ROWS", Self::DEFAULT.audit_rows),
+        }
+    }
+}
 // Exo-evolution E2 (variation): LLM budget for the mutation phase that refines
 // struggling procedures into fresh variants. Shares the overall MAX_LLM_CALLS
 // cap with the other phases (gated on `calls_used`), so on a small brain the
@@ -196,6 +234,19 @@ impl DreamEngine {
             Err(e)         => tracing::warn!("dream pre-phase: close_stale_episodes failed: {e}"),
         }
 
+        // Pre-phase retention (CB-021): bound the three forever-growing tables
+        // (memory_versions / dream_reports / audit_log). Nightly cadence rides
+        // the dream like the episode cleanup; fail-soft — a failed sweep never
+        // blocks consolidation. The sweep audits itself when it prunes.
+        let caps = RetentionCaps::from_env();
+        match cortex.storage.read().await.sqlite
+            .retention_sweep(caps.versions_per_memory, caps.dream_reports, caps.audit_rows).await {
+            Ok((0, 0, 0)) => {}
+            Ok((v, r, a)) => tracing::info!(
+                "dream pre-phase: retention pruned {v} version(s), {r} dream report(s), {a} audit row(s)"),
+            Err(e) => tracing::warn!("dream pre-phase: retention_sweep failed: {e}"),
+        }
+
         let p1 = self.sws_replay(&scope, &cortex).await;
         let p2 = self.pattern_extraction(
             &scope, &cortex, &mut calls_used,
@@ -329,6 +380,68 @@ impl DreamEngine {
         budget:         usize,
         overall_budget: usize,
     ) -> Result<PhaseResult> {
+        /// Cosine-similarity floor above which a dream-extracted candidate counts as a
+        /// RE-DISCOVERY of an existing procedure rather than a novel one. bge-small
+        /// paraphrases of the same lesson land ~0.85–0.95; topically-adjacent-but-
+        /// different procedures land ~0.6–0.8 — 0.86 keeps genuine variants novel.
+        const REDISCOVERY_SIMILARITY: f32 = 0.86;
+
+        /// Recurring evidence is stronger evidence — but boundedly: small bump,
+        /// hard cap below champion territory.
+        fn reinforced_salience(current: f32) -> f32 {
+            (current + 0.05).min(0.95)
+        }
+
+        /// If `content` is a semantic near-duplicate of an existing PROCEDURAL memory,
+        /// reinforce that memory (salience bump + a rediscovery ledger in metadata)
+        /// and return true. Embeddings-only: on FTS5 nodes (no vec0/embedder) this is
+        /// always false and the caller's prefix dedup remains the only gate.
+        async fn reinforce_if_rediscovery(
+            cortex:  &Arc<CerebroCortex>,
+            content: &str,
+            scope:   &VisibilityScope,
+        ) -> bool {
+            let storage = cortex.storage.read().await;
+            if !storage.vector.is_vec_available() || !storage.vector.is_embedder_loaded() {
+                return false;
+            }
+            let (scope_sql, scope_params) = scope.sql_filter();
+            let Ok(hits) = storage.vector.search(content, 3, scope_sql, &scope_params).await else {
+                return false;
+            };
+            let near_ids: Vec<crate::types::MemoryId> = hits
+                .into_iter()
+                .filter(|(_, score)| *score >= REDISCOVERY_SIMILARITY)
+                .map(|(id, _)| id)
+                .collect();
+            if near_ids.is_empty() {
+                return false;
+            }
+            let Ok(nodes) = storage.sqlite.get_memories_by_ids(&near_ids, scope).await else {
+                return false;
+            };
+            let Some(mut existing) = nodes
+                .into_iter()
+                .find(|n| n.memory_type == MemoryType::Procedural)
+            else {
+                return false;
+            };
+            existing.salience = reinforced_salience(existing.salience);
+            if let serde_json::Value::Object(ref mut map) = existing.metadata {
+                let n = map.get("rediscovered_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                map.insert("rediscovered_count".to_string(), json!(n + 1));
+                map.insert("last_rediscovered".to_string(), json!(Utc::now().to_rfc3339()));
+            }
+            if storage.sqlite.update_memory(&existing).await.is_err() {
+                return false; // couldn't reinforce — let the candidate store normally
+            }
+            tracing::info!(
+                id = %existing.id.0,
+                salience = existing.salience,
+                "dream re-discovery reinforced existing procedure"
+            );
+            true
+        }
         let start = std::time::Instant::now();
         let mut result = PhaseResult::new("pattern_extraction");
 
@@ -356,6 +469,7 @@ impl DreamEngine {
         let clusters_total = tag_map.values().filter(|v| v.len() >= CLUSTER_MIN_SIZE).count();
         let mut budget_remaining = budget;
         let mut total_procedures = 0usize;
+        let mut total_rediscovered = 0usize;
 
         for (tag, indices) in &tag_map {
             if indices.len() < CLUSTER_MIN_SIZE { continue; }
@@ -387,7 +501,26 @@ impl DreamEngine {
                                 .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
                                 .unwrap_or_else(|| vec![tag.clone()]);
 
-                            // Basic dedup: skip if first 40 chars match any existing memory
+                            // Semantic re-discovery gate (colony C2): the old 40-char
+                            // prefix check let the LLM re-mint the same lesson nightly
+                            // in different words — apex2 found five near-identical
+                            // procedures across five nights, never merged, each too
+                            // weak to trust. With embeddings available, check the
+                            // candidate against the WHOLE store: a procedural hit at
+                            // ≥ REDISCOVERY_SIMILARITY means the dream re-discovered
+                            // something known → REINFORCE the existing memory (small
+                            // capped salience bump — recurring evidence IS stronger
+                            // evidence — plus a rediscovery ledger in metadata)
+                            // instead of storing a fragment, counted honestly in the
+                            // report so the journal can say novel vs re-discovered.
+                            if reinforce_if_rediscovery(cortex, content, scope).await {
+                                total_rediscovered += 1;
+                                continue;
+                            }
+
+                            // Prefix dedup kept as the FTS5-only (Nano) fallback —
+                            // BM25 scores aren't a similarity, so no threshold works
+                            // there — and as a cheap first line everywhere.
                             let prefix = truncate_chars(content, 40);
                             if memories.iter().any(|n| n.content.starts_with(prefix)) {
                                 continue;
@@ -414,10 +547,11 @@ impl DreamEngine {
             }
         }
 
-        result.procedures_extracted = total_procedures;
+        result.procedures_extracted    = total_procedures;
+        result.procedures_rediscovered = total_rediscovered;
         result.notes = format!(
-            "Extracted {} procedures from {} clusters (budget used: {}/{})",
-            total_procedures, clusters_total, result.llm_calls, budget,
+            "Extracted {} novel procedures from {} clusters, reinforced {} re-discoveries (budget used: {}/{})",
+            total_procedures, clusters_total, total_rediscovered, result.llm_calls, budget,
         );
         result.duration_secs = start.elapsed().as_secs_f64();
         Ok(result)
@@ -1663,6 +1797,12 @@ pub struct PhaseResult {
     #[serde(default)]
     pub procedures_merged:    usize,
     pub procedures_extracted: usize,
+    /// Colony C2: extraction candidates that semantically matched an EXISTING
+    /// procedure (≥ the rediscovery similarity floor) and reinforced it instead of
+    /// storing a fragment. novel-vs-treading-water, visible in the dream journal.
+    /// `#[serde(default)]` keeps older persisted reports deserialisable.
+    #[serde(default)]
+    pub procedures_rediscovered: usize,
     pub episodes_consolidated: usize,
     pub llm_calls:            usize,
     pub duration_secs:        f64,
@@ -1686,6 +1826,7 @@ impl PhaseResult {
             procedures_mutated:   0,
             procedures_merged:    0,
             procedures_extracted: 0,
+            procedures_rediscovered: 0,
             episodes_consolidated: 0,
             llm_calls:            0,
             duration_secs:        0.0,
@@ -1710,10 +1851,32 @@ mod tests {
         refine_candidates, retrieval_rank, truncate_chars, wilson_lower_bound, CompetitionAction,
         SKILL_MIN_FITNESS,
     };
+    use super::RetentionCaps;
     use crate::config::FSRS_INITIAL_DIFFICULTY;
     use crate::models::MemoryNode;
     use crate::types::MemoryType;
     use serde_json::json;
+
+    #[test]
+    fn retention_caps_env_parse() {
+        // Unset → defaults.
+        for v in ["CEREBRO_RETAIN_VERSIONS", "CEREBRO_RETAIN_DREAM_REPORTS", "CEREBRO_RETAIN_AUDIT_ROWS"] {
+            std::env::remove_var(v);
+        }
+        assert_eq!(RetentionCaps::from_env(), RetentionCaps::DEFAULT);
+
+        // Explicit values win — including 0 (keep forever).
+        std::env::set_var("CEREBRO_RETAIN_VERSIONS", "3");
+        std::env::set_var("CEREBRO_RETAIN_DREAM_REPORTS", "0");
+        std::env::set_var("CEREBRO_RETAIN_AUDIT_ROWS", "junk"); // garbage → default
+        let caps = RetentionCaps::from_env();
+        assert_eq!(caps.versions_per_memory, 3);
+        assert_eq!(caps.dream_reports, 0);
+        assert_eq!(caps.audit_rows, RetentionCaps::DEFAULT.audit_rows);
+        for v in ["CEREBRO_RETAIN_VERSIONS", "CEREBRO_RETAIN_DREAM_REPORTS", "CEREBRO_RETAIN_AUDIT_ROWS"] {
+            std::env::remove_var(v);
+        }
+    }
 
     fn proc(salience: f32, difficulty: f32) -> MemoryNode {
         let mut n = MemoryNode::new("how I did X", MemoryType::Procedural);
@@ -2094,5 +2257,23 @@ mod tests {
         assert!(!has_pending_merge(&[merged_node("deploy", true)], "deploy"));
         // an ungraded hybrid in a DIFFERENT niche does not block "deploy"
         assert!(!has_pending_merge(&[merged_node("other", false)], "deploy"));
+    }
+}
+
+#[cfg(test)]
+mod report_compat_tests {
+    use super::PhaseResult;
+
+    #[test]
+    fn phase_result_deserializes_without_rediscovered_field() {
+        // Older persisted DreamReports predate the C2 novel/rediscovery split —
+        // the serde(default) must keep them loadable (dream_status reads them back).
+        let old = r#"{"phase":"pattern_extraction","episodes_consolidated":0,
+            "memories_processed":10,"links_created":0,"links_strengthened":0,
+            "memories_pruned":0,"schemas_extracted":0,"procedures_extracted":3,
+            "llm_calls":2,"duration_secs":1.0,"notes":"","success":true}"#;
+        let r: PhaseResult = serde_json::from_str(old).unwrap();
+        assert_eq!(r.procedures_rediscovered, 0);
+        assert_eq!(r.procedures_extracted, 3);
     }
 }

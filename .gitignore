@@ -5,3 +5,4 @@
 *.db-wal
 Cargo.lock
 .claude/scheduled_tasks.lock
+.fastembed_cache/
