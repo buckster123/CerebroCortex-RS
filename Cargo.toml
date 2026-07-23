@@ -35,6 +35,8 @@ petgraph    = "0.6"
 fastembed   = "4"
 # Image payloads (describe_image / search_vision)
 base64      = "0.22"
+# PDF text extraction (ingest_file)
+lopdf       = "0.44"
 # HTTP client (Anthropic API, dream engine LLM calls)
 reqwest     = { version = "0.12", features = ["json"] }
 # Web framework (cerebro-api)
