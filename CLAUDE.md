@@ -110,6 +110,9 @@ agentd never knows. Same 63 tools. Same MCP contract.
 | `ANTHROPIC_API_KEY` | — | Required for dream engine LLM phases |
 | `SQLITE_VEC_PATH` | system default | Path to `sqlite-vec` `.so` (TBD on Pi — `apt-cache show sqlite-vec`) |
 | `RUST_LOG` | `info` | tracing filter — logs go to stderr, stdout is MCP JSON-RPC |
+| `CEREBRO_VISION_BACKEND` | `auto` | describe_image VLM: `auto`\|`ollama`\|`anthropic`\|`off` (+ `_URL`/`_MODEL` for Ollama) |
+| `CEREBRO_VISION_EMBED` | follows embed model | CLIP visual recall on/off (`search_vision`) |
+| `CEREBRO_RETAIN_VERSIONS` / `_DREAM_REPORTS` / `_AUDIT_ROWS` | 10/90/20000 | retention caps, dream pre-phase sweep; 0 = keep forever |
 
 ---
 
@@ -125,7 +128,7 @@ agentd never knows. Same 63 tools. Same MCP contract.
 | 6 | `engines/` (thalamus→neocortex) | All 8 deterministic engines pass | ✓ 34 engine unit tests pass |
 | 7 | `cortex.rs` | `remember()` + `recall()` end-to-end | ✓ 6 cortex pipeline tests pass |
 | 8 | `cerebro-mcp/` (core tools) | MCP handshake + remember/recall vs agentd | ✓ 8 dispatch tests pass |
-| 9 | Remaining 61 MCP tools | Full tool surface | ✓ 62/66 wired |
+| 9 | Remaining 61 MCP tools | Full tool surface | ✓ 66/67 wired (only `ingest_file` stubbed) |
 | 10 | `engines/dream.rs` | All phases, live LLM calls | ✓ 8 phases (6 base + exo-evolution `variation`/`skill_competition`) + dream_run/dream_status wired |
 | 11 | `cerebro-cli/` + `cerebro-api/` | CLI and REST parity | ✓ |
 | 12 | DB compatibility | Rust reads a Python-generated `cerebro.db` | ✓ |
@@ -155,6 +158,8 @@ Then as needed:
 This feeds the knowledge graph. Dream cycles (`dream_run`) then consolidate across sessions — extracting schemas, strengthening links, surfacing connections. The graph compounds over time; consistent use is the only requirement.
 
 ---
+
+**Backport waves 3+4 done (2026-07-23)** — all 45 post-fork ApexOS-RS cerebro commits now reconciled (see BACKPORT-FROM-APEXOS.md; waves 1–4 = PRs #4/#5/#6/#7). Wave 3 (PR #6): per-frame JSON-RPC parse isolation + 32 MiB frame cap, 64 KiB thalamus gate, bare-string arg coercion, memory_store true alias, update_memory visibility/set_agent_id, embed-model fallback, FSRS recall reinforcement (activation_at_risk live), undo_snapshot exclusion, find_relevant_procedures widening + honest empty result, audit-log write path + retention sweep, dream semantic-rediscovery reinforcement, cerebro-api CB-006/012/023/026. Wave 4 (PR #7): describe_image (tiered Ollama→Anthropic VLM, `cerebro::vision`) + search_vision (CLIP ClipVitB32, `vision_embeddings` table, caption/FTS fallback) — tool surface now 67 (66 wired + ingest_file stub); VisibilityScope::shared_only federation scope (recall `visibility:"shared"`, closes the CB-008 deferred clause); find_by_tags exact-tag AND lookup; dream-report span fix; Python orphan-table reap. 226 tests green, clippy-clean.
 
 **Exo-evolution frontier done (2026-06-18)** — mirrored from ApexOS-RS `cerebro/crates/` (PRs #109/#111/#112/#113). The single-node Darwinian skill loop is now complete here too: **E1** niche competition + fitness ledger (`record_procedure_outcome` writes `metadata.outcomes:{successes,failures}`; new algorithmic `skill_competition` dream phase ranks same-topical-tag procedures by Wilson lower-bound, tags the fittest `skill_champion`, decays dominated rivals toward the 0.25 prune floor — novelty-exempt below 2 graded uses); **E2/E2b** the LLM `variation` dream phase (refine underperformers → `dream_mutated`; merge two strong distinct same-niche procedures → `dream_merged`, both inheriting niche tags + `derived_from`, starting un-graded); **champion-aware retrieval** (`find_relevant_procedures`/`cognitive_bootstrap` prefer the crowned procedure via shared `retrieval_rank`). `PRUNE_CANDIDATE_SALIENCE` moved to `config` (shared by dispatch + dream). Dream cycle is now 8 phases. `is_structural_tag` covers the new role markers. 168 tests green, clippy-clean (C-RS-013). See `docs/evolutionary-layer.md` in ApexOS-RS for the design charter.
 **Step 12 done (2026-06-10)** — Auto-migration from Python `cerebro.db` in `SqliteStore::open()`. Detects Python schema (`memory_nodes` table present), runs a single-transaction migration: `memory_nodes→memories`, `associative_links→links`, renames+recreates `agents`/`episodes`/`episode_steps`/`audit_log` with Rust column names. Access timestamps converted from Unix floats to RFC3339 via `strftime`. Idempotent (schema_version=100 marks completion). 2 new migration tests; 42 cerebro + 8 mcp = 50 total tests green.
@@ -204,7 +209,10 @@ This feeds the knowledge graph. Dream cycles (`dream_run`) then consolidate acro
 - `fastembed` model cache location on Pi — confirm on first deploy
 - Python ↔ Rust DB schema compat — verify same column names/types (step 12)
 - CCBS (Cognitive Bootstrap modules) — defer until core is solid
-- Vision extras (image, PDF, CLIP) — Phase 3 roadmap
+- Vision PDF ingestion (`ingest_file`) — the one remaining Tier-7 stub. Image captioning
+  (`describe_image`, tiered Ollama→Anthropic via `CEREBRO_VISION_BACKEND/_URL/_MODEL`) and
+  CLIP visual recall (`search_vision`, gate `CEREBRO_VISION_EMBED`) shipped in the wave-4
+  backport (PR #7)
 - Dream-cycle **resume** (skip completed phases) — needs a persisted per-cycle phase table + a `cycle_id` on the `dream_run` tool (audit C-RS-004; pre-phase cleanup + `episodes_consolidated` already shipped)
 - MCP `resources`/`prompts` surfaces (3 prompts) — port only if an ApexOS consumer needs them; capabilities are advertised honestly so nothing is broken (audit C-RS-011)
 - Recall wire-shape parity vs agentd — verify during the ApexOS-RS integration pass (audit C-RS-014)

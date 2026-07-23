@@ -1,9 +1,8 @@
 use serde_json::{json, Value};
 
-/// Tool schema registry — 63 tools mirroring the Python MCP server.
+/// Tool schema registry — the advertised tool set (count asserted by the
+/// `tools.len()` test in dispatch.rs so this header can't silently go stale).
 /// Descriptions are verbatim from the Python mcp_server.py (agent-facing strings).
-/// Step 8: remember, recall, associate, get_memory have full schemas.
-/// Step 9: remaining tools will be filled in.
 pub fn all_tool_schemas() -> Vec<Value> {
     TOOL_NAMES.iter().map(|&name| tool_schema(name)).collect()
 }
@@ -46,7 +45,8 @@ fn tool_schema(name: &str) -> Value {
                 "properties": {
                     "query":    { "type": "string", "description": "Search query text" },
                     "top_k":   { "type": "integer", "description": "Max results to return (default: 10)" },
-                    "agent_id": { "type": "string", "description": "Filter to this agent's memories" }
+                    "agent_id": { "type": "string", "description": "Filter to this agent's memories" },
+                    "visibility": { "type": "string", "enum": ["shared"], "description": "Restrict to shared-visibility memories ONLY (the federation scope; narrower than any agent scope)" }
                 },
                 "required": ["query"]
             }
@@ -420,6 +420,20 @@ fn tool_schema(name: &str) -> Value {
                     "agent_id": { "type": "string" }
                 },
                 "required": []
+            }
+        }),
+
+        "find_by_tags" => json!({
+            "name": "find_by_tags",
+            "description": "Find memories carrying EVERY given tag (exact match, AND). Precise where recall is fuzzy — use it for provenance queries (e.g. tags [\"from:apex1\"] lists everything a peer sent; add \"origin:<id>\" to find one specific federated import).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tags":     { "anyOf": [{"type":"array","items":{"type":"string"}},{"type":"string"}], "description": "Tag(s) that must ALL be present" },
+                    "limit":    { "type": "integer", "description": "Max results (default: 20)" },
+                    "agent_id": { "type": "string" }
+                },
+                "required": ["tags"]
             }
         }),
 
@@ -871,9 +885,45 @@ fn tool_schema(name: &str) -> Value {
             }
         }),
 
-        // Deferred Tier-7 tools (ingest_file, describe_image, search_vision).
-        // Advertised for surface parity with Python, but calling them returns an
-        // honest "not implemented" error (see dispatch, C-RS-007).
+        "describe_image" => json!({
+            "name": "describe_image",
+            "description": "Caption an image with a vision model and (optionally) store the caption as a memory — closing the vision→memory loop. Backend is tiered: a local/LAN Ollama VLM, falling back to an external API. Pass a workspace `path` OR inline `b64` (+ `media_type`).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path":        { "type": "string", "description": "Path to an image file" },
+                    "b64":         { "type": "string", "description": "Base64-encoded image data (alternative to path; for images not on disk)" },
+                    "media_type":  { "type": "string", "description": "MIME type for b64 input (image/png|jpeg|gif|webp); sniffed from the data when omitted" },
+                    "prompt":      { "type": "string", "description": "What to focus on; defaults to a general detailed caption for search" },
+                    "remember":    { "type": "boolean", "description": "If true, store the caption as a memory (tagged `vision`) and return its memory_id. Default false" },
+                    "memory_type": { "type": "string", "description": "Memory type when remember=true (episodic|semantic|…); default episodic" },
+                    "tags":        { "type": "array", "items": { "type": "string" }, "description": "Extra tags for the stored memory (when remember=true)" },
+                    "agent_id":    { "type": "string", "description": "Scope the stored memory to this agent" }
+                },
+                "required": []
+            }
+        }),
+
+        "search_vision" => json!({
+            "name": "search_vision",
+            "description": "Visually recall stored images — the read half of the vision loop (describe_image with remember:true is the write half). Rank your remembered images by a `query` (a text description; CLIP text→image) OR by an example image (`path`/`b64`; image→image similarity). Returns the matching caption memories with the source image_path (when available) so you can re-view them. On a node with image embeddings disabled (Nano tier) it falls back to keyword/semantic recall over the captions.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query":      { "type": "string", "description": "Text describing what to find (e.g. 'a red bicycle by a door')" },
+                    "path":       { "type": "string", "description": "Instead of text: a workspace image path to find visually-similar images" },
+                    "b64":        { "type": "string", "description": "Instead of text: an inline base64 image to match against" },
+                    "media_type": { "type": "string", "description": "Media type hint for `b64` (e.g. image/jpeg)" },
+                    "k":          { "type": "integer", "description": "Max results (default 5, max 50)" },
+                    "agent_id":   { "type": "string", "description": "Scope the search to this agent's memories" }
+                },
+                "required": []
+            }
+        }),
+
+        // Deferred Tier-7 tools (ingest_file). Advertised for surface parity with
+        // Python, but calling them returns an honest "not implemented" error (see
+        // dispatch, C-RS-007).
         _ => json!({
             "name": name,
             "description": format!("(not yet implemented) {name}"),
@@ -926,6 +976,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "audit_summary",
     "query_audit",
     "list_tags",
+    "find_by_tags",
     "delete_tag",
     "rename_tag",
     "merge_tags",

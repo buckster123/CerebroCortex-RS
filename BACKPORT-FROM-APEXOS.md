@@ -10,7 +10,10 @@
 > Difficulty: clean = near-cherry-pick · adapt = re-work against this tree · entangled = needs listed deps.
 >
 > **Status: Wave 1 shipped (PR #4) · Wave 2 shipped (PR #5) — including `bc226ee` (graph
-> prune on delete, folded into the CB-018 port as a hard prerequisite). Waves 3–4 open.**
+> prune on delete, folded into the CB-018 port as a hard prerequisite). Wave 3 shipped
+> (PR #6) · Wave 4 shipped (PR #7) — including the CB-008 `shared_only` clause deferred
+> from Wave 2, closed by the `4b08312` port. ALL WAVES COMPLETE; run the post-backport
+> check below before the next Pi deploy.**
 
 ## Wave 1 — data integrity & panic fixes (do these before pointing -RS at a real DB)
 

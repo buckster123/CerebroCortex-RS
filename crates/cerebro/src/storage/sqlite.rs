@@ -240,6 +240,23 @@ fn migrate_from_python(conn: &mut Connection) -> Result<()> {
             |r| r.get::<_, i64>(0),
         ).unwrap_or(0) > 0;
         if done {
+            // One-time reap of the migration's leftovers: the Python originals
+            // (memory_nodes/associative_links) and the _py_* renames are kept
+            // as a fallback through the migration boot itself; once a migrated
+            // DB is back in service they're dead weight. Dropping memory_nodes
+            // also makes every future open skip this probe (has_py = false).
+            if let Err(e) = conn.execute_batch(
+                "DROP TABLE IF EXISTS memory_nodes;
+                 DROP TABLE IF EXISTS associative_links;
+                 DROP TABLE IF EXISTS _py_agents;
+                 DROP TABLE IF EXISTS _py_episodes;
+                 DROP TABLE IF EXISTS _py_episode_steps;
+                 DROP TABLE IF EXISTS _py_audit_log;",
+            ) {
+                tracing::warn!("orphan Python-table reap failed (non-fatal): {e}");
+            } else {
+                tracing::info!("reaped Python-migration orphan tables (memory_nodes, associative_links, _py_*)");
+            }
             return Ok(());
         }
     }
@@ -651,6 +668,52 @@ impl SqliteStore {
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(dyn_params.as_slice(), row_to_raw)?;
 
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?.into_memory_node()?);
+        }
+        Ok(results)
+    }
+
+    /// Exact-tag lookup: memories carrying **every** tag in `tags` (AND), scoped,
+    /// newest first. Matches the exact quoted string inside the stored tags-JSON
+    /// (`%"<tag>"%`, LIKE-escaped) — precise where FTS/vector recall is fuzzy.
+    /// The provenance query: `["from:apex1", "origin:mem_x"]` finds a prior
+    /// federated import; `["from:apex1"]` lists everything a peer ever sent.
+    pub async fn find_by_tags(
+        &self,
+        scope: &VisibilityScope,
+        tags: &[String],
+        limit: usize,
+    ) -> Result<Vec<MemoryNode>> {
+        if tags.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().await;
+        let (scope_sql, scope_params) = scope.sql_filter();
+
+        let tag_clause = "AND tags LIKE ? ESCAPE '\\' ".repeat(tags.len());
+        let sql = format!(
+            "SELECT {SELECT_COLS} FROM memories \
+             WHERE {scope_sql} AND deleted_at IS NULL {tag_clause} \
+             ORDER BY created_at DESC LIMIT ?"
+        );
+        // The exact tag string, quoted as it appears inside the JSON array, with
+        // LIKE metacharacters escaped so a tag can't wildcard the match.
+        let patterns: Vec<String> = tags.iter()
+            .map(|t| {
+                let escaped = t.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+                format!("%\"{escaped}\"%")
+            })
+            .collect();
+        let limit_val = limit as i64;
+        let mut dyn_params: Vec<&dyn rusqlite::ToSql> = Vec::new();
+        for s in &scope_params { dyn_params.push(s); }
+        for p in &patterns { dyn_params.push(p); }
+        dyn_params.push(&limit_val);
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(dyn_params.as_slice(), row_to_raw)?;
         let mut results = Vec::new();
         for row in rows {
             results.push(row?.into_memory_node()?);
@@ -1877,7 +1940,14 @@ impl SqliteStore {
         agent_id: Option<&str>,
         report:   &crate::engines::dream::DreamReport,
     ) -> Result<()> {
-        let now = chrono::Utc::now().to_rfc3339();
+        // save happens at the END of the cycle, so now == ended_at; reconstruct
+        // started_at from the measured duration (was binding both to ?3 == now, so
+        // ended_at always equalled started_at and the span was unrecoverable).
+        let ended = chrono::Utc::now();
+        let started = ended
+            - chrono::Duration::milliseconds((report.total_duration_secs * 1000.0) as i64);
+        let started_at = started.to_rfc3339();
+        let ended_at   = ended.to_rfc3339();
         let phases_json = serde_json::to_string(&report.phases)?;
         let metadata_json = serde_json::to_string(&serde_json::json!({
             "total_llm_calls":     report.total_llm_calls,
@@ -1888,8 +1958,8 @@ impl SqliteStore {
         conn.execute(
             "INSERT OR REPLACE INTO dream_reports \
              (id, agent_id, started_at, ended_at, phases, metadata) \
-             VALUES (?1, ?2, ?3, ?3, ?4, ?5)",
-            params![id, agent_id, now, phases_json, metadata_json],
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, agent_id, started_at, ended_at, phases_json, metadata_json],
         )?;
         Ok(())
     }
@@ -2045,6 +2115,19 @@ CREATE TABLE IF NOT EXISTS memory_versions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_versions_memory ON memory_versions(memory_id);
+
+-- CLIP image embeddings for visual recall (search_vision). 512-dim f32 LE blob,
+-- keyed by the caption memory it indexes; image_path lets a hit return the source
+-- image for re-viewing. Brute-force cosine in Rust (image counts are modest), so
+-- no vec0 virtual table — a plain row store. Scope is enforced via the memories
+-- join at search time, not denormalized here.
+CREATE TABLE IF NOT EXISTS vision_embeddings (
+    memory_id   TEXT PRIMARY KEY,
+    embedding   BLOB NOT NULL,
+    image_path  TEXT,
+    created_at  TEXT NOT NULL,
+    FOREIGN KEY (memory_id) REFERENCES memories(id)
+);
 
 -- FTS5 virtual table for keyword search (FTS5 fallback when vector search unavailable)
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(

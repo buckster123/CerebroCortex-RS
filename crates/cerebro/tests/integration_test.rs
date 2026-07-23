@@ -34,6 +34,21 @@ mod types_roundtrip {
     }
 
     #[test]
+    fn visibility_scope_shared_only_is_the_narrowest() {
+        let fed = VisibilityScope::shared_only();
+        let (sql, params) = fed.sql_filter();
+        assert_eq!(sql, "visibility='shared'");
+        assert!(params.is_empty());
+        let owner = AgentId("APEX".into());
+        assert!(fed.can_access(Visibility::Shared, None));
+        assert!(!fed.can_access(Visibility::Private, Some(&owner)), "private never matches");
+        assert!(!fed.can_access(Visibility::Thread, None), "thread never matches");
+        // Sanity: global stays the unrestricted admin view, agent scope unchanged.
+        assert_eq!(VisibilityScope::global().sql_filter().0, "1=1");
+        assert!(VisibilityScope::for_agent(owner.clone()).can_access(Visibility::Private, Some(&owner)));
+    }
+
+    #[test]
     fn link_type_all_variants_with_weights() {
         let cases = [
             (LinkType::Causal,      0.9),
@@ -1189,7 +1204,7 @@ mod cortex_pipeline {
         config::Config,
         cortex::CerebroCortex,
         models::AssociativeLink,
-        types::{AgentId, LinkType, VisibilityScope},
+        types::{AgentId, LinkType, Visibility, VisibilityScope},
     };
     use tempfile::TempDir;
 
@@ -1351,6 +1366,35 @@ mod cortex_pipeline {
         ).await.unwrap();
         assert!(!cortex.storage.read().await.graph_is_stale().await.unwrap(),
             "an own-connection commit must not read as foreign");
+    }
+
+    #[tokio::test]
+    async fn shared_only_scope_hides_private_memories() {
+        // The federation scope (colony-federation Slice 2): a mesh peer's query
+        // must see ONLY visibility=shared — private never crosses the wire.
+        let (cortex, _dir) = make_cortex().await;
+        let apex = AgentId("APEX".into());
+        // Agent-scoped remember → Private; global remember → Shared.
+        cortex.remember(
+            "sqlite calibration detail this node keeps to itself".to_string(),
+            None, None, None, VisibilityScope::for_agent(apex.clone()),
+        ).await.unwrap();
+        let published = cortex.remember(
+            "sqlite calibration wisdom published for the colony".to_string(),
+            None, None, None, VisibilityScope::global(),
+        ).await.unwrap();
+
+        // The owning agent sees both…
+        let own = cortex.recall("sqlite calibration", 5, VisibilityScope::for_agent(apex))
+            .await.unwrap();
+        assert_eq!(own.len(), 2, "owner scope sees shared + own private");
+
+        // …the federation scope sees only the published one.
+        let fed = cortex.recall("sqlite calibration", 5, VisibilityScope::shared_only())
+            .await.unwrap();
+        assert_eq!(fed.len(), 1, "shared_only hides private");
+        assert_eq!(fed[0].0.id, published.id);
+        assert_eq!(fed[0].0.visibility, Visibility::Shared);
     }
 
     #[tokio::test]
@@ -1717,5 +1761,66 @@ mod db_compat {
         assert_eq!(mem2.memory_type, cerebro::types::MemoryType::Episodic);
         assert_eq!(mem2.layer,       cerebro::types::MemoryLayer::LongTerm);
         assert_eq!(mem2.visibility,  cerebro::types::Visibility::Private);
+    }
+}
+
+// =============================================================================
+// find_by_tags — exact-tag provenance lookup (colony-federation Slice 4)
+// =============================================================================
+
+#[cfg(test)]
+mod find_by_tags {
+    use cerebro::{
+        config::Config,
+        cortex::CerebroCortex,
+        types::VisibilityScope,
+    };
+    use tempfile::TempDir;
+
+    async fn make_cortex() -> (CerebroCortex, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let config = Config {
+            db_path:       dir.path().join("test.db"),
+            anthropic_key: None,
+            embed_model:   "".into(),
+        };
+        let cortex = CerebroCortex::new(config).await.unwrap();
+        (cortex, dir)
+    }
+
+    #[tokio::test]
+    async fn finds_by_exact_tags_and_requires_all() {
+        let (cortex, _dir) = make_cortex().await;
+        let imported = cortex.remember(
+            "a federated calibration memory from a peer node",
+            None, Some(vec!["colony".into(), "from:apex1".into(), "origin:mem_x".into()]),
+            None, VisibilityScope::global(),
+        ).await.unwrap();
+        cortex.remember(
+            "another memory from the same peer, different origin",
+            None, Some(vec!["colony".into(), "from:apex1".into(), "origin:mem_y".into()]),
+            None, VisibilityScope::global(),
+        ).await.unwrap();
+
+        let storage = cortex.storage.read().await;
+        // Both provenance tags → exactly the one import.
+        let hits = storage.sqlite.find_by_tags(
+            &VisibilityScope::global(),
+            &["from:apex1".into(), "origin:mem_x".into()], 10,
+        ).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, imported.id);
+        // Per-peer sweep: one tag → both.
+        let hits = storage.sqlite.find_by_tags(
+            &VisibilityScope::global(), &["from:apex1".into()], 10,
+        ).await.unwrap();
+        assert_eq!(hits.len(), 2);
+        // A tag that exists nowhere → empty; exactness: substring must NOT match.
+        assert!(storage.sqlite.find_by_tags(
+            &VisibilityScope::global(), &["from:apex".into()], 10,
+        ).await.unwrap().is_empty(), "exact tag match, not substring");
+        assert!(storage.sqlite.find_by_tags(
+            &VisibilityScope::global(), &[], 10,
+        ).await.unwrap().is_empty(), "empty tags → empty, no full scan");
     }
 }
