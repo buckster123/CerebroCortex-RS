@@ -128,7 +128,7 @@ agentd never knows. Same 63 tools. Same MCP contract.
 | 6 | `engines/` (thalamus→neocortex) | All 8 deterministic engines pass | ✓ 34 engine unit tests pass |
 | 7 | `cortex.rs` | `remember()` + `recall()` end-to-end | ✓ 6 cortex pipeline tests pass |
 | 8 | `cerebro-mcp/` (core tools) | MCP handshake + remember/recall vs agentd | ✓ 8 dispatch tests pass |
-| 9 | Remaining 61 MCP tools | Full tool surface | ✓ 66/67 wired (only `ingest_file` stubbed) |
+| 9 | Remaining 61 MCP tools | Full tool surface | ✓ 67/67 wired — no stubs left |
 | 10 | `engines/dream.rs` | All phases, live LLM calls | ✓ 8 phases (6 base + exo-evolution `variation`/`skill_competition`) + dream_run/dream_status wired |
 | 11 | `cerebro-cli/` + `cerebro-api/` | CLI and REST parity | ✓ |
 | 12 | DB compatibility | Rust reads a Python-generated `cerebro.db` | ✓ |
@@ -158,6 +158,8 @@ Then as needed:
 This feeds the knowledge graph. Dream cycles (`dream_run`) then consolidate across sessions — extracting schemas, strengthening links, surfacing connections. The graph compounds over time; consistent use is the only requirement.
 
 ---
+
+**ingest_file done (2026-07-23)** — the last Tier-7 stub is real: new `cerebro::ingest` module (Rust port of Python's `cerebro.ingestion` adapter pipeline, folded into one file). Extension-routed: text/code + HTML → paragraph/sentence chunks (≤500 words, ≥10 chars); Markdown → `##` sections with slug tags + simple frontmatter (type/tags); JSON → string-or-record lists (per-record type/tags/salience honored); CSV → row-per-memory or schema summary past 200 rows; PDF → `lopdf` text extraction (pure Rust, honest error on image-only scans); images → tiered VLM caption + CLIP index (upgrades Python's Ollama-or-filename fallback). Everything tagged `source:<filename>` for find_by_tags provenance/cleanup. `session_id` deliberately NOT advertised (no episode plumbing in Rust remember — no accept-and-ignore). Tool surface: 67/67 wired. First greenfield feature to flow upstream to ApexOS-RS instead of from it.
 
 **Backport waves 3+4 done (2026-07-23)** — all 45 post-fork ApexOS-RS cerebro commits now reconciled (see BACKPORT-FROM-APEXOS.md; waves 1–4 = PRs #4/#5/#6/#7). Wave 3 (PR #6): per-frame JSON-RPC parse isolation + 32 MiB frame cap, 64 KiB thalamus gate, bare-string arg coercion, memory_store true alias, update_memory visibility/set_agent_id, embed-model fallback, FSRS recall reinforcement (activation_at_risk live), undo_snapshot exclusion, find_relevant_procedures widening + honest empty result, audit-log write path + retention sweep, dream semantic-rediscovery reinforcement, cerebro-api CB-006/012/023/026. Wave 4 (PR #7): describe_image (tiered Ollama→Anthropic VLM, `cerebro::vision`) + search_vision (CLIP ClipVitB32, `vision_embeddings` table, caption/FTS fallback) — tool surface now 67 (66 wired + ingest_file stub); VisibilityScope::shared_only federation scope (recall `visibility:"shared"`, closes the CB-008 deferred clause); find_by_tags exact-tag AND lookup; dream-report span fix; Python orphan-table reap. 226 tests green, clippy-clean.
 
@@ -209,10 +211,10 @@ This feeds the knowledge graph. Dream cycles (`dream_run`) then consolidate acro
 - `fastembed` model cache location on Pi — confirm on first deploy
 - Python ↔ Rust DB schema compat — verify same column names/types (step 12)
 - CCBS (Cognitive Bootstrap modules) — defer until core is solid
-- Vision PDF ingestion (`ingest_file`) — the one remaining Tier-7 stub. Image captioning
-  (`describe_image`, tiered Ollama→Anthropic via `CEREBRO_VISION_BACKEND/_URL/_MODEL`) and
-  CLIP visual recall (`search_vision`, gate `CEREBRO_VISION_EMBED`) shipped in the wave-4
-  backport (PR #7)
+- Semantic chunking for `ingest_file` — the Rust port chunks by paragraph/sentence
+  (Python parity with the legacy chunker); Python's embedding-based SemanticChunker
+  is unported. PDF embedded-image extraction and OCR likewise (VLM captions cover
+  visible text). Port if ingestion quality ever becomes the bottleneck
 - Dream-cycle **resume** (skip completed phases) — needs a persisted per-cycle phase table + a `cycle_id` on the `dream_run` tool (audit C-RS-004; pre-phase cleanup + `episodes_consolidated` already shipped)
 - MCP `resources`/`prompts` surfaces (3 prompts) — port only if an ApexOS consumer needs them; capabilities are advertised honestly so nothing is broken (audit C-RS-011)
 - Recall wire-shape parity vs agentd — verify during the ApexOS-RS integration pass (audit C-RS-014)
