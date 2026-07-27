@@ -151,6 +151,7 @@ session_save(session_summary="...", key_discoveries=[...], unfinished_business=[
 ```
 Then as needed:
 - `store_procedure` — non-obvious implementation patterns, gotchas, workarounds
+- `record_procedure_outcome` — **grade every stored procedure you exercised this session** (success/failure). Ungraded procedures are invisible to the dream engine's skill competition; the fitness ledger only exists if we feed it
 - `store_intention` — next steps / deferred work (salience 0.8–0.95)
 - `create_schema` — architectural insights derived from multiple memories
 - `episode_start` / `episode_add_step` / `episode_end` — for multi-step implementation sequences
@@ -218,6 +219,7 @@ This feeds the knowledge graph. Dream cycles (`dream_run`) then consolidate acro
 - Dream-cycle **resume** (skip completed phases) — needs a persisted per-cycle phase table + a `cycle_id` on the `dream_run` tool (audit C-RS-004; pre-phase cleanup + `episodes_consolidated` already shipped)
 - MCP `resources`/`prompts` surfaces (3 prompts) — port only if an ApexOS consumer needs them; capabilities are advertised honestly so nothing is broken (audit C-RS-011)
 - Recall wire-shape parity vs agentd — verify during the ApexOS-RS integration pass (audit C-RS-014)
+- Topology/skill-invalidation exploration — gated experiment plan in `docs/ideas/CEREBRO_TOPO_EXPLORATION_PLAN.md` (reconciled against code 2026-07-27; backfill + dream hygiene already shipped from it)
 
 ---
 
