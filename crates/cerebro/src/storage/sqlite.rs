@@ -1483,6 +1483,139 @@ impl SqliteStore {
             for r in rows { let (t, cnt) = r?; by_type.insert(t, cnt.into()); }
         }
 
+        // E2 fragmentation watchdog (topo plan §4, FINDINGS-0): connectivity of
+        // the live link graph — components, island roster, isolated nodes,
+        // frozen-link share. Whole-store by design: links carry no scope and
+        // spreading crosses agents, so a scoped component count would report
+        // fake fragmentation. Island member PREVIEWS do honor the caller's
+        // scope — out-of-scope members stay bare ids.
+        let graph = {
+            const ISLAND_CAP: usize = 8;
+            const MEMBER_CAP: usize = 3;
+
+            let mut ids: Vec<String> = Vec::new();
+            {
+                let mut stmt = conn.prepare(
+                    "SELECT id FROM memories WHERE deleted_at IS NULL ORDER BY rowid",
+                )?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+                for r in rows {
+                    ids.push(r?);
+                }
+            }
+            let index: std::collections::HashMap<&str, usize> =
+                ids.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
+            let n = ids.len();
+            let mut uf = petgraph::unionfind::UnionFind::<usize>::new(n);
+            let mut is_linked = vec![false; n];
+            let mut live_links = 0i64;
+            let mut frozen = 0i64;
+            {
+                let mut stmt =
+                    conn.prepare("SELECT source_id, target_id, last_traversed FROM links")?;
+                let rows = stmt.query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (s, t, traversed) = row?;
+                    let (Some(&si), Some(&ti)) =
+                        (index.get(s.as_str()), index.get(t.as_str()))
+                    else {
+                        continue; // an endpoint is deleted — dead link, no connectivity
+                    };
+                    live_links += 1;
+                    if traversed.is_none() {
+                        frozen += 1;
+                    }
+                    is_linked[si] = true;
+                    is_linked[ti] = true;
+                    uf.union(si, ti);
+                }
+            }
+
+            // Components over LINKED nodes only; isolated nodes reported apart.
+            let mut comp: std::collections::HashMap<usize, Vec<usize>> = Default::default();
+            for (i, &l) in is_linked.iter().enumerate() {
+                if l {
+                    comp.entry(uf.find_mut(i)).or_default().push(i);
+                }
+            }
+            let mut components: Vec<Vec<usize>> = comp.into_values().collect();
+            components.sort_by_key(|c| std::cmp::Reverse(c.len()));
+            let linked_count = components.iter().map(Vec::len).sum::<usize>();
+            let isolated = n - linked_count;
+
+            // Scope-filtered content previews for island members (never the
+            // largest component — islands are the actionable part).
+            let member_ids: Vec<&str> = components
+                .iter()
+                .skip(1)
+                .take(ISLAND_CAP)
+                .flat_map(|c| c.iter().take(MEMBER_CAP).map(|&i| ids[i].as_str()))
+                .collect();
+            let mut previews: std::collections::HashMap<String, String> = Default::default();
+            if !member_ids.is_empty() {
+                let placeholders = vec!["?"; member_ids.len()].join(",");
+                let sql = format!(
+                    "SELECT id, substr(content, 1, 80) FROM memories \
+                     WHERE {scope_sql} AND deleted_at IS NULL AND id IN ({placeholders})"
+                );
+                let params_all: Vec<&dyn rusqlite::ToSql> = scope_params
+                    .iter()
+                    .map(|s| s as &dyn rusqlite::ToSql)
+                    .chain(member_ids.iter().map(|s| s as &dyn rusqlite::ToSql))
+                    .collect();
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(params_all.as_slice(), |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?;
+                for r in rows {
+                    let (id, preview) = r?;
+                    previews.insert(id, preview);
+                }
+            }
+
+            let islands: Vec<serde_json::Value> = components
+                .iter()
+                .skip(1)
+                .take(ISLAND_CAP)
+                .map(|c| {
+                    let members: Vec<serde_json::Value> = c
+                        .iter()
+                        .take(MEMBER_CAP)
+                        .map(|&i| {
+                            let id = &ids[i];
+                            match previews.get(id) {
+                                Some(p) => serde_json::json!({ "id": id, "preview": p }),
+                                None => serde_json::json!({ "id": id }),
+                            }
+                        })
+                        .collect();
+                    serde_json::json!({ "size": c.len(), "members": members })
+                })
+                .collect();
+
+            let pct = |num: i64, den: i64| {
+                if den == 0 { 0.0 } else { (num as f64 / den as f64 * 1000.0).round() / 10.0 }
+            };
+            serde_json::json!({
+                "live_memories": n,
+                "linked_memories": linked_count,
+                "isolated_memories": isolated,
+                "isolated_pct": pct(isolated as i64, n as i64),
+                "live_links": live_links,
+                "never_traversed_links_pct": pct(frozen, live_links),
+                "components": components.len(),
+                "largest_component": components.first().map_or(0, Vec::len),
+                "islands": islands,
+                "islands_truncated": components.len().saturating_sub(1) > ISLAND_CAP,
+            })
+        };
+
         Ok(serde_json::json!({
             "total_memories": total,
             "deleted_memories": deleted,
@@ -1490,6 +1623,7 @@ impl SqliteStore {
             "avg_salience": avg_sal,
             "avg_stability": avg_stab,
             "by_type": by_type,
+            "graph": graph,
         }))
     }
 
@@ -2268,6 +2402,75 @@ mod tests {
         assert_eq!(ids, vec![old.id.0.as_str(), newer.id.0.as_str()],
             "live vector-less rows only, oldest first");
         assert_eq!(missing[0].1, "oldest, no vector");
+    }
+
+    // E2 fragmentation watchdog: components over live-endpoint links (both
+    // directions), islands with scope-honest member previews, isolated count,
+    // frozen-link share. A link to a soft-deleted endpoint carries nothing.
+    #[tokio::test]
+    async fn memory_health_reports_graph_fragmentation() {
+        use crate::models::{AssociativeLink, MemoryNode};
+        use crate::types::{AgentId, LinkType, MemoryType, Visibility, VisibilityScope};
+
+        let dir = TempDir::new().unwrap();
+        let store = SqliteStore::open(&dir.path().join("t.db")).await.unwrap();
+
+        let mk = |content: &str| MemoryNode::new(content, MemoryType::Semantic);
+        let link = |a: &MemoryNode, b: &MemoryNode, traversed: bool| AssociativeLink {
+            source_id:       a.id.clone(),
+            target_id:       b.id.clone(),
+            link_type:       LinkType::Semantic,
+            weight:          0.5,
+            created_at:      Utc::now(),
+            last_traversed:  traversed.then(Utc::now),
+            traversal_count: i64::from(traversed) as u32,
+        };
+
+        let a0 = mk("main component anchor");
+        let a1 = mk("main component middle");
+        let a2 = mk("main component tail");
+        let mut b0 = mk("island member private to bob");
+        b0.agent_id = Some(AgentId("bob".into()));
+        b0.visibility = Visibility::Private;
+        let b1 = mk("island member shared");
+        let iso = mk("all alone, no links at all");
+        let dead = mk("soft-deleted endpoint");
+        for m in [&a0, &a1, &a2, &b0, &b1, &iso, &dead] {
+            store.insert_memory(m).await.unwrap();
+        }
+        store.insert_link(&link(&a0, &a1, true)).await.unwrap();
+        store.insert_link(&link(&a1, &a2, false)).await.unwrap();
+        store.insert_link(&link(&b0, &b1, false)).await.unwrap();
+        store.insert_link(&link(&dead, &a0, false)).await.unwrap();
+        store.delete_memory(&dead.id, &VisibilityScope::global()).await.unwrap();
+
+        let health = store.memory_health(&VisibilityScope::global()).await.unwrap();
+        let g = &health["graph"];
+        assert_eq!(g["live_memories"], 6);
+        assert_eq!(g["linked_memories"], 5);
+        assert_eq!(g["isolated_memories"], 1);
+        assert_eq!(g["live_links"], 3, "dead-endpoint link must not count");
+        assert_eq!(g["never_traversed_links_pct"], 66.7);
+        assert_eq!(g["components"], 2);
+        assert_eq!(g["largest_component"], 3);
+        assert_eq!(g["islands_truncated"], false);
+        let islands = g["islands"].as_array().unwrap();
+        assert_eq!(islands.len(), 1);
+        assert_eq!(islands[0]["size"], 2);
+        let members = islands[0]["members"].as_array().unwrap();
+        assert_eq!(members.len(), 2);
+        // Global scope is the unscoped view — every member carries a preview.
+        assert!(members.iter().all(|m| m.get("preview").is_some()));
+
+        // Alice's scope: bob's private island member is a bare id, the shared
+        // one keeps its preview.
+        let alice = VisibilityScope::for_agent(AgentId("alice".into()));
+        let scoped = store.memory_health(&alice).await.unwrap();
+        let members = scoped["graph"]["islands"][0]["members"].as_array().unwrap();
+        let by_id = |id: &str| members.iter().find(|m| m["id"] == id).unwrap();
+        assert!(by_id(b0.id.0.as_str()).get("preview").is_none(),
+            "private member of another agent must not leak content");
+        assert!(by_id(b1.id.0.as_str()).get("preview").is_some());
     }
 
     // C-RS-004: pre-phase cleanup closes stale open episodes but leaves fresh
