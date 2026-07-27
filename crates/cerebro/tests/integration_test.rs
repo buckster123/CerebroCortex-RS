@@ -555,6 +555,93 @@ mod storage_basic {
     }
 
     #[tokio::test]
+    async fn remember_auto_links_by_shared_topical_tags_not_bookkeeping() {
+        // Python remember() step 5, restored: a new memory sharing a TOPICAL
+        // tag with an existing one gets a semantic encoding link (weight
+        // 0.3 + 0.1·overlap) and becomes spreading-reachable immediately.
+        // Bookkeeping tags (session_note, …) never count toward overlap.
+        use cerebro::CerebroCortex;
+        let dir = TempDir::new().unwrap();
+        let config = Config {
+            db_path:       dir.path().join("test.db"),
+            anthropic_key: None,
+            embed_model:   "".into(), // the pass is symbolic — no vectors needed
+        };
+        let brain = CerebroCortex::new(config).await.unwrap();
+        let a = brain.remember(
+            "slint scissor pass clips the face view to its window rect",
+            None, Some(vec!["slint".into(), "session_note".into()]), None,
+            VisibilityScope::global(),
+        ).await.unwrap();
+        let b = brain.remember(
+            "quaternion gimbal rig calibration for the studio camera crane",
+            None, Some(vec!["slint".into(), "session_note".into()]), None,
+            VisibilityScope::global(),
+        ).await.unwrap();
+
+        let links = brain.storage.read().await.sqlite
+            .list_links_from(&b.id).await.unwrap();
+        let to_a: Vec<_> = links.iter().filter(|l| l.target_id == a.id).collect();
+        assert!(
+            to_a.iter().any(|l| {
+                l.link_type == cerebro::types::LinkType::Semantic
+                    && (l.weight - 0.4).abs() < 1e-6
+            }),
+            "one shared topical tag must create a semantic link at 0.3 + 0.1·1 = 0.4: {to_a:?}"
+        );
+        // Reachability is the point: both ends now sit in the live graph
+        // with an edge between them.
+        assert!(brain.storage.read().await.graph.neighbors(&b.id)
+            .iter().any(|n| **n == a.id),
+            "auto-link must mirror into the spreading graph immediately");
+        assert!(brain.storage.read().await.sqlite
+            .has_any_live_link(&a.id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn auto_link_retrofit_links_a_linkless_memory() {
+        // The `cerebro autolink` path: a pre-existing link-less memory gets
+        // its encoding links after the fact.
+        use cerebro::CerebroCortex;
+        let dir = TempDir::new().unwrap();
+        let config = Config {
+            db_path:       dir.path().join("test.db"),
+            anthropic_key: None,
+            embed_model:   "".into(),
+        };
+        let brain = CerebroCortex::new(config).await.unwrap();
+        let a = brain.remember(
+            "occipital politeness bucket honors the crawl delay",
+            None, Some(vec!["occipital".into()]), None,
+            VisibilityScope::global(),
+        ).await.unwrap();
+
+        // Strand a second memory the pre-fix way: direct insert, no links.
+        let mut b = cerebro::models::MemoryNode::new(
+            "occipital robots cache keyed by origin with a ttl",
+            cerebro::types::MemoryType::Semantic,
+        );
+        b.tags = vec!["occipital".into()];
+        brain.storage.read().await.sqlite.insert_memory(&b).await.unwrap();
+        let linkless = brain.storage.read().await.sqlite
+            .list_linkless_memory_ids(100).await.unwrap();
+        assert!(linkless.contains(&b.id), "b starts link-less");
+
+        let created = brain.auto_link(&b).await.unwrap();
+        assert!(created >= 1, "retrofit must create at least the tag link");
+        assert!(brain.storage.read().await.sqlite
+            .has_any_live_link(&b.id).await.unwrap());
+        let after = brain.storage.read().await.sqlite
+            .list_linkless_memory_ids(100).await.unwrap();
+        assert!(!after.contains(&b.id), "b leaves the worklist");
+        // a's links list gained nothing (direction: b → a), but connectivity
+        // is direction-blind — reachable either way.
+        assert!(brain.storage.read().await.sqlite
+            .list_links_from(&b.id).await.unwrap()
+            .iter().any(|l| l.target_id == a.id));
+    }
+
+    #[tokio::test]
     async fn backfill_without_embedder_errors_honestly() {
         // The backfill exists to CREATE vectors; silently scanning rows with
         // no embedder loaded would report success while doing nothing.

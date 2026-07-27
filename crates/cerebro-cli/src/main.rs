@@ -84,6 +84,14 @@ enum Command {
         #[arg(long)] dry_run: bool,
         #[arg(long)] json: bool,
     },
+    /// Create encoding links for memories that have none (stored before auto-link existed)
+    Autolink {
+        /// Max memories to process this run
+        #[arg(long, default_value_t = 10_000)] limit: usize,
+        /// Only report how many memories are link-less
+        #[arg(long)] dry_run: bool,
+        #[arg(long)] json: bool,
+    },
     /// Show emotional state summary
     Emotions {
         #[arg(long)] json: bool,
@@ -355,6 +363,32 @@ async fn main() -> Result<()> {
             } else {
                 let (embedded, found) = brain.backfill_embeddings(limit).await?;
                 out(&json!({ "embedded": embedded, "missing_found": found }), json);
+            }
+        }
+
+        // -----------------------------------------------------------------
+        Command::Autolink { limit, dry_run, json } => {
+            let linkless = brain.storage.read().await.sqlite
+                .list_linkless_memory_ids(limit).await?;
+            if dry_run {
+                out(&json!({ "dry_run": true, "linkless_memories": linkless.len() }), json);
+            } else {
+                let found = linkless.len();
+                let mut processed = 0usize;
+                let mut links_created = 0usize;
+                for id in linkless {
+                    let node = brain.storage.read().await.sqlite
+                        .get_memory(&id, &VisibilityScope::global()).await?;
+                    if let Some(node) = node {
+                        links_created += brain.auto_link(&node).await?;
+                        processed += 1;
+                    }
+                }
+                out(&json!({
+                    "linkless_found": found,
+                    "processed": processed,
+                    "links_created": links_created,
+                }), json);
             }
         }
 
