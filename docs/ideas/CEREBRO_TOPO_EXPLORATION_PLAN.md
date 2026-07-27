@@ -89,6 +89,7 @@ Each experiment: **Method / Baseline / Metric / Gate**. All are union-find-cheap
 - **Baseline:** plain connected-component count at a fixed weight cutoff.
 - **Metric:** does the barcode reveal structure the fixed-cutoff count misses (e.g., a large sub-community about to detach)? Behavior on fixture (e) must be exactly as constructed.
 - **Gate:** correct on fixtures + tells a legible story on the real store. Expected to pass — cheap, Nano-safe, instruments a *silent* failure mode (spreading activation quietly degrading as the graph shatters). Pass → `memory_health` extension in Phase 4.
+- **Status: GATE PASSED (FINDINGS-0) and SHIPPED (FINDINGS-1)** — `memory_health` now returns a `graph` section (components, island roster with scope-honest previews, isolated count/pct, never-traversed-link share). The conductance sweep stayed exploration-side: weights are quantized + 79% frozen, so connectivity is the whole signal.
 
 ### E3 — Persistence-stable clustering for Dream Phase 2/3
 
@@ -173,7 +174,7 @@ Deliberately its own track: the core here is statistics and logging; topology is
 | ID | Feature | Gate | Status / cost if shipped |
 |----|---------|------|--------------------------|
 | E1 | Recall coherence scalar | flags real ambiguity ≥ ~70%, beats silhouette baseline | corpus = transcripts; < 1 ms, recall path (flagged) |
-| E2 | Fragmentation watchdog | fixture-exact + legible on real store | forecast axis redesign first; ~0, dream/health path; Nano-safe |
+| E2 | Fragmentation watchdog | fixture-exact + legible on real store | **SHIPPED** — `memory_health.graph` (FINDINGS-1) |
 | E3 | Persistence-stable dream clustering | resampling stability ↑, sane counts | baseline = post-#10 filtered tag-grouping; dream-time |
 | E4 | Bridge immunity in pruning | Class-B bridge exists on real data | **parked** until grading data (§4) |
 | E5 | H1 hole hunting → REM targeting | ≥ 1 nameable hole in real data | dream-time, feature-gated |
