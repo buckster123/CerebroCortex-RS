@@ -1,0 +1,7 @@
+numpy
+scipy
+ripser
+persim
+hdbscan
+scikit-learn
+matplotlib
