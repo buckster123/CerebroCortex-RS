@@ -1459,7 +1459,7 @@ fn procedure_fitness(node: &MemoryNode) -> f32 {
 /// *topic*. Excluded wherever tags define clusters (pattern extraction, skill
 /// distillation, competition niches) so clusters form on subject matter
 /// (e.g. "slint", "async") not on markers like `session_note` or `agent:*`.
-fn is_structural_tag(tag: &str) -> bool {
+pub(crate) fn is_structural_tag(tag: &str) -> bool {
     matches!(
         tag,
         "procedure"

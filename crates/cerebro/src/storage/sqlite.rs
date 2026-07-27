@@ -562,6 +562,160 @@ impl SqliteStore {
     /// `scope_sql`, so a scoped caller can only delete what it can see — the
     /// scope lives IN the statement (atomic under the connection lock, no
     /// check-then-act window). Global scope (`1=1`) preserves admin behaviour.
+    /// Candidates sharing at least one of `tags` (JSON-quoted match — Python's
+    /// unquoted LIKE also matched substrings, "rust" hitting "trust"; quoted is
+    /// strictly tighter). Scope-filtered so private memories of other agents
+    /// never become link partners. Returns (id, tags).
+    pub async fn find_by_any_tag(
+        &self,
+        exclude: &MemoryId,
+        tags: &[String],
+        scope: &VisibilityScope,
+        limit: usize,
+    ) -> Result<Vec<(MemoryId, Vec<String>)>> {
+        if tags.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().await;
+        let (scope_sql, scope_params) = scope.sql_filter();
+        let likes = vec!["tags LIKE ?"; tags.len()].join(" OR ");
+        let sql = format!(
+            "SELECT id, tags FROM memories \
+             WHERE id != ? AND deleted_at IS NULL AND {scope_sql} AND ({likes}) \
+             LIMIT ?"
+        );
+        let patterns: Vec<String> = tags
+            .iter()
+            .map(|t| format!("%\"{}\"%", t.replace(['"', '%', '_'], "")))
+            .collect();
+        let limit_s = limit.to_string();
+        let params_all: Vec<&dyn rusqlite::ToSql> = std::iter::once(&exclude.0 as &dyn rusqlite::ToSql)
+            .chain(scope_params.iter().map(|s| s as &dyn rusqlite::ToSql))
+            .chain(patterns.iter().map(|s| s as &dyn rusqlite::ToSql))
+            .chain(std::iter::once(&limit_s as &dyn rusqlite::ToSql))
+            .collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_all.as_slice(), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, tags_json) = row?;
+            let parsed: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+            out.push((MemoryId(id), parsed));
+        }
+        Ok(out)
+    }
+
+    /// Candidates whose `metadata.concepts` share at least one of `concepts`
+    /// (matched as JSON-quoted strings inside the metadata TEXT, like Python's
+    /// `concepts_json LIKE '%"c"%'`). Scope-filtered. Returns (id, concepts).
+    pub async fn find_by_any_concept(
+        &self,
+        exclude: &MemoryId,
+        concepts: &[String],
+        scope: &VisibilityScope,
+        limit: usize,
+    ) -> Result<Vec<(MemoryId, Vec<String>)>> {
+        if concepts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().await;
+        let (scope_sql, scope_params) = scope.sql_filter();
+        let likes = vec!["metadata LIKE ?"; concepts.len()].join(" OR ");
+        let sql = format!(
+            "SELECT id, metadata FROM memories \
+             WHERE id != ? AND deleted_at IS NULL AND {scope_sql} AND ({likes}) \
+             LIMIT ?"
+        );
+        let patterns: Vec<String> = concepts
+            .iter()
+            .map(|c| format!("%\"{}\"%", c.replace(['"', '%', '_'], "")))
+            .collect();
+        let limit_s = limit.to_string();
+        let params_all: Vec<&dyn rusqlite::ToSql> = std::iter::once(&exclude.0 as &dyn rusqlite::ToSql)
+            .chain(scope_params.iter().map(|s| s as &dyn rusqlite::ToSql))
+            .chain(patterns.iter().map(|s| s as &dyn rusqlite::ToSql))
+            .chain(std::iter::once(&limit_s as &dyn rusqlite::ToSql))
+            .collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_all.as_slice(), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, meta_json) = row?;
+            let parsed: Vec<String> = serde_json::from_str::<serde_json::Value>(&meta_json)
+                .ok()
+                .and_then(|m| {
+                    m.get("concepts")
+                        .and_then(|c| serde_json::from_value(c.clone()).ok())
+                })
+                .unwrap_or_default();
+            out.push((MemoryId(id), parsed));
+        }
+        Ok(out)
+    }
+
+    /// Highest-salience live memories sharing an emotional valence, scope-
+    /// filtered. Returns (id, emotional_intensity) — the affective-link pass.
+    pub async fn find_same_valence(
+        &self,
+        exclude: &MemoryId,
+        valence: &str,
+        scope: &VisibilityScope,
+        limit: usize,
+    ) -> Result<Vec<(MemoryId, f32)>> {
+        let conn = self.conn.lock().await;
+        let (scope_sql, scope_params) = scope.sql_filter();
+        let sql = format!(
+            "SELECT id, emotional_intensity FROM memories \
+             WHERE id != ? AND deleted_at IS NULL AND emotional_valence = ? AND {scope_sql} \
+             ORDER BY salience DESC LIMIT ?"
+        );
+        let limit_s = limit.to_string();
+        let params_all: Vec<&dyn rusqlite::ToSql> = [
+            &exclude.0 as &dyn rusqlite::ToSql,
+            &valence as &dyn rusqlite::ToSql,
+        ]
+        .into_iter()
+        .chain(scope_params.iter().map(|s| s as &dyn rusqlite::ToSql))
+        .chain(std::iter::once(&limit_s as &dyn rusqlite::ToSql))
+        .collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_all.as_slice(), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)? as f32))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, intensity) = row?;
+            out.push((MemoryId(id), intensity));
+        }
+        Ok(out)
+    }
+
+    /// Live memories with no live-endpoint link at all (the auto-link retrofit
+    /// worklist), oldest first — the set-based complement of `has_any_live_link`.
+    pub async fn list_linkless_memory_ids(&self, limit: usize) -> Result<Vec<MemoryId>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT m.id FROM memories m WHERE m.deleted_at IS NULL AND NOT EXISTS (
+                SELECT 1 FROM links l
+                JOIN memories other
+                  ON other.id = CASE WHEN l.source_id = m.id
+                                     THEN l.target_id ELSE l.source_id END
+                WHERE (l.source_id = m.id OR l.target_id = m.id)
+                  AND other.deleted_at IS NULL
+             ) ORDER BY m.created_at LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(MemoryId(row?));
+        }
+        Ok(out)
+    }
+
     /// Live memories with no stored embedding vector, oldest first — the
     /// backfill worklist (id + content only; the caller embeds).
     pub async fn list_missing_embeddings(&self, limit: usize) -> Result<Vec<(MemoryId, String)>> {

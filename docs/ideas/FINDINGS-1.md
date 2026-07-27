@@ -79,11 +79,22 @@ keep twice over:
    Rust-stored memory is born isolated — that is the root cause of both the
    23% isolated share and the island-formation mechanism ("topic-batch
    accretion" = a batch only links internally when something episodic ties
-   it). **Candidate fix, flagged for decision: port the auto-link step**
-   (top-k vector-similar above threshold → semantic links at store time,
-   matching Python semantics). This is the highest-leverage recall-quality
-   item found by the whole exploration so far — 123 memories spreading
-   activation cannot reach.
+   it). **Candidate fix, flagged for decision: port the auto-link step.**
+   This is the highest-leverage recall-quality item found by the whole
+   exploration so far — 123 memories spreading activation cannot reach.
+
+   **RESOLVED (same day)** — André green-lit it; the port shipped as
+   `fix/remember-auto-link`. Reading Python first paid off again: the linking
+   is *not* vector-based — it is shared-**tags** → semantic
+   (w = 0.3 + 0.1·overlap, cap 0.8), shared-**concepts** → semantic
+   (w = 0.3 + 0.15·overlap, cap 0.9), and same-**valence** → affective
+   (w = max(0.3, 0.7 − |Δintensity|·0.5), top-salience, ≤3) — all scope-aware
+   (`_scope_sql(agent_id)` mirrored exactly). Two deliberate deviations:
+   bookkeeping tags never link (Python linked on ALL tags — that is precisely
+   how its 269 session notes inter-linked into the hairball), and tag/concept
+   matching is JSON-quoted (Python's unquoted LIKE also matched substrings —
+   "rust" hit "trust"). Plus `cerebro autolink` retrofits the stranded
+   backlog, mirroring the `backfill` pattern.
 
 ## E1 — Retrieval merge-dominance: GATE FAILED, parked (2026-07-27)
 
