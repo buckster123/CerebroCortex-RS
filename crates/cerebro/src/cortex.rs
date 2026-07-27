@@ -403,7 +403,7 @@ impl CerebroCortex {
             match storage.vector.embed_and_store(&id, &content).await {
                 Ok(v) if !v.is_empty() => {
                     embedded += 1;
-                    if embedded % 50 == 0 {
+                    if embedded.is_multiple_of(50) {
                         tracing::info!("backfill: {embedded}/{found} embedded");
                     }
                 }
