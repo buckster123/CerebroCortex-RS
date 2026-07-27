@@ -771,6 +771,27 @@ impl SqliteStore {
         Ok(results)
     }
 
+    /// True if the memory participates in any link whose other endpoint is
+    /// live, in either direction — spreading activation traverses links both
+    /// ways, and the graph rebuild drops links to deleted endpoints, so this
+    /// is the isolation test that matches what recall can actually reach.
+    pub async fn has_any_live_link(&self, id: &MemoryId) -> Result<bool> {
+        let conn = self.conn.lock().await;
+        let exists: i64 = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM links l
+                JOIN memories other
+                  ON other.id = CASE WHEN l.source_id = ?1
+                                     THEN l.target_id ELSE l.source_id END
+                WHERE (l.source_id = ?1 OR l.target_id = ?1)
+                  AND other.deleted_at IS NULL
+             )",
+            params![id.0],
+            |r| r.get(0),
+        )?;
+        Ok(exists != 0)
+    }
+
     /// Hard-delete a single memory (use after backup/purge confirmation).
     ///
     /// Cleans dependent rows in the same transaction so the hard delete is
@@ -2229,5 +2250,38 @@ mod tests {
         assert!(!old["ended_at"].is_null(), "stale episode should be closed");
         let fresh = store.get_episode_raw("ep_new").await.unwrap().unwrap();
         assert!(fresh["ended_at"].is_null(), "fresh open episode stays open");
+    }
+
+    // Phase-5 isolation check: incoming links count too (spreading is
+    // bidirectional), but a link whose other endpoint is soft-deleted does not.
+    #[tokio::test]
+    async fn has_any_live_link_sees_both_directions_and_dead_endpoints() {
+        use crate::models::{AssociativeLink, MemoryNode};
+        use crate::types::{LinkType, MemoryType, VisibilityScope};
+
+        let dir = TempDir::new().unwrap();
+        let store = SqliteStore::open(&dir.path().join("t.db")).await.unwrap();
+
+        let a = MemoryNode::new("source node", MemoryType::Semantic);
+        let b = MemoryNode::new("target node", MemoryType::Semantic);
+        store.insert_memory(&a).await.unwrap();
+        store.insert_memory(&b).await.unwrap();
+        store.insert_link(&AssociativeLink {
+            source_id:       a.id.clone(),
+            target_id:       b.id.clone(),
+            link_type:       LinkType::Semantic,
+            weight:          0.5,
+            created_at:      Utc::now(),
+            last_traversed:  None,
+            traversal_count: 0,
+        }).await.unwrap();
+
+        // b has only an INCOMING link — still connected.
+        assert!(store.has_any_live_link(&a.id).await.unwrap());
+        assert!(store.has_any_live_link(&b.id).await.unwrap());
+
+        // Soft-delete a: b's only link now points at a dead endpoint.
+        store.delete_memory(&a.id, &VisibilityScope::global()).await.unwrap();
+        assert!(!store.has_any_live_link(&b.id).await.unwrap());
     }
 }
