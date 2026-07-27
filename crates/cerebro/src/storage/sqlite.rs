@@ -562,6 +562,25 @@ impl SqliteStore {
     /// `scope_sql`, so a scoped caller can only delete what it can see — the
     /// scope lives IN the statement (atomic under the connection lock, no
     /// check-then-act window). Global scope (`1=1`) preserves admin behaviour.
+    /// Live memories with no stored embedding vector, oldest first — the
+    /// backfill worklist (id + content only; the caller embeds).
+    pub async fn list_missing_embeddings(&self, limit: usize) -> Result<Vec<(MemoryId, String)>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT id, content FROM memories \
+             WHERE embedding IS NULL AND deleted_at IS NULL \
+             ORDER BY created_at LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok((MemoryId(r.get::<_, String>(0)?), r.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     pub async fn delete_memory(&self, id: &MemoryId, scope: &VisibilityScope) -> Result<bool> {
         let (scope_sql, scope_params) = scope.sql_filter();
         let conn = self.conn.lock().await;
@@ -2195,6 +2214,40 @@ CREATE INDEX IF NOT EXISTS idx_audit_ts          ON audit_log(timestamp);
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    // Backfill worklist: only live, vector-less rows, oldest first.
+    #[tokio::test]
+    async fn list_missing_embeddings_lists_only_live_vectorless_rows() {
+        use crate::models::MemoryNode;
+        use crate::types::{MemoryType, VisibilityScope};
+
+        let dir = TempDir::new().unwrap();
+        let store = SqliteStore::open(&dir.path().join("t.db")).await.unwrap();
+
+        let mut old = MemoryNode::new("oldest, no vector", MemoryType::Semantic);
+        old.created_at = Utc::now() - chrono::Duration::hours(2);
+        old.updated_at = old.created_at;
+        let newer    = MemoryNode::new("newer, no vector", MemoryType::Semantic);
+        let vectored = MemoryNode::new("has a vector", MemoryType::Semantic);
+        let deleted  = MemoryNode::new("deleted, no vector", MemoryType::Semantic);
+        for n in [&old, &newer, &vectored, &deleted] {
+            store.insert_memory(n).await.unwrap();
+        }
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE memories SET embedding = X'00' WHERE id = ?1",
+                params![vectored.id.0],
+            ).unwrap();
+        }
+        store.delete_memory(&deleted.id, &VisibilityScope::global()).await.unwrap();
+
+        let missing = store.list_missing_embeddings(10).await.unwrap();
+        let ids: Vec<_> = missing.iter().map(|(id, _)| id.0.as_str()).collect();
+        assert_eq!(ids, vec![old.id.0.as_str(), newer.id.0.as_str()],
+            "live vector-less rows only, oldest first");
+        assert_eq!(missing[0].1, "oldest, no vector");
+    }
 
     // C-RS-004: pre-phase cleanup closes stale open episodes but leaves fresh
     // ones (and already-ended ones) untouched.

@@ -555,6 +555,25 @@ mod storage_basic {
     }
 
     #[tokio::test]
+    async fn backfill_without_embedder_errors_honestly() {
+        // The backfill exists to CREATE vectors; silently scanning rows with
+        // no embedder loaded would report success while doing nothing.
+        use cerebro::CerebroCortex;
+        let dir = TempDir::new().unwrap();
+        let config = Config {
+            db_path:       dir.path().join("test.db"),
+            anthropic_key: None,
+            embed_model:   "".into(),
+        };
+        let brain = CerebroCortex::new(config).await.unwrap();
+        brain.remember("vectorless row", None, None, None, VisibilityScope::global())
+            .await.unwrap();
+        let err = brain.backfill_embeddings(100).await.unwrap_err();
+        assert!(err.to_string().contains("embedder"),
+            "error names the missing embedder: {err}");
+    }
+
+    #[tokio::test]
     async fn remember_lands_in_graph_even_without_a_vector() {
         // CB-007/CB-009: the embed runs lock-free before the write guard and a
         // missing/failed embedding is non-fatal — the memory must still land in
