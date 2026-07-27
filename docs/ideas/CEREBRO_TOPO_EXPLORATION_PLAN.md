@@ -81,7 +81,8 @@ Each experiment: **Method / Baseline / Metric / Gate**. All are union-find-cheap
 - **Method:** For each replayed transcript query, take the post-spreading-activation candidate set (≤ 50 nodes — `SPREADING_MAX_ACTIVATED`). Compute pairwise angular distances, MST, H0 barcode. Coherence scalar: `C = 1 − p2/p1` where `p1`, `p2` are the two longest finite bar persistences (C→1: one tight idea; C→0: two rival clusters). Also record component count at the largest merge gap.
 - **Baseline:** silhouette score with k=2 KMeans; mean pairwise distance.
 - **Metric:** on ~100 replayed real queries, does low-C flag queries a human (André) or an LLM judge considers ambiguous / multi-topic? Small-sample precision, eyeball-honest.
-- **Gate:** low-C flags are judged genuinely ambiguous in ≥ ~70% of cases AND the baseline doesn't match that. Pass → Phase 4 wires an optional `coherence` field into recall output. Cost budget: trivially met (≤50 points; ~0.5M flops in release Rust).
+- **Gate:** low-dominance flags are judged genuinely ambiguous in ≥ ~70% of cases AND the baseline doesn't match that.
+- **Status: GATE FAILED (FINDINGS-1)** — chance AUC on labeled controls for the metric AND both baselines; constructed-union follow-up shows the metric is nearly blind at this store's concentration, with retrieval dissolving mixtures on top. Parked with a written re-test trigger (materially different store or embed model).
 
 ### E2 — Link-graph fragmentation watchdog (memory_health)
 
@@ -173,7 +174,7 @@ Deliberately its own track: the core here is statistics and logging; topology is
 
 | ID | Feature | Gate | Status / cost if shipped |
 |----|---------|------|--------------------------|
-| E1 | Recall coherence scalar | flags real ambiguity ≥ ~70%, beats silhouette baseline | corpus = transcripts; < 1 ms, recall path (flagged) |
+| E1 | Recall coherence scalar | flags real ambiguity ≥ ~70%, beats silhouette baseline | **FAILED — parked** (FINDINGS-1: chance AUC, two-layer cause; re-test trigger written) |
 | E2 | Fragmentation watchdog | fixture-exact + legible on real store | **SHIPPED** — `memory_health.graph` (FINDINGS-1) |
 | E3 | Persistence-stable dream clustering | resampling stability ↑, sane counts | baseline = post-#10 filtered tag-grouping; dream-time |
 | E4 | Bridge immunity in pruning | Class-B bridge exists on real data | **parked** until grading data (§4) |
