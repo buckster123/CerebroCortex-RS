@@ -383,6 +383,37 @@ impl CerebroCortex {
         Ok(hits)
     }
 
+    /// Backfill vector embeddings for memories that have none (rows migrated
+    /// from the Python store predate the Rust embedder and are FTS5-only at
+    /// recall until embedded). Runs the same embed-and-persist path
+    /// `remember()` uses, oldest first, up to `limit` rows. Returns
+    /// `(embedded, missing_found)`.
+    pub async fn backfill_embeddings(&self, limit: usize) -> Result<(usize, usize)> {
+        let storage = self.storage.read().await;
+        if !storage.vector.is_embedder_loaded() {
+            anyhow::bail!(
+                "no embedder loaded — backfill requires embeddings enabled \
+                 (CEREBRO_EMBED_MODEL must not be empty)"
+            );
+        }
+        let missing = storage.sqlite.list_missing_embeddings(limit).await?;
+        let found = missing.len();
+        let mut embedded = 0usize;
+        for (id, content) in missing {
+            match storage.vector.embed_and_store(&id, &content).await {
+                Ok(v) if !v.is_empty() => {
+                    embedded += 1;
+                    if embedded.is_multiple_of(50) {
+                        tracing::info!("backfill: {embedded}/{found} embedded");
+                    }
+                }
+                Ok(_)  => tracing::warn!("backfill: no vector produced for {}", id.0),
+                Err(e) => tracing::warn!("backfill: embed failed for {}: {e}", id.0),
+            }
+        }
+        Ok((embedded, found))
+    }
+
     /// Associate two existing memories with a typed link.
     ///
     /// Writes to SQLite first (source of truth), then mirrors into the graph.
