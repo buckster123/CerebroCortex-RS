@@ -57,3 +57,77 @@ dream-phase consumers) now see `components > 1` + named islands and can act —
 **Follow-up candidates** (not scheduled): a dream-phase consumer that proposes
 bridges for islands (REM recombination already random-pairs; islands are
 better targets); isolated-node triage (23% is a lot of unreachable memory).
+
+### E2 postscript — the first topology-guided intervention (same day)
+
+Used the shipped watchdog to actually *heal* the live brain, and it earned its
+keep twice over:
+
+1. Bridged the GL-face island to the June GL-face session summary
+   (`derived_from` — the procedures were distilled in the same minute as that
+   summary). Island absorbed ✓.
+2. First Occipital bridge went to a recent Occipital close-note — and the
+   watchdog reported the island had **grown to 4**: the chosen anchor was
+   itself an isolated node (isolated 124→123), so the bridge merged it INTO
+   the island. Re-anchored to a verified high-degree node (178 links) →
+   **`components: 1, islands: []`** — the graph fully connected for the first
+   time.
+3. The wrong-anchor incident exposed a real **port gap**: Python `remember()`
+   step 5 is "Link engine (auto-link to related memories)"
+   (`src/cerebro/cortex.py`); the Rust pipeline (thalamus → amygdala →
+   temporal → SQLite → embed → graph node) **has no auto-link step**. Every
+   Rust-stored memory is born isolated — that is the root cause of both the
+   23% isolated share and the island-formation mechanism ("topic-batch
+   accretion" = a batch only links internally when something episodic ties
+   it). **Candidate fix, flagged for decision: port the auto-link step**
+   (top-k vector-similar above threshold → semantic links at store time,
+   matching Python semantics). This is the highest-leverage recall-quality
+   item found by the whole exploration so far — 123 memories spreading
+   activation cannot reach.
+
+## E1 — Retrieval merge-dominance: GATE FAILED, parked (2026-07-27)
+
+**Protocol.** 14 real transcript queries + 30 labeled synthetic controls (15
+single-topic, 15 two-distant-topics), every query through the real Rust recall
+pipeline (`cerebro recall -n 50 --json`) against a fresh scratch copy of the
+pin. Per candidate set: merge-dominance p2/p1, components-at-largest-gap, k=2
+silhouette, mean pairwise distance, and a bootstrap z of dominance against 200
+random size-matched store subsets (everything relative, per FINDINGS-0).
+`scripts/topo/e1.py`; full numbers in `out/e1/e1_report.json` (regenerable).
+
+**Result — chance, across the board.** AUC on the labeled controls
+(ambiguous = positive): dominance 0.44, dominance-z 0.41, silhouette 0.53,
+mean pairwise 0.49. No metric separates tight from ambiguous queries; some of
+the strongest "two-cluster" signals sit on *tight* queries (audit-retention:
+z = −3.0) while jammed two-topic queries come back single-soup (z = +1.0).
+Phase-0's promising n=5 ordering did not survive controls — exactly what the
+gate discipline exists to catch.
+
+**Where the signal dies — both layers, demonstrated** (`e1_union.py`):
+constructed two-topic sets (25+25 unions of distinct tight-query results,
+bypassing retrieval) still barely separate from single-topic sets — AUC 0.60,
+mean z −0.64 vs −0.27. So:
+
+1. **The metric is nearly blind at this store's concentration** (90% of
+   pairwise distances in a 0.10 band; topic clusters are not tight relative
+   to inter-topic distances — the mega-session-notes span topics and pull
+   everything together). Even ground-truth mixtures barely register.
+2. **Retrieval dissolves mixtures on top of that**: a jammed query's embedding
+   is a midpoint, and the top-50 fills with midpoint-adjacent multi-topic
+   session notes rather than two clusters (real-recall ambiguous sets did
+   *worse* than constructed unions).
+
+![E1 verdict](topo-figs/e1_verdict.png)
+
+**Verdict: E1 gate FAILED — no coherence/dominance field ships on recall.**
+Per plan rule 2/3 this is a valid documented outcome; the alternative was
+shipping a noise field. Parked with a written re-test trigger: revisit only if
+the store's concentration picture changes materially (e.g. a colony node's
+much larger, more topically-differentiated brain, or an embed-model migration
+— E6 would notice). The H0 machinery itself is fine (fixture-validated);
+what failed is this *use* of it on this *store*.
+
+**Standing next steps** (unchanged by E1's failure): the auto-link port-gap
+fix above; E3 (dream-clustering comparison — different data shape: ≤500-memory
+dream samples clustered for LLM consumption, where even weak structure may
+beat tag-grouping); S0 (invocation logging + grading habit).
