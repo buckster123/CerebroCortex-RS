@@ -1307,8 +1307,8 @@ impl DreamEngine {
             }
 
             let prompt = PROMPT_REM_CONNECT
-                .replace("{memory_a}", &node_a.content[..node_a.content.len().min(300)])
-                .replace("{memory_b}", &node_b.content[..node_b.content.len().min(300)]);
+                .replace("{memory_a}", truncate_chars(&node_a.content, 300))
+                .replace("{memory_b}", truncate_chars(&node_b.content, 300));
 
             match llm_call(&key, SYSTEM_DREAM, &prompt).await {
                 Ok(resp) => {
