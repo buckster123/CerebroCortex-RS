@@ -13,9 +13,9 @@ CerebroCortex is a brain-analogous AI memory system. It models six memory types 
 - **FSRS retrievability** — `R(t, S) = (1 + t/9S)^{-1}` — spaced-repetition forgetting curve
 - **Spreading activation** — Collins & Loftus, 2 hops, 0.6 decay/hop, 50-node cap
 - **9 brain-region engines** — each handles a cognitive function
-- **6-phase dream engine** — memory consolidation cycle (3 algorithmic + 3 LLM)
+- **8-phase dream engine** — memory consolidation cycle (4 algorithmic + 4 LLM)
 
-The Rust port is a clean translation of the Python semantics. The cognitive architecture, MCP tool surface (66 tools), and wire format are preserved exactly.
+The Rust port is a clean translation of the Python semantics. The cognitive architecture, MCP tool surface (67 tools), and wire format are preserved exactly.
 
 ### Engine pipeline
 
@@ -65,6 +65,8 @@ CerebroCortex-RS/
 │   │       ├── types.rs              # enums + newtype IDs + VisibilityScope
 │   │       ├── config.rs             # all tunable parameters + env resolution
 │   │       ├── cortex.rs            # CerebroCortex coordinator (step 7)
+│   │       ├── ingest.rs            # ingest_file adapter pipeline (text/md/json/csv/pdf/image)
+│   │       ├── vision.rs            # tiered VLM captioning (describe_image)
 │   │       ├── models/
 │   │       │   ├── memory.rs        # MemoryNode, StrengthState
 │   │       │   ├── link.rs          # AssociativeLink (with link-age decay)
@@ -89,13 +91,13 @@ CerebroCortex-RS/
 │   │           ├── cerebellum.rs    # ProceduralEngine — workflows
 │   │           ├── prefrontal.rs    # ExecutiveEngine — intentions
 │   │           ├── neocortex.rs     # SchemaEngine — abstractions
-│   │           └── dream.rs         # DreamEngine — 6-phase consolidation
-│   ├── cerebro-mcp/                  # MCP-over-stdio binary (63 tools)
+│   │           └── dream.rs         # DreamEngine — 8-phase consolidation
+│   ├── cerebro-mcp/                  # MCP-over-stdio binary (67 tools)
 │   │   └── src/
 │   │       ├── main.rs
 │   │       ├── transport.rs         # newline-delimited JSON-RPC over stdio
 │   │       ├── dispatch.rs          # initialize handshake + tool routing
-│   │       └── tools.rs             # tool schema registry (63 tools)
+│   │       └── tools.rs             # tool schema registry (67 tools)
 │   ├── cerebro-api/                  # axum REST API + dashboard (step 11)
 │   └── cerebro-cli/                  # clap CLI (step 11)
 ├── tests/
@@ -210,7 +212,7 @@ Write order: **SQLite first, then update graph/vector in memory.** Never write t
 
 ---
 
-## Dream engine (6-phase consolidation)
+## Dream engine (8-phase consolidation)
 
 | Phase | Type | Description |
 |-------|------|-------------|
@@ -220,14 +222,16 @@ Write order: **SQLite first, then update graph/vector in memory.** Never write t
 | 4 — Emotional Reprocessing | Algorithmic | Adjust salience based on emotional markers |
 | 5 — Pruning | Algorithmic | Remove stale, low-salience, orphan sensory-layer memories |
 | 6 — REM Recombination | LLM | Find non-obvious connections across the graph |
+| 7 — Variation | LLM | Refine underperforming procedures; merge strong same-niche pairs (`dream_mutated` / `dream_merged`) |
+| 8 — Skill Competition | Algorithmic | Wilson-rank same-niche procedures; crown `skill_champion`, decay dominated rivals |
 
-LLM call budget: `DREAM_MAX_LLM_CALLS = 20` per cycle per agent. Phases 2, 3, 6 share this budget; the engine stops early if exhausted.
+LLM call budget: `DREAM_MAX_LLM_CALLS = 20` per cycle per agent. The LLM phases (2, 3, 6, 7) share this budget; the engine stops early if exhausted.
 
 ---
 
 ## MCP server
 
-`cerebro-mcp` exposes 66 tools over newline-delimited JSON-RPC on stdin/stdout. Stderr is for tracing logs. The protocol version is `"2024-11-05"`.
+`cerebro-mcp` exposes 67 tools over newline-delimited JSON-RPC on stdin/stdout. Stderr is for tracing logs. The protocol version is `"2024-11-05"`.
 
 **Tool categories:**
 - Core: `remember`, `recall`, `get_memory`, `update_memory`, `delete_memory`
@@ -246,7 +250,7 @@ LLM call budget: `DREAM_MAX_LLM_CALLS = 20` per cycle per agent. Phases 2, 3, 6 
 
 Tool descriptions are verbatim from Python `interfaces/mcp_server.py` — they are agent-facing strings and must not change.
 
-> **Note:** the Python server had 63 tools at the time the port began; the count grew to 66 as the Python version was updated in parallel. All 66 are wired in `cerebro-mcp/src/dispatch.rs`.
+> **Note:** the Python server had 63 tools at the time the port began; the count grew to 66 as the Python version was updated in parallel, then to 67 with the vision wave. All 67 are wired in `cerebro-mcp/src/dispatch.rs`.
 
 ---
 
@@ -264,8 +268,8 @@ All 12 steps are complete and production-deployed.
 | 6 | `cargo test engines_*` — all 8 deterministic engines pass | ✓ |
 | 7 | `cargo test cortex` — `remember()` persists, `recall()` returns matching memory | ✓ |
 | 8 | MCP handshake against agentd — `remember` + `recall` tools | ✓ |
-| 9 | All 66 tools respond without panic | ✓ |
-| 10 | Dream cycle runs all 6 phases with live Anthropic key | ✓ |
+| 9 | All 67 tools respond without panic | ✓ |
+| 10 | Dream cycle runs all 8 phases with live Anthropic key | ✓ |
 | 11 | `cerebro stats` and REST `/health` respond correctly | ✓ |
 | 12 | `cargo test db_compat` — Rust opens a Python-generated `cerebro.db`, migrates, reads memories | ✓ |
 

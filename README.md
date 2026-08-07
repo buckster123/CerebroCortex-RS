@@ -10,7 +10,7 @@
 
 [![Rust](https://img.shields.io/badge/rust-1.78%2B-orange?logo=rust)](https://rustup.rs)
 [![Tools](https://img.shields.io/badge/MCP_tools-67%2F67-brightgreen)](#-the-tool-surface-67)
-[![Tests](https://img.shields.io/badge/tests-238_passing-brightgreen)](#-building-from-source)
+[![Tests](https://img.shields.io/badge/tests-250_passing-brightgreen)](#-building-from-source)
 [![Platform](https://img.shields.io/badge/platform-arm64_%7C_x86__64-lightgrey)](#-deployment)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
@@ -441,16 +441,16 @@ printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion
 
 ```bash
 cargo build --release        # all four crates
-cargo test                   # 238 tests, no network, no model download
+cargo test                   # 250 tests, no network, no model download
 ```
 
 | Suite | Tests | What it gates |
 |-------|-------|---------------|
-| cerebro (unit) | 130 | engines, activation vs Python fixtures (±1e-4), dream phases, vision, ingestion, transport-free logic |
-| cerebro (integration) | 64 | storage CRUD, scope enforcement, migration + reap, retention, cortex end-to-end |
-| cerebro-mcp | 42 | dispatch routing, tool contracts, audit trail, panic isolation, frame caps |
+| cerebro (unit) | 135 | engines, activation vs Python fixtures (±1e-4), dream phases, vision, ingestion, transport-free logic |
+| cerebro (integration) | 69 | storage CRUD, scope enforcement, migration + reap, retention, cortex end-to-end |
+| cerebro-mcp | 44 | dispatch routing, tool contracts, audit trail, panic isolation, frame caps |
 | cerebro-api | 2 | priority-casing parity with MCP |
-| **total** | **238** | |
+| **total** | **250** | |
 
 ## 🔗 Related
 

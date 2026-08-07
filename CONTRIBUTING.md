@@ -19,7 +19,7 @@ CerebroCortex-RS is a **port, not a redesign.** Good PRs:
 Out of scope for now:
 - New cognitive features (add them to the Python original first, then port)
 - New MCP tools not in the Python version
-- Changing the 66-tool interface (it's a contract with agentd)
+- Changing the 67-tool interface (it's a contract with agentd)
 - Vision extras / CCBS bootstrap modules — deferred to Phase 3
 
 ---
