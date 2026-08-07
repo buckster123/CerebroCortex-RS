@@ -946,8 +946,8 @@ fn tool_schema(name: &str) -> Value {
     }
 }
 
-/// All 66 tool names (62 functional + 4 deferred Tier-7 stubs) — derived from
-/// Python mcp_server.py tool registry.
+/// All tool names — mirrors the Python mcp_server.py registry plus Rust-first
+/// additions. Deliberately count-free; the dispatch tests enforce the pairing.
 pub const TOOL_NAMES: &[&str] = &[
     "remember",
     "recall",

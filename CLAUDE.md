@@ -1,6 +1,6 @@
 # CerebroCortex-RS — Agent & Developer Guide
 
-> Pure-Rust port of CerebroCortex. Same 63 MCP tools, same wire format, zero Python runtime.
+> Pure-Rust port of CerebroCortex. Same 67 MCP tools, same wire format, zero Python runtime.
 > Drop-in for ApexOS `plugins.toml`. Pi 5 native. Single binary.
 
 See also: [ARCHITECTURE.md](ARCHITECTURE.md) | [CONTRIBUTING.md](CONTRIBUTING.md)
@@ -14,7 +14,7 @@ See also: [ARCHITECTURE.md](ARCHITECTURE.md) | [CONTRIBUTING.md](CONTRIBUTING.md
 ```
 crates/
   cerebro/        # library — all cognitive logic (types, models, activation, engines, storage)
-  cerebro-mcp/    # MCP-over-stdio binary (63 tools) — the ApexOS drop-in
+  cerebro-mcp/    # MCP-over-stdio binary (67 tools) — the ApexOS drop-in
   cerebro-api/    # axum REST API + dashboard (optional, mirrors Python cerebro-api)
   cerebro-cli/    # clap CLI (mirrors Python cerebro CLI)
 ```
@@ -97,7 +97,7 @@ cmd     = "/usr/local/bin/cerebro-mcp"   # was: python -m cerebrocortex.mcp
 restart = "always"
 ```
 `sudo systemctl reload agentd` (or `hot_reload_subsystem plugins` via the agent).
-agentd never knows. Same 63 tools. Same MCP contract.
+agentd never knows. Same 67 tools. Same MCP contract.
 
 ---
 
