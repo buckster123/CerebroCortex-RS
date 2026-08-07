@@ -28,7 +28,7 @@
 
 | Wave | Findings | Theme |
 |------|----------|-------|
-| W-A | R-02 R-04 R-05 R-06 | data-integrity + panic + contract-lie fixes (do first) |
+| W-A | R-02 R-04 R-05 R-06 | data-integrity + panic + contract-lie fixes — **shipped (PR #22)** |
 | W-B | R-01 R-03 | destructive-UX + dream compounding |
 | W-C | R-20 R-21 R-22 R-23 R-24 R-33 R-34 | recall/consolidation parity (the brain ranks differently than Python) |
 | W-D | R-07..R-12 R-28 | API/CLI catch-up with the dispatch surface |
