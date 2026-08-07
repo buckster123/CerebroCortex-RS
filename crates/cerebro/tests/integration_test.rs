@@ -1000,6 +1000,70 @@ mod storage_basic {
         assert!(store.sqlite.list_links_from(&b_id).await.unwrap().is_empty());
     }
 
+    // R-06: memory_versions and vision_embeddings both REFERENCE memories(id)
+    // with no CASCADE — purging a memory that has either kind of child row
+    // used to fail with SQLITE_CONSTRAINT (FK 19). Both purge paths now clear
+    // them in-transaction, like links/vectors before them.
+    #[tokio::test]
+    async fn purge_memory_cleans_versions_and_vision_rows() {
+        let (store, _dir) = make_store().await;
+
+        let node = MemoryNode::new("versioned + captioned memory", MemoryType::Semantic);
+        let id = node.id.clone();
+        store.sqlite.insert_memory(&node).await.unwrap();
+        store.sqlite.log_memory_version(&node, Some("test"), Some("v0")).await.unwrap();
+        store.vector.store_vision_embedding(&id, &[0.1, 0.2, 0.3], Some("x.png"))
+            .await.unwrap();
+
+        store.sqlite.delete_memory(&id, &VisibilityScope::global()).await.unwrap();
+        let purged = store.sqlite.purge_memory(&id, &VisibilityScope::global()).await.unwrap();
+        assert!(purged, "purge with version + vision child rows should succeed");
+        assert!(store.sqlite.get_memory_versions_raw(&id.0, 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn purge_all_deleted_cleans_versions_and_vision_rows() {
+        let (store, _dir) = make_store().await;
+
+        let node = MemoryNode::new("bulk versioned + captioned", MemoryType::Semantic);
+        let id = node.id.clone();
+        store.sqlite.insert_memory(&node).await.unwrap();
+        store.sqlite.log_memory_version(&node, Some("test"), Some("v0")).await.unwrap();
+        store.vector.store_vision_embedding(&id, &[0.4, 0.5], None).await.unwrap();
+
+        store.sqlite.delete_memory(&id, &VisibilityScope::global()).await.unwrap();
+        let n = store.sqlite.purge_all_deleted(&VisibilityScope::global()).await.unwrap();
+        assert_eq!(n, 1, "bulk purge with child rows should succeed");
+        assert!(store.sqlite.get_memory_versions_raw(&id.0, 10).await.unwrap().is_empty());
+    }
+
+    // R-04: a content edit snapshots the PRIOR row into memory_versions
+    // (Python parity — get_memory_versions' "each content change creates a
+    // snapshot" contract). Metadata-only updates snapshot nothing.
+    #[tokio::test]
+    async fn update_memory_snapshots_prior_content() {
+        let (store, _dir) = make_store().await;
+
+        let mut node = MemoryNode::new("first draft of the idea", MemoryType::Semantic);
+        let id = node.id.clone();
+        store.sqlite.insert_memory(&node).await.unwrap();
+
+        node.content = "second draft, sharpened".to_string();
+        store.sqlite.update_memory_noted(&node, Some("FORGE"), Some("sharpen"))
+            .await.unwrap();
+
+        let versions = store.sqlite.get_memory_versions_raw(&id.0, 10).await.unwrap();
+        assert_eq!(versions.len(), 1, "content edit must snapshot the prior row");
+        assert_eq!(versions[0]["content"].as_str().unwrap(), "first draft of the idea");
+        assert_eq!(versions[0]["edited_by"].as_str().unwrap(), "FORGE");
+
+        // Metadata-only update (the dream engine's usual write) — no snapshot.
+        node.salience = 0.9;
+        store.sqlite.update_memory(&node).await.unwrap();
+        let versions = store.sqlite.get_memory_versions_raw(&id.0, 10).await.unwrap();
+        assert_eq!(versions.len(), 1, "metadata-only update must not snapshot");
+    }
+
     // CB-022 (set form): purge_all_deleted must also clear links of every
     // soft-deleted memory before the bulk DELETE.
     #[tokio::test]
@@ -1464,10 +1528,12 @@ mod cortex_pipeline {
             None, None, None, VisibilityScope::global(),
         ).await.unwrap();
         // Content deliberately shares NO keywords with the query — reachable
-        // only via the associative link.
-        let private = cortex.remember(
+        // only via the associative link. Explicitly private (R-05: remember
+        // defaults to Shared now, Python parity).
+        let private = cortex.remember_with_visibility(
             "meadow rituals and quiet unrelated things",
             None, None, None, VisibilityScope::for_agent(alice.clone()),
+            Some(Visibility::Private),
         ).await.unwrap();
         cortex.associate(
             seed.id.clone(), private.id.clone(),
@@ -1563,10 +1629,12 @@ mod cortex_pipeline {
         // must see ONLY visibility=shared — private never crosses the wire.
         let (cortex, _dir) = make_cortex().await;
         let apex = AgentId("APEX".into());
-        // Agent-scoped remember → Private; global remember → Shared.
-        cortex.remember(
+        // Explicitly-private agent memory vs a shared (default) global one
+        // (R-05: remember defaults to Shared regardless of scope now).
+        cortex.remember_with_visibility(
             "sqlite calibration detail this node keeps to itself".to_string(),
             None, None, None, VisibilityScope::for_agent(apex.clone()),
+            Some(Visibility::Private),
         ).await.unwrap();
         let published = cortex.remember(
             "sqlite calibration wisdom published for the colony".to_string(),

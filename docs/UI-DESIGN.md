@@ -83,6 +83,30 @@ ledger** (outcome counts, Wilson rank, champion badges — the ledger deserves a
 UI), intentions, schemas with sources, tags, trash lifecycle, dream runs,
 audit summary. Nothing modal; the sky stays visible behind a translucent rail.
 
+**CRUD is in scope** — the API already supports all of it: create (a compose
+box that stores through the real `remember` pipeline, thalamus gate included —
+a rejection is shown honestly), edit (content/tags/salience/visibility; content
+edits version-snapshot server-side), trash lifecycle (soft-delete → restore →
+purge, purge behind a confirm), and link-drawing: in focus mode, select a
+second star to `associate` them with a chosen link type. Destructive actions
+never live on the field itself — the sky is for reading; the card is for acting.
+
+**Settings drawer** — lens defaults, motion/glow intensity (and a reduced-
+motion override), label density, Live poll cadence, API token. Persisted in
+`localStorage`; the server stays stateless about UI preferences.
+
+### Interaction rules (field feedback, 2026-08-07)
+
+Locked after the U0 mockup review — the mockup's card-on-hover made sweeping
+the cursor across the field thrash the card panel:
+
+- **Hover** = highlight only: ring + a small name/type tooltip at the cursor.
+  Nothing opens, nothing moves elsewhere on screen.
+- **Click** = select: the memory card opens **pinned** until dismissed
+  (background click / Esc / another selection). Sweeping the mouse can never
+  change the selection.
+- Focus (neighbors + edges lit) follows selection, not hover.
+
 ## Architecture
 
 ```
@@ -126,7 +150,8 @@ env/config.
 | Step | Scope | Gate |
 |------|-------|------|
 | U0 | this charter | merged |
-| U1 | `/graph/export` + `/graph/layout` + ui-web shell with Atlas lens (pan/zoom/hover/focus/search) | field renders a real brain from a real DB |
+| U1 | `/graph/export` + `/graph/layout` + ui-web shell with Atlas lens (pan/zoom/hover/select/search) | field renders a real brain from a real DB |
+| U1b | settings drawer + memory CRUD + link-drawing (instruments over existing routes) | a memory created, edited, and trashed from the UI round-trips |
 | U2 | trace-carrying recall + Thought lens ripple | a typed query animates its real spread |
 | U3 | SSE audit tail + Live lens glow | an MCP `remember` from another terminal ripples in ≤2s |
 | U4 | Dream observatory + `/dream/reports` | a real dream cycle scrubbable |

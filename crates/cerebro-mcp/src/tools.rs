@@ -30,7 +30,7 @@ fn tool_schema(name: &str) -> Value {
                     "visibility": {
                         "type": "string",
                         "enum": ["private","shared","thread"],
-                        "description": "Who can see this memory"
+                        "description": "Who can see this memory. Default: shared (Python parity). private requires agent_id — an owner-less private row would be visible to no one."
                     }
                 },
                 "required": ["content"]
@@ -137,7 +137,12 @@ fn tool_schema(name: &str) -> Value {
                         "enum": ["episodic","semantic","procedural","affective","prospective","schematic"],
                         "description": "Memory type (auto-classified if omitted)"
                     },
-                    "salience": { "type": "number", "description": "Importance 0-1 (auto-estimated if omitted)" }
+                    "salience": { "type": "number", "description": "Importance 0-1 (auto-estimated if omitted)" },
+                    "visibility": {
+                        "type": "string",
+                        "enum": ["private","shared","thread"],
+                        "description": "Who can see this memory. Default: shared (Python parity). private requires agent_id — an owner-less private row would be visible to no one."
+                    }
                 },
                 "required": ["content"]
             }

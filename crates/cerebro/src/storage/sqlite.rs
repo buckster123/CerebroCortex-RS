@@ -2,7 +2,7 @@ use std::{collections::HashMap, path::Path, sync::{Arc, OnceLock}};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::sync::Mutex;
 
@@ -752,8 +752,53 @@ impl SqliteStore {
     }
 
     pub async fn update_memory(&self, node: &MemoryNode) -> Result<()> {
-        let conn = self.conn.lock().await;
-        conn.execute(
+        self.update_memory_noted(node, None, None).await
+    }
+
+    /// `update_memory` plus version provenance. When the incoming content
+    /// differs from the stored row, the PRIOR row is snapshotted into
+    /// `memory_versions` first (Python parity: cortex.update_memory saves a
+    /// version before every content edit — R-04; the retention sweep caps the
+    /// table at `CEREBRO_RETAIN_VERSIONS`). Metadata-only updates (salience,
+    /// tags, FSRS state — the dream engine's bread and butter) snapshot
+    /// nothing. Snapshot + UPDATE run inside one transaction.
+    pub async fn update_memory_noted(
+        &self,
+        node: &MemoryNode,
+        edited_by: Option<&str>,
+        change_note: Option<&str>,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().await;
+        let tx = conn.transaction()?;
+        let prior: Option<(String, String, f64, String)> = tx
+            .query_row(
+                "SELECT content, tags, salience, visibility \
+                 FROM memories WHERE id = ? AND deleted_at IS NULL",
+                params![node.id.0],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        if let Some((old_content, old_tags, old_salience, old_visibility)) = prior {
+            if old_content != node.content {
+                tx.execute(
+                    "INSERT INTO memory_versions \
+                     (memory_id, content, tags_json, salience, visibility, \
+                      edited_by, edited_at, change_note) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        node.id.0,
+                        old_content,
+                        old_tags,
+                        old_salience,
+                        old_visibility,
+                        edited_by,
+                        Utc::now().to_rfc3339(),
+                        change_note,
+                    ],
+                )?;
+            }
+        }
+        tx.execute(
             "UPDATE memories SET \
              content=?2, memory_type=?3, layer=?4, salience=?5, tags=?6, agent_id=?7, \
              visibility=?8, thread_id=?9, emotional_valence=?10, emotional_intensity=?11, \
@@ -781,6 +826,7 @@ impl SqliteStore {
                 serde_json::to_string(&node.metadata)?,
             ],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -920,7 +966,6 @@ impl SqliteStore {
         content: &str,
         agent_id: Option<&str>,
     ) -> Result<Option<MemoryId>> {
-        use rusqlite::OptionalExtension;
         let conn = self.conn.lock().await;
         let id: Option<String> = conn
             .query_row(
@@ -1063,6 +1108,11 @@ impl SqliteStore {
             "DELETE FROM links WHERE source_id = ?1 OR target_id = ?1",
             params![id.0],
         )?;
+        // memory_versions + vision_embeddings both REFERENCE memories(id) with
+        // no CASCADE, and foreign_keys=ON — leaving them fails the parent
+        // DELETE with SQLITE_CONSTRAINT (R-06).
+        tx.execute("DELETE FROM memory_versions WHERE memory_id = ?", params![id.0])?;
+        tx.execute("DELETE FROM vision_embeddings WHERE memory_id = ?", params![id.0])?;
         let changed = tx.execute("DELETE FROM memories WHERE id = ?", params![id.0])?;
         tx.commit()?;
         Ok(changed > 0)
@@ -1098,6 +1148,16 @@ impl SqliteStore {
         )?;
         tx.execute(
             &format!("DELETE FROM links WHERE target_id IN ({doomed})"),
+            dp.as_slice(),
+        )?;
+        // Same FK-safety as purge_memory (R-06): versions + vision rows must
+        // go before their parent memories.
+        tx.execute(
+            &format!("DELETE FROM memory_versions WHERE memory_id IN ({doomed})"),
+            dp.as_slice(),
+        )?;
+        tx.execute(
+            &format!("DELETE FROM vision_embeddings WHERE memory_id IN ({doomed})"),
             dp.as_slice(),
         )?;
         let changed = tx.execute(
