@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lucida — CerebroCortex Observatory</title>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='3' fill='%233a7de0'/><circle cx='8' cy='8' r='7' fill='none' stroke='%233a7de0' stroke-opacity='.35'/></svg>">
+</head>
+<body>
+
+<canvas id="field" aria-label="Memory starfield — drag to pan, wheel to zoom, click a star to open its card"></canvas>
+<div id="tooltip"></div>
+
+<header id="bar">
+  <div id="wordmark">
+    <span class="name">LUCIDA</span>
+    <span class="sub">CEREBROCORTEX · OBSERVATORY</span>
+  </div>
+  <nav id="lenses" aria-label="Lens">
+    <button data-lens="atlas"   aria-pressed="true">ATLAS</button>
+    <button data-lens="thought" aria-pressed="false">THOUGHT</button>
+    <button data-lens="dream"   aria-pressed="false">DREAM</button>
+    <button data-lens="health"  aria-pressed="false">HEALTH</button>
+    <button data-lens="live"    aria-pressed="false">LIVE</button>
+  </nav>
+  <div id="query-wrap">
+    <input id="query" placeholder="recall…" aria-label="Recall query" />
+    <button id="recall-btn" title="Recall through the real pipeline">RECALL</button>
+  </div>
+  <span id="agent-chip" title="Visibility scope (set ?agent=NAME in the URL)"></span>
+</header>
+
+<aside id="card" aria-live="polite">
+  <div class="type-row">
+    <span class="chip" id="card-chip"></span>
+    <span class="type-label" id="card-type"></span>
+    <span class="mem-id" id="card-id"></span>
+    <button id="card-close" aria-label="Close card">✕</button>
+  </div>
+  <div class="content" id="card-content"></div>
+  <div class="tags" id="card-tags"></div>
+  <div class="stats">
+    <div class="stat"><div class="k">salience</div><div class="v" id="card-sal"></div></div>
+    <div class="stat"><div class="k">activation</div><div class="v" id="card-act"></div></div>
+    <div class="stat"><div class="k">retrievability</div><div class="v" id="card-ret"></div></div>
+    <div class="stat"><div class="k">accesses</div><div class="v" id="card-acc"></div></div>
+    <div class="stat"><div class="k">layer</div><div class="v" id="card-layer"></div></div>
+    <div class="stat"><div class="k">born</div><div class="v" id="card-born"></div></div>
+  </div>
+</aside>
+
+<aside id="results">
+  <div class="panel-head">
+    <h2>RECALLED</h2>
+    <button id="results-clear" aria-label="Clear recall">✕</button>
+  </div>
+  <div class="meta" id="results-meta"></div>
+  <ol id="results-list"></ol>
+</aside>
+
+<aside id="health-panel">
+  <h2>MEMORY HEALTH</h2>
+  <div class="hrow"><span class="hk">Graph components</span><span class="hv" id="h-comp"></span></div>
+  <div class="hrow"><span class="hk">Isolated memories</span><span class="hv" id="h-iso"></span></div>
+  <div class="hrow"><span class="hk">Never-traversed links</span><span class="hv" id="h-cold"></span></div>
+  <div class="hrow"><span class="hk">Largest component</span><span class="hv" id="h-largest"></span></div>
+  <p class="note">Cold links render blue; isolated memories are ringed. Numbers from <code>memory_health</code>.</p>
+</aside>
+
+<div id="placard" role="dialog" aria-modal="false">
+  <div class="inner">
+    <span class="phase-tag" id="placard-phase"></span>
+    <h2 id="placard-title"></h2>
+    <p id="placard-body"></p>
+  </div>
+</div>
+
+<div id="telemetry">
+  <div class="cell"><div class="k">memories</div><div class="v" id="t-mem">—</div></div>
+  <div class="cell"><div class="k">links</div><div class="v" id="t-links">—</div></div>
+  <div class="cell"><div class="k">cold links</div><div class="v" id="t-cold">—</div></div>
+  <div class="cell"><div class="k">components</div><div class="v" id="t-comp">—</div></div>
+</div>
+
+<div id="legend" aria-label="Memory types">
+  <div class="row"><span class="chip" style="color:#c07f28;background:#c07f28"></span><span class="lab">episodic</span></div>
+  <div class="row"><span class="chip" style="color:#2fa8a0;background:#2fa8a0"></span><span class="lab">affective</span></div>
+  <div class="row"><span class="chip" style="color:#3a7de0;background:#3a7de0"></span><span class="lab">semantic</span></div>
+  <div class="row"><span class="chip" style="color:#3aa76c;background:#3aa76c"></span><span class="lab">prospective</span></div>
+  <div class="row"><span class="chip" style="color:#8f6ee0;background:#8f6ee0"></span><span class="lab">procedural</span></div>
+  <div class="row"><span class="chip" style="color:#cf5d96;background:#cf5d96"></span><span class="lab">schematic</span></div>
+</div>
+
+<div id="notice" hidden></div>
+
+<script src="app.js"></script>
+</body>
+</html>

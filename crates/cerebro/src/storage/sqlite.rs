@@ -735,6 +735,82 @@ impl SqliteStore {
         Ok(out)
     }
 
+    // -- graph_layout: the cached 2D semantic projection (Lucida U1) ---------
+
+    /// Every live memory's stored text embedding, decoded — the projection
+    /// input. (f32 LE blobs; empty when the embedder is disabled.)
+    pub async fn list_embeddings(&self) -> Result<Vec<(MemoryId, Vec<f32>)>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT id, embedding FROM memories \
+             WHERE embedding IS NOT NULL AND deleted_at IS NULL",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((MemoryId(r.get::<_, String>(0)?), r.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, blob) = row?;
+            out.push((id, crate::storage::vector::blob_to_vec(&blob)));
+        }
+        Ok(out)
+    }
+
+    /// Count of live embedded memories — the layout-staleness denominator.
+    pub async fn count_embedded(&self) -> Result<usize> {
+        let conn = self.conn.lock().await;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM memories \
+             WHERE embedding IS NOT NULL AND deleted_at IS NULL",
+            [], |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
+    /// Replace the whole cached layout in one transaction (a projection is
+    /// global — axes shift together, so partial updates would lie).
+    pub async fn replace_layout(&self, coords: &[(MemoryId, f32, f32)]) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock().await;
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM graph_layout", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO graph_layout (memory_id, x, y, computed_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for (id, x, y) in coords {
+                stmt.execute(params![id.0, *x as f64, *y as f64, now])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The cached layout, plus its computed_at stamp (None when empty).
+    pub async fn get_layout(&self) -> Result<(Vec<(MemoryId, f32, f32)>, Option<String>)> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT memory_id, x, y, computed_at FROM graph_layout",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                MemoryId(r.get::<_, String>(0)?),
+                r.get::<_, f64>(1)? as f32,
+                r.get::<_, f64>(2)? as f32,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        let mut stamp: Option<String> = None;
+        for row in rows {
+            let (id, x, y, at) = row?;
+            stamp = Some(at);
+            out.push((id, x, y));
+        }
+        Ok((out, stamp))
+    }
+
     pub async fn delete_memory(&self, id: &MemoryId, scope: &VisibilityScope) -> Result<bool> {
         let (scope_sql, scope_params) = scope.sql_filter();
         let conn = self.conn.lock().await;
@@ -2588,6 +2664,18 @@ CREATE TABLE IF NOT EXISTS vision_embeddings (
     image_path  TEXT,
     created_at  TEXT NOT NULL,
     FOREIGN KEY (memory_id) REFERENCES memories(id)
+);
+
+-- Cached 2D semantic projection of memory embeddings (Lucida U1). Written by
+-- cerebro-api's /graph/layout (PCA over memories.embedding); the field's star
+-- positions. ON DELETE CASCADE: layout rows are pure derivation, so a purge
+-- must never trip over them (the R-06 lesson, applied at birth).
+CREATE TABLE IF NOT EXISTS graph_layout (
+    memory_id   TEXT PRIMARY KEY,
+    x           REAL NOT NULL,
+    y           REAL NOT NULL,
+    computed_at TEXT NOT NULL,
+    FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
 );
 
 -- FTS5 virtual table for keyword search (FTS5 fallback when vector search unavailable)

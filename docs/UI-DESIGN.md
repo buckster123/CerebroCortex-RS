@@ -150,7 +150,7 @@ env/config.
 | Step | Scope | Gate |
 |------|-------|------|
 | U0 | this charter | merged |
-| U1 | `/graph/export` + `/graph/layout` + ui-web shell with Atlas lens (pan/zoom/hover/select/search) | field renders a real brain from a real DB |
+| U1 | `/graph/export` + `/graph/layout` + ui-web shell with Atlas lens (pan/zoom/hover/select/search) | field renders a real brain from a real DB — **shipped 2026-08-08; gate passed against the dev brain (369 memories / 5,885 links)** |
 | U1b | settings drawer + memory CRUD + link-drawing (instruments over existing routes) | a memory created, edited, and trashed from the UI round-trips |
 | U2 | trace-carrying recall + Thought lens ripple | a typed query animates its real spread |
 | U3 | SSE audit tail + Live lens glow | an MCP `remember` from another terminal ripples in ≤2s |
@@ -160,6 +160,23 @@ env/config.
 
 Each step is one PR, tests riding. U1 is the bulk; everything after is
 additive.
+
+## U1 field notes (2026-08-08)
+
+- **Edge LOD is not optional.** The dev brain averages 31 links/node (auto-link
+  + Hebbian encoding); drawing all of them at overview zoom IS the forbidden
+  hairball. Shipped rule: edges ranked by effective weight once at boot; at
+  overview zoom only the strongest ~8% draw (floor 400), 35% at mid zoom, all
+  when zoomed in — with alpha additionally dimmed by draw count. Health lens
+  exempts cold links (they are the diagnosis).
+- **Backfill is the layout's prerequisite.** Only embedded memories get PCA
+  coords; the dev brain had 37/369 until `cerebro backfill` embedded the rest.
+  Un-embedded memories render honestly on an outer rim, never faked into the map.
+- **Deep links:** `?q=…` boot-runs a recall, `?lens=health` opens a lens,
+  `?agent=NAME` scopes, `?token=…` is consumed into sessionStorage and
+  scrubbed from the URL.
+- The 6-type legend maps `affective` to the teal slot (the mockup's "message"
+  — messages are affective memories with a `message` tag).
 
 ## Out-of-scope (recorded so we don't drift)
 
