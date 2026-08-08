@@ -116,6 +116,42 @@ struct RememberReq {
     tags:        Option<Vec<String>>,
     salience:    Option<f64>,
     agent_id:    Option<String>,
+    /// private|shared|thread; absent → Shared (Python parity, R-05 — the
+    /// MCP twin's contract, mirrored).
+    visibility:  Option<String>,
+}
+
+/// Parse an optional visibility string the way the MCP twin does: absent →
+/// None (cortex defaults Shared), unknown → hard error, never silent.
+fn parse_visibility_opt(v: Option<&str>) -> Result<Option<cerebro::types::Visibility>> {
+    use cerebro::types::Visibility;
+    match v {
+        None => Ok(None),
+        Some(s) => match s.to_lowercase().as_str() {
+            "private" => Ok(Some(Visibility::Private)),
+            "shared"  => Ok(Some(Visibility::Shared)),
+            "thread"  => Ok(Some(Visibility::Thread)),
+            other => anyhow::bail!("unknown visibility '{other}' (private|shared|thread)"),
+        },
+    }
+}
+
+/// Best-effort audit write for API-surface mutations (Lucida U1b): the Live
+/// lens tails the audit log, and what you do in the observatory must show in
+/// its own EEG. Mirrors the MCP dispatch discipline — an audit failure never
+/// fails the call it records.
+async fn audit(
+    brain: &Brain,
+    agent: Option<&str>,
+    action: &str,
+    memory_id: Option<&str>,
+    details: Option<&str>,
+) {
+    if let Err(e) = brain.storage.read().await.sqlite
+        .log_audit_event(agent, action, memory_id, details).await
+    {
+        tracing::warn!("api audit write failed for {action}: {e}");
+    }
 }
 
 #[derive(Deserialize)]
@@ -135,9 +171,10 @@ struct AssociateReq {
 
 #[derive(Deserialize)]
 struct UpdateMemoryReq {
-    content:  Option<String>,
-    tags:     Option<Vec<String>>,
-    salience: Option<f64>,
+    content:    Option<String>,
+    tags:       Option<Vec<String>>,
+    salience:   Option<f64>,
+    visibility: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -287,9 +324,11 @@ async fn remember(
     let mt: Option<MemoryType> = req.memory_type
         .and_then(|s| serde_json::from_value(Value::String(s)).ok());
     let scope = scope_from(req.agent_id.as_deref());
-    let node  = brain.remember(
-        req.content, mt, req.tags, req.salience.map(|f| f as f32), scope,
+    let vis   = parse_visibility_opt(req.visibility.as_deref())?;
+    let node  = brain.remember_with_visibility(
+        req.content, mt, req.tags, req.salience.map(|f| f as f32), scope, vis,
     ).await?;
+    audit(&brain, req.agent_id.as_deref(), "remember", Some(&node.id.0), None).await;
     Ok(Json(serde_json::to_value(&node)?))
 }
 
@@ -335,13 +374,27 @@ async fn update_memory(
     if let Some(c) = req.content  { node.content  = c; }
     if let Some(t) = req.tags     { node.tags      = t; }
     if let Some(s) = req.salience { node.salience  = s as f32; }
-    storage.sqlite.update_memory(&node).await?;
+    // Visibility change mirrors the MCP orphan guard: private + no owner
+    // would be visible to no one.
+    if let Some(vis) = parse_visibility_opt(req.visibility.as_deref())? {
+        if vis == cerebro::types::Visibility::Private && node.agent_id.is_none() {
+            return Err(anyhow::anyhow!(
+                "refusing to privatize an owner-less memory (it would be visible to no one)"
+            ).into());
+        }
+        node.visibility = vis;
+    }
+    // Content edits snapshot the prior row store-side (R-04); the editor
+    // identity is the caller's scope.
+    storage.sqlite.update_memory_noted(&node, q.agent_id.as_deref(), None).await?;
     // CB-006: mirror the MCP update path — re-embed when content changed so the
     // vector index does not point at the pre-edit text (sqlite.update_memory only
     // refreshes the content column + FTS5 trigger, never the embedding/vec0 row).
     if content_changed {
         storage.vector.embed_and_store(&node.id, &node.content).await?;
     }
+    drop(storage);
+    audit(&brain, q.agent_id.as_deref(), "update_memory", Some(&id), None).await;
     Ok(Json(serde_json::to_value(&node)?))
 }
 
@@ -350,8 +403,14 @@ async fn delete_memory(
     Path(id): Path<String>,
     State(brain): State<Brain>,
 ) -> AppResult {
-    let ok = brain.storage.read().await.sqlite
+    // R-08: go through the coordinator wrapper (write guard) so the graph
+    // evicts the node too — the raw sqlite call left deleted memories
+    // spreading activation until restart.
+    let ok = brain.storage.write().await
         .delete_memory(&MemoryId(id.clone()), &VisibilityScope::global()).await?;
+    if ok {
+        audit(&brain, None, "delete_memory", Some(&id), None).await;
+    }
     Ok(Json(json!({ "deleted": ok })))
 }
 
@@ -383,6 +442,8 @@ async fn associate(
         traversal_count: 0,
     };
     brain.associate(src, tgt, link).await?;
+    audit(&brain, None, "associate", Some(&req.source_id),
+        Some(&format!("→ {}", req.target_id))).await;
     Ok(Json(json!({ "status": "ok" })))
 }
 
@@ -840,6 +901,17 @@ async fn graph_layout_recompute(State(brain): State<Brain>) -> AppResult {
     layout_inner(brain, true).await
 }
 
+/// The observatory's identity line (Lucida U1b): which skull are you inside?
+/// Set once in main() from the resolved config; "unknown" in router tests.
+static DB_LABEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+async fn meta() -> AppResult {
+    Ok(Json(json!({
+        "db_path": DB_LABEL.get().map(String::as_str).unwrap_or("unknown"),
+        "version": env!("CARGO_PKG_VERSION"),
+    })))
+}
+
 #[derive(Deserialize)]
 struct EventsQuery {
     /// Replay from this audit rowid (exclusive). Default: only what happens
@@ -1109,8 +1181,14 @@ async fn restore_trash(
     Path(memory_id): Path<String>,
     State(brain): State<Brain>,
 ) -> AppResult {
-    let ok = brain.storage.read().await.sqlite
-        .restore_memory(&MemoryId(memory_id), &VisibilityScope::global()).await?;
+    // R-08: coordinator wrappers (write guard) keep the graph in step —
+    // restore rebuilds the node AND its links; the raw sqlite calls left the
+    // graph stale until restart.
+    let ok = brain.storage.write().await
+        .restore_memory(&MemoryId(memory_id.clone()), &VisibilityScope::global()).await?;
+    if ok {
+        audit(&brain, None, "restore_memory", Some(&memory_id), None).await;
+    }
     Ok(Json(json!({ "restored": ok })))
 }
 
@@ -1118,15 +1196,23 @@ async fn purge_trash(
     Path(memory_id): Path<String>,
     State(brain): State<Brain>,
 ) -> AppResult {
-    let ok = brain.storage.read().await.sqlite
-        .purge_memory(&MemoryId(memory_id), &VisibilityScope::global()).await?;
+    let ok = brain.storage.write().await
+        .purge_memory(&MemoryId(memory_id.clone()), &VisibilityScope::global()).await?;
+    if ok {
+        audit(&brain, None, "purge_memory", Some(&memory_id), None).await;
+    }
     Ok(Json(json!({ "purged": ok })))
 }
 
 async fn purge_all_trash(
     State(brain): State<Brain>,
 ) -> AppResult {
-    let count = brain.storage.read().await.sqlite.purge_all_deleted(&VisibilityScope::global()).await?;
+    let count = brain.storage.read().await.sqlite
+        .purge_all_deleted(&VisibilityScope::global()).await?;
+    if count > 0 {
+        audit(&brain, None, "purge_all_deleted", None,
+            Some(&format!("{count} purged"))).await;
+    }
     Ok(Json(json!({ "purged": count })))
 }
 
@@ -1134,8 +1220,13 @@ async fn bulk_delete(
     State(brain): State<Brain>,
     Json(req): Json<BulkDeleteReq>,
 ) -> AppResult {
+    // R-08: wrapper form — evicts each actually-deleted id from the graph.
     let ids: Vec<MemoryId> = req.ids.into_iter().map(MemoryId).collect();
-    let count = brain.storage.read().await.sqlite.bulk_delete(&ids, &VisibilityScope::global()).await?.len();
+    let count = brain.storage.write().await
+        .bulk_delete(&ids, &VisibilityScope::global()).await?;
+    if count > 0 {
+        audit(&brain, None, "bulk_delete", None, Some(&format!("{count} deleted"))).await;
+    }
     Ok(Json(json!({ "deleted": count })))
 }
 
@@ -1212,6 +1303,7 @@ async fn main() -> Result<()> {
         .init();
 
     let config = cerebro::config::Config::from_env()?;
+    let _ = DB_LABEL.set(config.db_path.display().to_string());
     let brain: Brain = Arc::new(CerebroCortex::new(config).await?);
 
     let app = build_router(brain);
@@ -1233,6 +1325,7 @@ fn build_router(brain: Brain) -> Router {
         .route("/recall/trace",    post(recall_trace))
         .route("/events",          get(events))
         .route("/audit/since/{id}", get(audit_since))
+        .route("/meta",            get(meta))
         // Core
         .route("/health",          get(health))
         .route("/stats",           get(stats))

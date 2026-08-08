@@ -19,7 +19,21 @@ same flaw (spreading.py:155, reference only — do not modify). Regression test
 `full_seed_page_still_spreads` rides. Measured on the dev brain: same query
 went 0 walks → 75 walks, top score 0.415 → 0.62.
 
-## 2. Traced recall (feature — port with or ahead of any Lucida upstreaming)
+## 2. Ghost-FK repair for Python-migrated DBs (HIGH — ships WITH item 1/W-A or before)
+
+`repair_ghost_fk_memory_versions` in `SqliteStore::open()` (CC-RS PR #27,
+2026-08-08): a Python-created DB already HAS `memory_versions`, so SCHEMA_SQL's
+IF NOT EXISTS skips it — and the Python FK references `memory_nodes`, which
+migration renamed and the reap dropped. With `foreign_keys=ON`, any version
+snapshot (W-A R-04) or purge cleanup (W-A R-06) then fails
+"no such table: main.memory_nodes". **Every colony brain is Python-migrated**
+— land this repair in the same wave as the W-A port or update_memory/purge
+break in the field. Probe is cheap and runs every open; rebuild preserves
+rows + ids. Test: `python_ghost_fk_memory_versions_repaired_on_open`.
+(Also present in migrated DBs: an inert Python `attachments` table with the
+same ghost FK — nothing writes it; left alone.)
+
+## 3. Traced recall (feature — port with or ahead of any Lucida upstreaming)
 
 `spread_events` + `TraceEvent` (spreading.rs), `recall_traced` + `RecallTrace`
 (cortex.rs; `recall` is now a thin wrapper), `POST /recall/trace` (cerebro-api).

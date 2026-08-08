@@ -1126,6 +1126,60 @@ mod storage_basic {
         assert!(store.sqlite.get_layout().await.unwrap().0.is_empty());
     }
 
+    // The ghost-FK repair (U1b field find): a Python-migrated DB carries a
+    // memory_versions whose FK references the dropped memory_nodes — every
+    // R-04 snapshot and R-06 purge then fails "no such table". Reopening
+    // must rebuild the table (data intact) with the canonical FK.
+    #[tokio::test]
+    async fn python_ghost_fk_memory_versions_repaired_on_open() {
+        use cerebro::storage::sqlite::SqliteStore;
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("test.db");
+
+        {
+            let store = SqliteStore::open(&db).await.unwrap();
+            let node = MemoryNode::new("survives the table rebuild", MemoryType::Semantic);
+            store.insert_memory(&node).await.unwrap();
+            store.log_memory_version(&node, Some("py-era"), Some("v0")).await.unwrap();
+        }
+        // Simulate the Python residue: same columns, FK aimed at the ghost.
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "PRAGMA foreign_keys=OFF;
+                 CREATE TABLE mv_py (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     memory_id TEXT NOT NULL, content TEXT NOT NULL,
+                     tags_json TEXT NOT NULL DEFAULT '[]', salience REAL NOT NULL,
+                     visibility TEXT NOT NULL, edited_by TEXT,
+                     edited_at TEXT NOT NULL, change_note TEXT,
+                     FOREIGN KEY (memory_id) REFERENCES memory_nodes(id) ON DELETE CASCADE
+                 );
+                 INSERT INTO mv_py SELECT * FROM memory_versions;
+                 DROP TABLE memory_versions;
+                 ALTER TABLE mv_py RENAME TO memory_versions;",
+            ).unwrap();
+        }
+
+        // Reopen: the repair must fire, keep the row, and unbreak writes.
+        let store = SqliteStore::open(&db).await.unwrap();
+        let mut node = store
+            .list_memories_scoped(&VisibilityScope::global(), &Default::default())
+            .await.unwrap().pop().unwrap();
+        let versions = store.get_memory_versions_raw(&node.id.0, 10).await.unwrap();
+        assert_eq!(versions.len(), 1, "pre-repair snapshot must survive the rebuild");
+        assert_eq!(versions[0]["change_note"], "v0");
+
+        // R-04 write path works again…
+        node.content = "edited after repair".into();
+        store.update_memory_noted(&node, Some("FORGE"), None).await.unwrap();
+        assert_eq!(store.get_memory_versions_raw(&node.id.0, 10).await.unwrap().len(), 2);
+
+        // …and so does the R-06 purge (FK now resolves against memories).
+        store.delete_memory(&node.id, &VisibilityScope::global()).await.unwrap();
+        assert!(store.purge_memory(&node.id, &VisibilityScope::global()).await.unwrap());
+    }
+
     // U3 (the Live lens): the SSE tail's cursor primitives — rowid-strict,
     // oldest-first, capped, and never skipping a burst.
     #[tokio::test]

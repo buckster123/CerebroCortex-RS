@@ -28,7 +28,9 @@
     <input id="query" placeholder="recall…" aria-label="Recall query" />
     <button id="recall-btn" title="Recall through the real pipeline">RECALL</button>
   </div>
+  <button id="compose-btn" title="Store a new memory through the real pipeline">+ NEW</button>
   <span id="agent-chip" title="Visibility scope (set ?agent=NAME in the URL)"></span>
+  <button id="settings-btn" aria-label="Settings" title="Settings">⚙</button>
 </header>
 
 <aside id="card" aria-live="polite">
@@ -47,6 +49,31 @@
     <div class="stat"><div class="k">accesses</div><div class="v" id="card-acc"></div></div>
     <div class="stat"><div class="k">layer</div><div class="v" id="card-layer"></div></div>
     <div class="stat"><div class="k">born</div><div class="v" id="card-born"></div></div>
+  </div>
+  <div class="card-actions">
+    <button id="card-edit">EDIT</button>
+    <button id="card-link">DRAW LINK</button>
+    <select id="card-linktype" title="Link type for DRAW LINK">
+      <option>semantic</option><option>causal</option><option>temporal</option>
+      <option>supports</option><option>contradicts</option><option>contextual</option>
+      <option>derived_from</option><option>part_of</option><option>affective</option>
+    </select>
+    <button id="card-trash" class="danger">TRASH</button>
+  </div>
+  <div id="card-editform" hidden>
+    <textarea id="e-content" rows="5"></textarea>
+    <input id="e-tags" placeholder="tags, comma, separated">
+    <div class="formrow">
+      <input id="e-salience" type="number" min="0" max="1" step="0.05">
+      <select id="e-vis">
+        <option>shared</option><option>private</option><option>thread</option>
+      </select>
+    </div>
+    <div class="btnrow">
+      <button id="e-save">SAVE</button>
+      <button id="e-cancel">CANCEL</button>
+      <span id="e-status"></span>
+    </div>
   </div>
 </aside>
 
@@ -99,6 +126,69 @@
   <div class="row"><span class="chip" style="color:#8f6ee0;background:#8f6ee0"></span><span class="lab">procedural</span></div>
   <div class="row"><span class="chip" style="color:#cf5d96;background:#cf5d96"></span><span class="lab">schematic</span></div>
 </div>
+
+<aside id="settings" aria-label="Settings drawer">
+  <h2>SETTINGS</h2>
+
+  <div class="sec">MOTION</div>
+  <label class="row"><span>Twinkle</span><input type="checkbox" id="s-twinkle"></label>
+  <label class="row"><span>Ripple speed <em id="s-hop-val"></em></span>
+    <input type="range" id="s-hop" min="300" max="2000" step="50"></label>
+
+  <div class="sec">FIELD</div>
+  <label class="row"><span>Edge density</span>
+    <select id="s-density">
+      <option value="0.5">sparse</option>
+      <option value="1">normal</option>
+      <option value="2">dense</option>
+    </select></label>
+  <label class="row"><span>Recall top-k <em id="s-topk-val"></em></span>
+    <input type="range" id="s-topk" min="5" max="25" step="1"></label>
+  <label class="row"><span>Default lens</span>
+    <select id="s-lens">
+      <option>atlas</option><option>thought</option><option>health</option><option>live</option>
+    </select></label>
+
+  <div class="sec">LIVE</div>
+  <label class="row"><span>Ticker depth <em id="s-ticker-val"></em></span>
+    <input type="range" id="s-ticker" min="20" max="100" step="10"></label>
+  <label class="row"><span>Pause stream</span><input type="checkbox" id="s-pause"></label>
+
+  <div class="sec">DATA</div>
+  <div class="kv"><span>brain</span><code id="s-db" title=""></code></div>
+  <div class="kv"><span>scope</span><code id="s-scope"></code></div>
+  <div class="kv"><span>version</span><code id="s-version"></code></div>
+  <div class="btnrow">
+    <button id="s-relayout" title="POST /graph/layout — recompute the projection (after a dream or big ingest)">RECOMPUTE LAYOUT</button>
+    <button id="s-reload" title="Re-fetch the field">RELOAD FIELD</button>
+  </div>
+
+  <div class="sec">TRASH</div>
+  <div id="s-trash-list" class="trash-list"></div>
+  <div class="btnrow"><button id="s-trash-refresh">REFRESH TRASH</button></div>
+</aside>
+
+<aside id="compose" aria-label="New memory">
+  <h2>NEW MEMORY <button id="compose-close" aria-label="Close">✕</button></h2>
+  <textarea id="c-content" rows="5" placeholder="What is worth remembering? (thalamus gates < 10 chars)"></textarea>
+  <div class="formrow">
+    <select id="c-type">
+      <option value="">auto type</option>
+      <option>episodic</option><option>semantic</option><option>procedural</option>
+      <option>affective</option><option>prospective</option><option>schematic</option>
+    </select>
+    <select id="c-vis">
+      <option value="shared">shared</option>
+      <option value="private">private</option>
+    </select>
+    <input id="c-salience" type="number" min="0" max="1" step="0.05" placeholder="salience auto">
+  </div>
+  <input id="c-tags" placeholder="tags, comma, separated">
+  <div class="btnrow">
+    <button id="c-store">STORE</button>
+    <span id="c-status"></span>
+  </div>
+</aside>
 
 <div id="notice" hidden></div>
 
