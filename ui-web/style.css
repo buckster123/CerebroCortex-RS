@@ -140,11 +140,11 @@ button, input { font: inherit; color: inherit; }
   margin: 0 0 2px; font-family: var(--mono); font-size: 10px;
   letter-spacing: 0.16em; color: var(--ink-2); font-weight: 600; flex: 1;
 }
-#results-clear {
+#results-clear, #results-replay {
   border: 0; background: transparent; color: var(--ink-3); cursor: pointer;
   font-size: 12px; padding: 2px 4px; border-radius: 4px;
 }
-#results-clear:hover { color: var(--ink); background: rgba(122,152,199,0.12); }
+#results-clear:hover, #results-replay:hover { color: var(--ink); background: rgba(122,152,199,0.12); }
 #results .meta { font-family: var(--mono); font-size: 9.5px; color: var(--ink-3); margin-bottom: 10px; }
 #results ol {
   margin: 0; padding: 0; list-style: none;
