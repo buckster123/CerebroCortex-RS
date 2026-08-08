@@ -840,6 +840,72 @@ async fn graph_layout_recompute(State(brain): State<Brain>) -> AppResult {
     layout_inner(brain, true).await
 }
 
+#[derive(Deserialize)]
+struct EventsQuery {
+    /// Replay from this audit rowid (exclusive). Default: only what happens
+    /// after connect (MAX(id) at open).
+    since:   Option<i64>,
+    /// Poll cadence in ms, clamped 250..=5000. A U1b settings-drawer knob.
+    poll_ms: Option<u64>,
+}
+
+/// GET /audit/since/{id} — the audit tail as plain JSON (rows strictly after
+/// the given rowid, oldest first, capped at 200). The Live lens uses this to
+/// replay history at boot before opening the SSE stream; also the REST
+/// surface's first audit read.
+async fn audit_since(
+    Path(id): Path<i64>,
+    State(brain): State<Brain>,
+) -> AppResult {
+    let rows = brain.storage.read().await.sqlite.list_audit_since(id, 200).await?;
+    Ok(Json(json!({ "rows": rows })))
+}
+
+/// GET /events — the Live lens (Lucida U3): an SSE tail of the audit log.
+/// Every mutating MCP tool call leaves an audit row (colony C3); this streams
+/// them as they land, so the observatory shows the brain being used — no IPC,
+/// the shared SQLite is already the bus. Each SSE message is a JSON array of
+/// audit rows (one poll batch); silence is covered by keep-alive comments.
+/// EventSource can't set headers, so auth rides the ?token= query param the
+/// middleware already accepts.
+async fn events(
+    Query(q): Query<EventsQuery>,
+    State(brain): State<Brain>,
+) -> impl IntoResponse {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    let poll = std::time::Duration::from_millis(q.poll_ms.unwrap_or(1000).clamp(250, 5000));
+
+    let stream = async_stream::stream! {
+        let mut cursor: i64 = match q.since {
+            Some(s) => s,
+            None => brain.storage.read().await.sqlite.max_audit_id().await.unwrap_or(0),
+        };
+        let mut tick = tokio::time::interval(poll);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let batch = brain.storage.read().await.sqlite
+                .list_audit_since(cursor, 200).await;
+            match batch {
+                Ok(rows) if !rows.is_empty() => {
+                    if let Some(last) = rows.last().and_then(|r| r["id"].as_i64()) {
+                        cursor = last;
+                    }
+                    let data = serde_json::to_string(&rows)
+                        .unwrap_or_else(|_| "[]".to_string());
+                    yield Ok::<_, std::convert::Infallible>(
+                        Event::default().event("audit").data(data));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!("/events poll failed: {e}");
+                }
+            }
+        }
+    };
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
 // The observatory itself — three embedded files, one binary (house rule).
 async fn ui_index() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "text/html; charset=utf-8")],
@@ -1148,14 +1214,25 @@ async fn main() -> Result<()> {
     let config = cerebro::config::Config::from_env()?;
     let brain: Brain = Arc::new(CerebroCortex::new(config).await?);
 
-    let app = Router::new()
-        // Lucida observatory (embedded UI + its two data feeds)
+    let app = build_router(brain);
+    run_server(app).await
+}
+
+/// The full route table, testable without a listener. Path params use the
+/// axum 0.8 brace syntax — under axum 0.7 these were silently LITERAL
+/// segments and every parameterized route 404'd (found 2026-08-08; the
+/// `parameterized_routes_resolve` test pins the semantics).
+fn build_router(brain: Brain) -> Router {
+    Router::new()
+        // Lucida observatory (embedded UI + its data feeds)
         .route("/",                get(ui_index))
         .route("/style.css",       get(ui_css))
         .route("/app.js",          get(ui_js))
         .route("/graph/export",    get(graph_export))
         .route("/graph/layout",    get(graph_layout).post(graph_layout_recompute))
         .route("/recall/trace",    post(recall_trace))
+        .route("/events",          get(events))
+        .route("/audit/since/{id}", get(audit_since))
         // Core
         .route("/health",          get(health))
         .route("/stats",           get(stats))
@@ -1211,8 +1288,10 @@ async fn main() -> Result<()> {
         // Dream
         .route("/dream/run",       post(dream_run))
         .route("/dream/status",    get(dream_status))
-        .with_state(brain);
+        .with_state(brain)
+}
 
+async fn run_server(app: Router) -> Result<()> {
     // Token auth — CEREBRO_API_TOKEN, falling back to AGENTD_TOKEN (the shared
     // secret on an ApexOS node, so those deployments work unchanged).
     // Binds 127.0.0.1 by default; use CEREBRO_API_ADDR=0.0.0.0:8765 for LAN
@@ -1321,6 +1400,40 @@ mod tests {
             "clusters must separate on PC1: a={mean_a} b={mean_b}");
         // Axes are normalized to [-1, 1].
         assert!(coords.iter().all(|c| c.1.abs() <= 1.001 && c.2.abs() <= 1.001));
+    }
+
+    // The axum-0.8 brace-syntax pin: under 0.7 every `{param}` route was a
+    // silent LITERAL segment — the whole parameterized REST surface 404'd
+    // (found 2026-08-08 via the Live lens's /audit/since route). This test
+    // fails on any regression to colon-syntax semantics.
+    #[tokio::test]
+    async fn parameterized_routes_resolve() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = cerebro::config::Config {
+            db_path:       dir.path().join("test.db"),
+            anthropic_key: None,
+            embed_model:   "".into(),
+        };
+        let brain: Brain = Arc::new(CerebroCortex::new(config).await.unwrap());
+        let app = build_router(brain);
+
+        // A parameterized route must MATCH (200 with an empty rows array).
+        let resp = app.clone()
+            .oneshot(Request::get("/audit/since/0").body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "/audit/since/{{id}} must route");
+
+        // A missing memory is the HANDLER's error (500 ApiError), never the
+        // router's 404 — a 404 here means the param syntax broke again.
+        let resp = app
+            .oneshot(Request::get("/memory/nonexistent").body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND,
+            "/memory/{{id}} must route to the handler");
     }
 
     #[test]

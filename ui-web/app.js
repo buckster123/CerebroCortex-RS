@@ -210,7 +210,8 @@ const sy = y => (y - view.y) * view.k + H / 2;
 let lastFrame = -1e9;
 function render(now) {
   requestAnimationFrame(render);
-  const animating = !REDUCED || (thought.trace && !thought.done);
+  while (pulses.length && now - pulses[0].t0 > 8000) pulses.shift();
+  const animating = !REDUCED || (thought.trace && !thought.done) || pulses.length > 0;
   if (!dirty && !animating) return;
   if (now - lastFrame < 30) return;
   lastFrame = now; dirty = false;
@@ -310,6 +311,9 @@ function render(now) {
       if (i !== selectedIdx && !isNeighbor) act *= 0.22;
     }
     if (searchSet && !searchSet.has(i) && i !== selectedIdx) act *= 0.15;
+    for (const p of pulses) {
+      if (p.idx === i) act = Math.min(1, act + Math.max(0, 1 - (now - p.t0) / 8000) * 0.6);
+    }
     if (!REDUCED) act *= 0.93 + 0.07 * Math.sin(t * 1.7 + n.twinkle);
 
     const layerBoost = n.layer === 'working' ? 1.25 : 1;
@@ -324,6 +328,25 @@ function render(now) {
     ctx.fillRect(x - 0.7, y - 0.7, 1.4, 1.4);
   }
   ctx.restore();
+
+  /* live pulses: an expanding ring + lingering warmth per audit event */
+  if (pulses.length) {
+    ctx.save();
+    for (const p of pulses) {
+      const age = (now - p.t0) / 1000;
+      if (age > 1.4 || REDUCED) continue;
+      const n = nodes[p.idx];
+      const x = sx(n.x), y = sy(n.y);
+      if (x < -60 || x > W + 60 || y < -60 || y > H + 60) continue;
+      const ease = 1 - Math.pow(1 - age / 1.4, 2);
+      ctx.strokeStyle = p.color + Math.round(200 * (1 - ease)).toString(16).padStart(2, '0');
+      ctx.lineWidth = 1.6;
+      ctx.beginPath();
+      ctx.arc(x, y, 6 + ease * 46 * Math.max(view.k, 0.5), 0, 7);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
 
   /* isolated rings (health lens) */
   if (lens === 'health') {
@@ -579,9 +602,104 @@ document.getElementById('results-replay').addEventListener('click', () => {
 const PLACARDS = {
   dream: ['U4', 'Dream observatory',
     'Dream reports on a timeline. Scrub a cycle to watch phase effects as overlay diffs: pruned memories collapse to embers, a newborn schema flares with rays to its sources, the skill-competition champion takes a halo while dominated rivals dim toward the prune floor.'],
-  live: ['U3', 'Live — the EEG',
-    'The observatory tails the audit log over SSE. When any agent remembers, recalls, or dreams against this brain, the event ripples across the field within a second or two. The shared SQLite is already the bus.'],
 };
+
+/* ---------- Live (U3): the audit-log EEG ---------- */
+/* The stream connects at boot and stays up in every lens — a mutation
+   ripples on the field wherever you are; the ticker panel is Live-only.
+   Mutating MCP tool calls audit; reads deliberately do not. */
+const pulses = [];                  // {idx, t0, color}
+const born = { count: 0 };
+let esLastEvent = null;
+
+function liveDot(state) {
+  const d = document.getElementById('live-dot');
+  d.className = state;
+  document.getElementById('live-meta').textContent =
+    state === 'on'
+      ? (esLastEvent ? 'streaming · last event ' + esLastEvent : 'streaming · waiting for events')
+      : state === 'err' ? 'reconnecting…' : 'connecting…';
+}
+
+function addTickerRow(ev) {
+  const list = document.getElementById('live-list');
+  const li = document.createElement('li');
+  const idx = ev.memory_id ? byId.get(ev.memory_id) : undefined;
+  const what = idx !== undefined ? nodes[idx].head
+    : ev.memory_id ? ev.memory_id.slice(0, 10) + '…'
+    : (ev.details || '—');
+  li.innerHTML = `<span class="ts"></span><span class="agent"></span>` +
+    `<span class="action"></span><span class="what"></span>`;
+  li.querySelector('.ts').textContent = (ev.timestamp || '').slice(11, 19);
+  li.querySelector('.agent').textContent = ev.agent_id || '·';
+  li.querySelector('.action').textContent = ev.action;
+  li.querySelector('.what').textContent = what;
+  if (idx !== undefined) {
+    li.style.cursor = 'pointer';
+    li.addEventListener('click', () => selectNode(idx));
+  }
+  list.prepend(li);
+  while (list.children.length > 40) list.removeChild(list.lastChild);
+}
+
+const BIRTH_ACTIONS = new Set([
+  'remember', 'memory_store', 'session_save', 'store_procedure',
+  'store_intention', 'create_schema', 'send_message', 'ingest_file',
+  'describe_image', 'episode_start',
+]);
+
+function onAuditRows(rows) {
+  for (const ev of rows) {
+    if (ev.id <= lastAuditId) continue;   /* replay/stream overlap guard */
+    lastAuditId = ev.id;
+    esLastEvent = (ev.timestamp || '').slice(11, 19);
+    if (AGENT && ev.agent_id && ev.agent_id !== AGENT) continue;
+    addTickerRow(ev);
+    const idx = ev.memory_id ? byId.get(ev.memory_id) : undefined;
+    if (idx !== undefined) {
+      const color = ev.action.startsWith('purge') || ev.action.startsWith('delete')
+        ? RISK : (TYPE_COLOR[nodes[idx].type] || FALLBACK_COLOR);
+      pulses.push({ idx, t0: performance.now(), color });
+      if (REDUCED) setTimeout(() => { dirty = true; }, 2200);
+    } else if (BIRTH_ACTIONS.has(ev.action) && ev.memory_id) {
+      born.count++;
+      const el = document.getElementById('live-new');
+      el.hidden = false;
+      el.innerHTML = '';
+      el.append(born.count + ' memor' + (born.count === 1 ? 'y' : 'ies') +
+        ' born since load — ');
+      const btn = document.createElement('button');
+      btn.textContent = 'RELOAD FIELD';
+      btn.addEventListener('click', () => location.reload());
+      el.append(btn);
+    }
+  }
+  liveDot('on');
+  dirty = true;
+}
+
+let lastAuditId = 0;   /* replay/stream dedupe cursor */
+
+async function connectEvents() {
+  /* ?since=<audit rowid>: replay history from that cursor via plain JSON
+     first ("what happened while I was away"), THEN go live. ?es=off skips
+     the stream entirely (captures, demos — a pause control is U1b material). */
+  const since = urlParams.get('since');
+  if (since) {
+    try {
+      const replay = await api('/audit/since/' + encodeURIComponent(since));
+      onAuditRows(replay.rows);
+    } catch { /* replay is best-effort */ }
+  }
+  if (urlParams.get('es') === 'off') { liveDot(''); return; }
+
+  const es = new EventSource('/events' + (TOKEN ? '?token=' + encodeURIComponent(TOKEN) : ''));
+  es.addEventListener('audit', e => {
+    try { onAuditRows(JSON.parse(e.data)); } catch { /* one bad frame ≠ a dead EEG */ }
+  });
+  es.addEventListener('open', () => liveDot('on'));
+  es.addEventListener('error', () => liveDot('err'));  /* EventSource auto-reconnects */
+}
 const placard = document.getElementById('placard');
 function setLens(name) {
   lens = name;
@@ -608,6 +726,7 @@ placard.addEventListener('click', () => setLens('atlas'));
 
 /* shareable boot params: ?lens=health opens a lens, ?q=… runs a recall */
 boot().then(() => {
+  connectEvents();               /* the EEG runs in every lens */
   const lensParam = urlParams.get('lens');
   if (lensParam && document.querySelector(`#lenses [data-lens="${lensParam}"]`))
     setLens(lensParam);

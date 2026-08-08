@@ -1126,6 +1126,40 @@ mod storage_basic {
         assert!(store.sqlite.get_layout().await.unwrap().0.is_empty());
     }
 
+    // U3 (the Live lens): the SSE tail's cursor primitives — rowid-strict,
+    // oldest-first, capped, and never skipping a burst.
+    #[tokio::test]
+    async fn audit_since_cursor_tails_in_order() {
+        let (store, _dir) = make_store().await;
+        assert_eq!(store.sqlite.max_audit_id().await.unwrap(), 0, "empty log = cursor 0");
+
+        for i in 0..5 {
+            store.sqlite.log_audit_event(
+                Some("FORGE"), "remember", Some(&format!("mem{i}")), None,
+            ).await.unwrap();
+        }
+        let top = store.sqlite.max_audit_id().await.unwrap();
+        assert_eq!(top, 5);
+
+        // Tail from 0: all five, oldest first.
+        let all = store.sqlite.list_audit_since(0, 100).await.unwrap();
+        assert_eq!(all.len(), 5);
+        assert_eq!(all[0]["memory_id"], "mem0");
+        assert_eq!(all[4]["memory_id"], "mem4");
+
+        // Cursor mid-stream: strictly-after semantics.
+        let after3 = store.sqlite.list_audit_since(3, 100).await.unwrap();
+        assert_eq!(after3.len(), 2);
+        assert_eq!(after3[0]["id"], 4);
+
+        // The cap holds; the caller resumes from the last delivered id.
+        let capped = store.sqlite.list_audit_since(0, 2).await.unwrap();
+        assert_eq!(capped.len(), 2);
+        let resume = store.sqlite
+            .list_audit_since(capped[1]["id"].as_i64().unwrap(), 100).await.unwrap();
+        assert_eq!(resume.len(), 3, "no row lost between capped batches");
+    }
+
     // R-04: a content edit snapshots the PRIOR row into memory_versions
     // (Python parity — get_memory_versions' "each content change creates a
     // snapshot" contract). Metadata-only updates snapshot nothing.
