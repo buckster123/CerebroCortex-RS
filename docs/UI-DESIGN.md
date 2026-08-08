@@ -211,9 +211,16 @@ additive.
   (`/memory/{id}`, episodes, graph, trash…) was a silent 404 since the crate
   was born; the U1 card's full-body fetch was quietly falling back to the
   content head. Fixed by the 0.8 bump; `parameterized_routes_resolve` pins it.
-- **The dev MCP daemon runs a stale binary** (pre-wave-3: no audit writes, no
-  dedup gate, no ratchet, old Private default) — its remembers left no audit
-  rows during the gate run. Rebuild + `/mcp` reconnect after merge.
+- **There are two brains** (correction, same day: the U3 gate-run diagnosis
+  said "stale binary, no audit writes" — wrong skull). The dev MCP runs with
+  `CEREBRO_DATA_DIR=~/Projects/CerebroCortex/data` — the REAL FORGE brain
+  (703 memories, 330 audit rows, fully embedded, auditing fine on its wave-5
+  binary; it only lacked W-A + the spread fix until the 2026-08-08 rebuild).
+  What the U1–U3 gate runs observed was `~/.cerebro-cortex/`, the DEFAULT
+  data dir — a May-era snapshot brain. Lucida against the real brain:
+  `CEREBRO_DATA_DIR=~/Projects/CerebroCortex/data cerebro-api`. A data-dir
+  indicator in the UI header is U1b material (you should always know which
+  skull you're inside).
 - Headless-capture lesson: an open `EventSource` pins chromium's virtual-time
   forever — hence `?es=off` + REST replay for deterministic screenshots.
 
