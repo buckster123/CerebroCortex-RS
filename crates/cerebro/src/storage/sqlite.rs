@@ -2632,6 +2632,41 @@ impl SqliteStore {
             Err(e) => Err(e.into()),
         }
     }
+
+    /// Dream reports, newest first — the Dream observatory's timeline
+    /// (Lucida U4). Same wire shape per row as `get_last_dream_report`.
+    pub async fn list_dream_reports(&self, limit: usize) -> Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT id, agent_id, started_at, ended_at, phases, metadata \
+             FROM dream_reports ORDER BY started_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, agent_id, started_at, ended_at, phases_json, metadata_json) = row?;
+            out.push(serde_json::json!({
+                "id":         id,
+                "agent_id":   agent_id,
+                "started_at": started_at,
+                "ended_at":   ended_at,
+                "phases":     serde_json::from_str::<serde_json::Value>(&phases_json)
+                                  .unwrap_or(serde_json::Value::Array(vec![])),
+                "metadata":   serde_json::from_str::<serde_json::Value>(&metadata_json)
+                                  .unwrap_or(serde_json::Value::Null),
+            }));
+        }
+        Ok(out)
+    }
 }
 
 const SCHEMA_SQL: &str = r#"
