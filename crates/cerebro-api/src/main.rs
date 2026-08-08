@@ -710,6 +710,38 @@ async fn graph_export(
     })))
 }
 
+#[derive(Deserialize)]
+struct RecallTraceReq {
+    query:    String,
+    top_k:    Option<usize>,
+    agent_id: Option<String>,
+}
+
+/// POST /recall/trace — a REAL recall (same pipeline, same reinforcement:
+/// watching a thought is still thinking it) plus the trace the Thought lens
+/// animates: seeds with similarities, every spread walk in firing order,
+/// and the post-spread activation map. Results are summary rows — the field
+/// fetches full bodies from /memory/:id on select.
+async fn recall_trace(
+    State(brain): State<Brain>,
+    Json(req): Json<RecallTraceReq>,
+) -> AppResult {
+    let scope = scope_from(req.agent_id.as_deref());
+    let (results, trace) = brain
+        .recall_traced(&req.query, req.top_k.unwrap_or(10), scope)
+        .await?;
+    let rows: Vec<Value> = results.iter().map(|(n, s)| json!({
+        "id":            n.id.0,
+        "memory_type":   n.memory_type,
+        "content_head":  head_chars(&n.content, 200),
+        "content_chars": n.content.chars().count(),
+        "tags":          n.tags,
+        "salience":      round3(n.salience),
+        "score":         round3(*s),
+    })).collect();
+    Ok(Json(json!({ "results": rows, "trace": trace })))
+}
+
 /// Top-2 PCA of the (mean-centered) embedding matrix via power iteration,
 /// axes independently scaled to [-1, 1]. Deterministic (fixed start vector),
 /// dependency-free, and honest about what it is: a stable *semantic* map, not
@@ -1123,6 +1155,7 @@ async fn main() -> Result<()> {
         .route("/app.js",          get(ui_js))
         .route("/graph/export",    get(graph_export))
         .route("/graph/layout",    get(graph_layout).post(graph_layout_recompute))
+        .route("/recall/trace",    post(recall_trace))
         // Core
         .route("/health",          get(health))
         .route("/stats",           get(stats))

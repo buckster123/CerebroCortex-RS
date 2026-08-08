@@ -152,7 +152,7 @@ env/config.
 | U0 | this charter | merged |
 | U1 | `/graph/export` + `/graph/layout` + ui-web shell with Atlas lens (pan/zoom/hover/select/search) | field renders a real brain from a real DB — **shipped 2026-08-08; gate passed against the dev brain (369 memories / 5,885 links)** |
 | U1b | settings drawer + memory CRUD + link-drawing (instruments over existing routes) | a memory created, edited, and trashed from the UI round-trips |
-| U2 | trace-carrying recall + Thought lens ripple | a typed query animates its real spread |
+| U2 | trace-carrying recall + Thought lens ripple | a typed query animates its real spread — **shipped 2026-08-08; and the lens's first real query exposed the seed-cap spread no-op (see field notes)** |
 | U3 | SSE audit tail + Live lens glow | an MCP `remember` from another terminal ripples in ≤2s |
 | U4 | Dream observatory + `/dream/reports` | a real dream cycle scrubbable |
 | U5 | `ui-slint` mirror (dashboard + Atlas + Thought) | native app browses the same DB |
@@ -177,6 +177,32 @@ additive.
   scrubbed from the URL.
 - The 6-type legend maps `affective` to the teal slot (the mockup's "message"
   — messages are affective memories with a `message` tag).
+
+## U2 field notes (2026-08-08)
+
+- **The lens found a real bug on its first query.** `/recall/trace` returned
+  zero events on the dev brain: `SPREADING_MAX_ACTIVATED` (50) counted the
+  seeds, and recall over-fetches `k*5 = 50` candidates — so on any store
+  returning a full page, the spread broke before hop 1 and spreading
+  activation was silently a no-op. Python has the identical flaw
+  (spreading.py:155); ours is now a documented deviation — the budget bounds
+  growth beyond the seeds. Post-fix, the same query: 75 walks, 100 activated,
+  top score 0.415 → 0.62 (association scores finally contribute). This is
+  also why `never_traversed_links_pct` sat at exactly 100.0 for the colony.
+- A traced recall is a REAL recall: same reinforcement (ACT-R/FSRS on the
+  top-k, walk-stamping on used links). Watching a thought is thinking it —
+  the meta line says "reinforced" so nobody is surprised.
+- Trace events whose endpoints fall outside the export cap are dropped
+  client-side; the meta line keeps the honest totals.
+
+### Settings-drawer backlog for U1b (surfaced by U1+U2, as predicted)
+
+- Ripple speed (`HOP_MS`, currently 950ms) + replay behavior
+- Edge-LOD thresholds (overview share, zoom breakpoints, alpha dim)
+- Motion: twinkle on/off (beyond `prefers-reduced-motion`), glow floor
+- Recall `top_k` for the query bar (currently 12)
+- Default lens on load; default agent scope
+- Layout recompute button (POST /graph/layout) — post-dream refresh
 
 ## Out-of-scope (recorded so we don't drift)
 

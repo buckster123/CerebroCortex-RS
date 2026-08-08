@@ -67,6 +67,18 @@ let hoverIdx = -1, selectedIdx = -1;
 let searchSet = null;         // Set of node indices matched by the last recall
 let dirty = true;
 
+/* Thought lens (U2): one traced recall, animated. Everything here is the
+   REAL spread — seeds, per-hop edge walks, final activations — recorded by
+   the engine, not simulated. HOP_MS is a U1b settings-drawer candidate. */
+const HOP_MS = REDUCED ? 1 : 950;
+const thought = {
+  trace: null,      // {seedIdx:Map(idx→sim), events:[{hop,a,b,amount}], boost:Map(idx→act), maxHop}
+  t0: 0, done: false,
+};
+function thoughtHopNow(now) {
+  return thought.trace ? (now - thought.t0) / HOP_MS : -1;
+}
+
 /* deterministic small hash for rim placement + jitter */
 function idHash(s) {
   let h = 2166136261;
@@ -198,7 +210,7 @@ const sy = y => (y - view.y) * view.k + H / 2;
 let lastFrame = -1e9;
 function render(now) {
   requestAnimationFrame(render);
-  const animating = !REDUCED;
+  const animating = !REDUCED || (thought.trace && !thought.done);
   if (!dirty && !animating) return;
   if (now - lastFrame < 30) return;
   lastFrame = now; dirty = false;
@@ -208,6 +220,13 @@ function render(now) {
   ctx.fillRect(0, 0, W, H);
 
   const focusSet = selectedIdx >= 0 ? new Set(adj[selectedIdx]) : null;
+
+  /* Thought ripple clock */
+  const hopNow = thoughtHopNow(now);
+  if (thought.trace && !thought.done && hopNow > thought.trace.maxHop + 0.6) {
+    thought.done = true;
+    document.getElementById('results').classList.add('open');
+  }
 
   /* links — density LOD: at overview zoom only the strongest strands draw;
      zooming in earns the full web. Focus and health override per-edge. */
@@ -235,13 +254,33 @@ function render(now) {
       if (e.cold) color = '90,140,235';
     } else if (focused) {
       alpha = 0.55;
-    } else if (selectedIdx >= 0 || searchSet) {
+    } else if (selectedIdx >= 0 || searchSet || thought.trace) {
       alpha = 0.02 * densityDim;
     } else {
       alpha = (0.04 + e.eff * 0.14) * densityDim;
     }
     ctx.strokeStyle = `rgba(${color},${alpha})`;
     ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+  }
+
+  /* Thought ripple: the real spread walks, hop by hop, as light */
+  if (thought.trace) {
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.lineWidth = 1.4;
+    for (const e of thought.trace.events) {
+      const p = REDUCED ? 1 : Math.min(1, Math.max(0, hopNow - (e.hop - 1)));
+      if (p <= 0) continue;
+      const A = nodes[e.a], B = nodes[e.b];
+      const x1 = sx(A.x), y1 = sy(A.y);
+      const x2 = x1 + (sx(B.x) - x1) * p, y2 = y1 + (sy(B.y) - y1) * p;
+      const fade = thought.done
+        ? 0.10 + 0.20 * e.norm
+        : Math.max(0.15, 1 - Math.max(0, hopNow - e.hop) * 0.5) * (0.25 + 0.55 * e.norm);
+      ctx.strokeStyle = `rgba(140,190,255,${fade})`;
+      ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+    }
+    ctx.restore();
   }
 
   /* stars */
@@ -255,6 +294,17 @@ function render(now) {
 
     /* brightness: retrievability is the long decay, activation the recent heat */
     let act = Math.max(0.06, Math.min(1, 0.2 * n.glow + 0.8 * n.retr));
+    if (thought.trace) {
+      const arrive = thought.trace.arrival.get(i);
+      if (arrive !== undefined && (REDUCED || hopNow >= arrive)) {
+        const boost = arrive === 0
+          ? (thought.trace.seedIdx.get(i) || 0.5)
+          : (thought.trace.boost.get(i) || 0);
+        act = Math.min(1, act + boost * (thought.done ? 0.75 : 1));
+      } else if (thought.done) {
+        act *= 0.3;   /* the unrecalled sky recedes once the ripple lands */
+      }
+    }
     if (focusSet) {
       const isNeighbor = adj[i].some(li => focusSet.has(li));
       if (i !== selectedIdx && !isNeighbor) act *= 0.22;
@@ -406,10 +456,27 @@ addEventListener('keydown', e => {
   if (e.key === 'Escape') { deselect(); clearSearch(); }
 });
 
-/* ---------- recall (Atlas search — the ripple animation is U2) ---------- */
+/* ---------- recall: Atlas = highlight, Thought = animated real spread ---------- */
+function fillResultsList(rows, getText, getType, getId) {
+  const list = document.getElementById('results-list');
+  list.innerHTML = '';
+  for (const r of rows) {
+    const idx = byId.get(getId(r));
+    const li = document.createElement('li');
+    const color = TYPE_COLOR[getType(r)] || FALLBACK_COLOR;
+    li.innerHTML = `<span class="chip" style="background:${color}"></span>` +
+      `<span class="head"></span><span class="score">${(r.score ?? 0).toFixed(2)}</span>`;
+    li.querySelector('.head').textContent = getText(r);
+    if (idx !== undefined) li.addEventListener('click', () => selectNode(idx));
+    list.appendChild(li);
+  }
+}
+
 async function runRecall() {
   const query = document.getElementById('query').value.trim();
   if (!query) return;
+  if (lens === 'thought') return runThoughtRecall(query);
+
   let results;
   try {
     results = await api('/recall', {
@@ -420,28 +487,78 @@ async function runRecall() {
     });
   } catch { return; }
 
-  const list = document.getElementById('results-list');
-  list.innerHTML = '';
   searchSet = new Set();
   for (const r of results) {
-    const mem = r.memory, idx = byId.get(mem.id);
+    const idx = byId.get(r.memory.id);
     if (idx !== undefined) searchSet.add(idx);
-    const li = document.createElement('li');
-    const color = TYPE_COLOR[mem.memory_type] || FALLBACK_COLOR;
-    li.innerHTML = `<span class="chip" style="background:${color}"></span>` +
-      `<span class="head"></span><span class="score">${(r.score ?? 0).toFixed(2)}</span>`;
-    li.querySelector('.head').textContent = mem.content;
-    if (idx !== undefined) li.addEventListener('click', () => selectNode(idx));
-    list.appendChild(li);
   }
+  fillResultsList(results, r => r.memory.content, r => r.memory.memory_type, r => r.memory.id);
+  document.getElementById('results-title').textContent = 'RECALLED';
+  document.getElementById('results-replay').hidden = true;
   document.getElementById('results-meta').textContent =
     results.length + ' recalled · real pipeline (spread + rank)';
   deselect();                                       /* hides the card only */
   document.getElementById('results').classList.add('open');
   dirty = true;
 }
+
+async function runThoughtRecall(query) {
+  let resp;
+  try {
+    resp = await api('/recall/trace', {
+      method: 'POST',
+      body: JSON.stringify(Object.assign(
+        { query, top_k: 12 }, AGENT ? { agent_id: AGENT } : {},
+      )),
+    });
+  } catch { return; }
+
+  const tr = resp.trace;
+  /* index-space trace; events whose endpoints fell outside the export cap
+     are dropped (they still happened — the meta line stays honest) */
+  const seedIdx = new Map();
+  for (const [id, sim] of tr.seeds) {
+    const idx = byId.get(id);
+    if (idx !== undefined) seedIdx.set(idx, sim);
+  }
+  let maxAmount = 1e-9, maxHop = 0;
+  const events = [];
+  for (const e of tr.events) {
+    const a = byId.get(e.source), b = byId.get(e.target);
+    if (a === undefined || b === undefined) continue;
+    events.push({ hop: e.hop, a, b, amount: e.amount });
+    maxAmount = Math.max(maxAmount, e.amount);
+    maxHop = Math.max(maxHop, e.hop);
+  }
+  for (const e of events) e.norm = e.amount / maxAmount;
+  const boost = new Map();
+  for (const [id, act] of tr.activated) {
+    const idx = byId.get(id);
+    if (idx !== undefined) boost.set(idx, act);
+  }
+  /* arrival hop per node: seeds at 0, else the first event that reached it */
+  const arrival = new Map([...seedIdx.keys()].map(i => [i, 0]));
+  for (const e of events)
+    if (!arrival.has(e.b) || e.hop < arrival.get(e.b)) arrival.set(e.b, e.hop);
+
+  thought.trace = { seedIdx, events, boost, arrival, maxHop };
+  thought.t0 = performance.now();
+  thought.done = false;
+
+  fillResultsList(resp.results, r => r.content_head, r => r.memory_type, r => r.id);
+  document.getElementById('results-title').textContent = 'THOUGHT';
+  document.getElementById('results-replay').hidden = false;
+  document.getElementById('results-meta').textContent =
+    tr.seeds.length + ' seeds · ' + tr.events.length + ' walks · ' +
+    tr.activated.length + ' activated · reinforced';
+  deselect();
+  document.getElementById('results').classList.remove('open'); /* opens when the ripple lands */
+  dirty = true;
+}
+
 function clearSearch() {
   searchSet = null;
+  thought.trace = null; thought.done = false;
   document.getElementById('results').classList.remove('open');
   dirty = true;
 }
@@ -450,11 +567,16 @@ document.getElementById('query').addEventListener('keydown', e => {
   if (e.key === 'Enter') runRecall();
 });
 document.getElementById('results-clear').addEventListener('click', clearSearch);
+document.getElementById('results-replay').addEventListener('click', () => {
+  if (!thought.trace) return;
+  thought.t0 = performance.now();
+  thought.done = false;
+  document.getElementById('results').classList.remove('open');
+  dirty = true;
+});
 
 /* ---------- lenses ---------- */
 const PLACARDS = {
-  thought: ['U2', 'Thought — recall replay',
-    'Type a query and watch the actual spreading-activation wavefront propagate hop by hop along the real walked edges, then crystallize into the ranked constellation. The trace exists in the engine (spread_traced) — this lens ships when /recall/trace lands.'],
   dream: ['U4', 'Dream observatory',
     'Dream reports on a timeline. Scrub a cycle to watch phase effects as overlay diffs: pruned memories collapse to embers, a newborn schema flares with rays to its sources, the skill-competition champion takes a halo while dominated rivals dim toward the prune floor.'],
   live: ['U3', 'Live — the EEG',
@@ -466,6 +588,9 @@ function setLens(name) {
   document.body.dataset.lens = name;
   document.querySelectorAll('#lenses button').forEach(b =>
     b.setAttribute('aria-pressed', String(b.dataset.lens === name)));
+  document.getElementById('query').placeholder =
+    name === 'thought' ? 'think…  (a traced recall — you will watch it spread)' : 'recall…';
+  if (name !== 'thought' && thought.trace) clearSearch();
   const pl = PLACARDS[name];
   if (pl) {
     document.getElementById('placard-phase').textContent = 'CHARTER · ' + pl[0];
