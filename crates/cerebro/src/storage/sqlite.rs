@@ -216,6 +216,54 @@ const SELECT_COLS: &str =
 /// Detects a Python-generated `cerebro.db` (table `memory_nodes` present) and
 /// converts it in-place to the Rust schema.  Runs once; subsequent opens are
 /// no-ops (schema_version 100 marks completion).
+/// Rebuild `memory_versions` when its FK points at a table that no longer
+/// exists (the Python original's `REFERENCES memory_nodes(id)`, orphaned by
+/// migration+reap). Data is preserved row-for-row, ids included. Idempotent:
+/// after one repair the probe is false forever.
+fn repair_ghost_fk_memory_versions(conn: &Connection) -> Result<()> {
+    let ghost: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM pragma_foreign_key_list('memory_versions') f
+            WHERE f.\"table\" NOT IN (SELECT name FROM sqlite_master WHERE type='table'))",
+        [],
+        |r| r.get(0),
+    )?;
+    if !ghost {
+        return Ok(());
+    }
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+    let repair = conn.execute_batch(
+        "BEGIN;
+         CREATE TABLE memory_versions_repair (
+             id          INTEGER PRIMARY KEY AUTOINCREMENT,
+             memory_id   TEXT NOT NULL,
+             content     TEXT NOT NULL,
+             tags_json   TEXT NOT NULL DEFAULT '[]',
+             salience    REAL NOT NULL,
+             visibility  TEXT NOT NULL,
+             edited_by   TEXT,
+             edited_at   TEXT NOT NULL,
+             change_note TEXT,
+             FOREIGN KEY (memory_id) REFERENCES memories(id)
+         );
+         INSERT INTO memory_versions_repair
+             (id, memory_id, content, tags_json, salience, visibility,
+              edited_by, edited_at, change_note)
+             SELECT id, memory_id, content, tags_json, salience, visibility,
+                    edited_by, edited_at, change_note
+             FROM memory_versions;
+         DROP TABLE memory_versions;
+         ALTER TABLE memory_versions_repair RENAME TO memory_versions;
+         CREATE INDEX IF NOT EXISTS idx_versions_memory ON memory_versions(memory_id);
+         COMMIT;",
+    );
+    // Restore FK enforcement even when the rebuild failed mid-batch.
+    let _ = conn.execute_batch("PRAGMA foreign_keys=ON;");
+    repair?;
+    tracing::info!("repaired memory_versions ghost FK (Python-migration residue → REFERENCES memories)");
+    Ok(())
+}
+
 fn migrate_from_python(conn: &mut Connection) -> Result<()> {
     // Is this a Python-schema DB?
     let has_py: bool = conn.query_row(
@@ -463,6 +511,16 @@ impl SqliteStore {
         // One-time migration: if this DB was created by the Python CerebroCortex server
         // (uses memory_nodes / associative_links), transparently convert it to Rust schema.
         migrate_from_python(&mut conn)?;
+
+        // Ghost-FK repair (found 2026-08-08 by Lucida U1b's CRUD instruments):
+        // a Python-created DB already HAS a memory_versions table, so
+        // SCHEMA_SQL's IF NOT EXISTS skips it — and the Python original's FK
+        // references memory_nodes, which migration renamed and the reap
+        // dropped. With foreign_keys=ON, ANY write to the table (the R-04
+        // version snapshot) or dependent cleanup (the R-06 purge) then fails
+        // with "no such table: main.memory_nodes". Probe every open (cheap);
+        // rebuild with the canonical FK when the ghost is present.
+        repair_ghost_fk_memory_versions(&conn)?;
 
         // Try to create the vec0 virtual table; works only if sqlite-vec loaded successfully.
         let vec_available = conn.execute_batch(

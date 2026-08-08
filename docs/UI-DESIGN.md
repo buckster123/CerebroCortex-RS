@@ -151,7 +151,7 @@ env/config.
 |------|-------|------|
 | U0 | this charter | merged |
 | U1 | `/graph/export` + `/graph/layout` + ui-web shell with Atlas lens (pan/zoom/hover/select/search) | field renders a real brain from a real DB — **shipped 2026-08-08; gate passed against the dev brain (369 memories / 5,885 links)** |
-| U1b | settings drawer + memory CRUD + link-drawing (instruments over existing routes) | a memory created, edited, and trashed from the UI round-trips |
+| U1b | settings drawer + memory CRUD + link-drawing (instruments over existing routes) | a memory created, edited, and trashed from the UI round-trips — **shipped 2026-08-08; the round-trip's first run caught the Python ghost-FK (see field notes)** |
 | U2 | trace-carrying recall + Thought lens ripple | a typed query animates its real spread — **shipped 2026-08-08; and the lens's first real query exposed the seed-cap spread no-op (see field notes)** |
 | U3 | SSE audit tail + Live lens glow | an MCP `remember` from another terminal ripples in ≤2s — **shipped 2026-08-08; gate passed (stdio `cerebro-mcp` remember → SSE tap in the same poll window); found the axum-0.7 brace-route 404 and the stale dev-MCP binary along the way** |
 | U4 | Dream observatory + `/dream/reports` | a real dream cycle scrubbable |
@@ -223,6 +223,27 @@ additive.
   skull you're inside).
 - Headless-capture lesson: an open `EventSource` pins chromium's virtual-time
   forever — hence `?es=off` + REST replay for deterministic screenshots.
+
+## U1b field notes (2026-08-08)
+
+- **The instruments caught a live data bug within the hour.** The CRUD
+  round-trip's first PUT failed "no such table: main.memory_nodes" — Python-
+  migrated DBs (BOTH local brains, and every colony node) carry the Python-era
+  `memory_versions` whose FK references the ghost `memory_nodes`, because
+  SCHEMA_SQL's IF NOT EXISTS skipped the existing table. Latent until W-A's
+  R-04 snapshots and R-06 purge cleanup started writing there. Fixed with
+  `repair_ghost_fk_memory_versions` on every `SqliteStore::open()`
+  (row-preserving rebuild, idempotent probe); queued HIGH for ApexOS.
+- **API mutations now audit** (remember/update/delete/restore/purge/associate/
+  bulk) — what you do in the observatory shows in its own EEG. Mirrors the
+  MCP discipline: best-effort, never fails the call it records.
+- API `POST /remember` + `PUT /memory/{id}` accept `visibility` (MCP-twin
+  contract: strict parse, orphan guard); PUT passes the caller's scope as
+  `edited_by`; the R-08 graph-eviction wrappers now back delete/restore/
+  purge/bulk (deleted nodes stop spreading immediately, no restart needed).
+- Settings live in `localStorage` (`lucida.settings`); the server stays
+  stateless about UI preferences, as chartered. `?open=settings|compose`
+  deep-links a drawer.
 
 ### Settings-drawer backlog for U1b (surfaced by U1+U2+U3, as predicted)
 

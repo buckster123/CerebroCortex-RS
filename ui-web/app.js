@@ -67,16 +67,28 @@ let hoverIdx = -1, selectedIdx = -1;
 let searchSet = null;         // Set of node indices matched by the last recall
 let dirty = true;
 
+/* ---------- settings (U1b): localStorage-persisted, applied live ---------- */
+const S_DEFAULTS = {
+  twinkle: true, hopMs: 950, density: 1, topK: 12,
+  defaultLens: 'atlas', tickerDepth: 40, pauseStream: false,
+};
+const S = Object.assign({}, S_DEFAULTS,
+  JSON.parse(localStorage.getItem('lucida.settings') || '{}'));
+function saveSettings() {
+  localStorage.setItem('lucida.settings', JSON.stringify(S));
+  dirty = true;
+}
+
 /* Thought lens (U2): one traced recall, animated. Everything here is the
    REAL spread — seeds, per-hop edge walks, final activations — recorded by
-   the engine, not simulated. HOP_MS is a U1b settings-drawer candidate. */
-const HOP_MS = REDUCED ? 1 : 950;
+   the engine, not simulated. */
+const hopMs = () => (REDUCED ? 1 : S.hopMs);
 const thought = {
   trace: null,      // {seedIdx:Map(idx→sim), events:[{hop,a,b,amount}], boost:Map(idx→act), maxHop}
   t0: 0, done: false,
 };
 function thoughtHopNow(now) {
-  return thought.trace ? (now - thought.t0) / HOP_MS : -1;
+  return thought.trace ? (now - thought.t0) / hopMs() : -1;
 }
 
 /* deterministic small hash for rim placement + jitter */
@@ -231,7 +243,7 @@ function render(now) {
 
   /* links — density LOD: at overview zoom only the strongest strands draw;
      zooming in earns the full web. Focus and health override per-edge. */
-  const zoomShare = view.k < 0.8 ? 0.08 : view.k < 1.4 ? 0.35 : 1.0;
+  const zoomShare = (view.k < 0.8 ? 0.08 : view.k < 1.4 ? 0.35 : 1.0) * S.density;
   const drawCount = Math.min(edges.length,
     Math.max(400, Math.floor(edges.length * zoomShare)));
   const densityDim = Math.min(1, 900 / Math.max(1, drawCount));
@@ -244,6 +256,7 @@ function render(now) {
     if (!inLod && !focused && lens !== 'health') continue;
 
     const A = nodes[e.a], B = nodes[e.b];
+    if (A.trashed || B.trashed) continue;
     const x1 = sx(A.x), y1 = sy(A.y), x2 = sx(B.x), y2 = sy(B.y);
     if (Math.max(x1, x2) < 0 || Math.min(x1, x2) > W ||
         Math.max(y1, y2) < 0 || Math.min(y1, y2) > H) continue;
@@ -290,6 +303,7 @@ function render(now) {
   const t = now / 1000;
   for (let i = 0; i < nodes.length; i++) {
     const n = nodes[i];
+    if (n.trashed) continue;
     const x = sx(n.x), y = sy(n.y);
     if (x < -40 || x > W + 40 || y < -40 || y > H + 40) continue;
 
@@ -314,7 +328,7 @@ function render(now) {
     for (const p of pulses) {
       if (p.idx === i) act = Math.min(1, act + Math.max(0, 1 - (now - p.t0) / 8000) * 0.6);
     }
-    if (!REDUCED) act *= 0.93 + 0.07 * Math.sin(t * 1.7 + n.twinkle);
+    if (!REDUCED && S.twinkle) act *= 0.93 + 0.07 * Math.sin(t * 1.7 + n.twinkle);
 
     const layerBoost = n.layer === 'working' ? 1.25 : 1;
     const size = (3.2 + n.salience * 9) * view.k * layerBoost;
@@ -438,6 +452,7 @@ canvas.addEventListener('pointermove', e => {
   } else {
     let best = -1, bestD = 196;
     for (let i = 0; i < nodes.length; i++) {
+      if (nodes[i].trashed) continue;
       const dx = sx(nodes[i].x) - e.clientX, dy = sy(nodes[i].y) - e.clientY;
       const d = dx * dx + dy * dy;
       if (d < bestD) { bestD = d; best = i; }
@@ -461,10 +476,14 @@ canvas.addEventListener('pointermove', e => {
 });
 canvas.addEventListener('pointerup', () => {
   dragging = false; canvas.classList.remove('dragging');
-  if (!moved) {
-    if (hoverIdx >= 0) selectNode(hoverIdx);
-    else deselect();
+  if (moved) return;
+  /* link-drawing (U1b): an armed card completes on the next star click */
+  if (linkArm !== null && hoverIdx >= 0 && hoverIdx !== linkArm) {
+    completeLink(hoverIdx);
+    return;
   }
+  if (hoverIdx >= 0) selectNode(hoverIdx);
+  else { deselect(); disarmLink(); }
 });
 canvas.addEventListener('wheel', e => {
   e.preventDefault();
@@ -476,7 +495,7 @@ canvas.addEventListener('wheel', e => {
   dirty = true;
 }, { passive: false });
 addEventListener('keydown', e => {
-  if (e.key === 'Escape') { deselect(); clearSearch(); }
+  if (e.key === 'Escape') { deselect(); clearSearch(); disarmLink(); }
 });
 
 /* ---------- recall: Atlas = highlight, Thought = animated real spread ---------- */
@@ -505,7 +524,7 @@ async function runRecall() {
     results = await api('/recall', {
       method: 'POST',
       body: JSON.stringify(Object.assign(
-        { query, top_k: 12 }, AGENT ? { agent_id: AGENT } : {},
+        { query, top_k: S.topK }, AGENT ? { agent_id: AGENT } : {},
       )),
     });
   } catch { return; }
@@ -531,7 +550,7 @@ async function runThoughtRecall(query) {
     resp = await api('/recall/trace', {
       method: 'POST',
       body: JSON.stringify(Object.assign(
-        { query, top_k: 12 }, AGENT ? { agent_id: AGENT } : {},
+        { query, top_k: S.topK }, AGENT ? { agent_id: AGENT } : {},
       )),
     });
   } catch { return; }
@@ -639,7 +658,7 @@ function addTickerRow(ev) {
     li.addEventListener('click', () => selectNode(idx));
   }
   list.prepend(li);
-  while (list.children.length > 40) list.removeChild(list.lastChild);
+  while (list.children.length > S.tickerDepth) list.removeChild(list.lastChild);
 }
 
 const BIRTH_ACTIONS = new Set([
@@ -653,6 +672,7 @@ function onAuditRows(rows) {
     if (ev.id <= lastAuditId) continue;   /* replay/stream overlap guard */
     lastAuditId = ev.id;
     esLastEvent = (ev.timestamp || '').slice(11, 19);
+    if (S.pauseStream) continue;   /* paused: events drop, honestly */
     if (AGENT && ev.agent_id && ev.agent_id !== AGENT) continue;
     addTickerRow(ev);
     const idx = ev.memory_id ? byId.get(ev.memory_id) : undefined;
@@ -724,15 +744,232 @@ document.querySelectorAll('#lenses button').forEach(b =>
   b.addEventListener('click', () => setLens(b.dataset.lens)));
 placard.addEventListener('click', () => setLens('atlas'));
 
+/* ============================================================
+   U1b — the instruments: settings drawer, compose, edit/trash,
+   link-drawing, trash browser. All over existing routes.
+   ============================================================ */
+
+/* ---------- settings drawer ---------- */
+const settingsEl = document.getElementById('settings');
+function bindSettings() {
+  const el = id => document.getElementById(id);
+  const showVals = () => {
+    el('s-hop-val').textContent = S.hopMs + 'ms';
+    el('s-topk-val').textContent = S.topK;
+    el('s-ticker-val').textContent = S.tickerDepth;
+  };
+  el('s-twinkle').checked = S.twinkle;
+  el('s-hop').value = S.hopMs;
+  el('s-density').value = String(S.density);
+  el('s-topk').value = S.topK;
+  el('s-lens').value = S.defaultLens;
+  el('s-ticker').value = S.tickerDepth;
+  el('s-pause').checked = S.pauseStream;
+  showVals();
+  el('s-twinkle').addEventListener('change', e => { S.twinkle = e.target.checked; saveSettings(); });
+  el('s-hop').addEventListener('input', e => { S.hopMs = +e.target.value; showVals(); saveSettings(); });
+  el('s-density').addEventListener('change', e => { S.density = +e.target.value; saveSettings(); });
+  el('s-topk').addEventListener('input', e => { S.topK = +e.target.value; showVals(); saveSettings(); });
+  el('s-lens').addEventListener('change', e => { S.defaultLens = e.target.value; saveSettings(); });
+  el('s-ticker').addEventListener('input', e => { S.tickerDepth = +e.target.value; showVals(); saveSettings(); });
+  el('s-pause').addEventListener('change', e => {
+    S.pauseStream = e.target.checked; saveSettings();
+    liveDot(S.pauseStream ? '' : 'on');
+  });
+  el('s-scope').textContent = AGENT || 'ALL';
+  el('s-relayout').addEventListener('click', async () => {
+    el('s-relayout').textContent = 'RECOMPUTING…';
+    try { await api('/graph/layout', { method: 'POST' }); } catch { /* shown on reload */ }
+    location.reload();
+  });
+  el('s-reload').addEventListener('click', () => location.reload());
+  el('s-trash-refresh').addEventListener('click', refreshTrash);
+}
+document.getElementById('settings-btn').addEventListener('click', () => {
+  const opening = !settingsEl.classList.contains('open');
+  settingsEl.classList.toggle('open');
+  if (opening) refreshTrash();
+});
+
+async function refreshTrash() {
+  const list = document.getElementById('s-trash-list');
+  let rows;
+  try { rows = await api('/trash?limit=30'); } catch { return; }
+  list.innerHTML = '';
+  if (!rows.length) {
+    list.innerHTML = '<div class="trow"><span class="head">trash is empty</span></div>';
+    return;
+  }
+  for (const m of rows) {
+    const div = document.createElement('div');
+    div.className = 'trow';
+    div.innerHTML = '<span class="head"></span><button>RESTORE</button><button class="danger">PURGE</button>';
+    div.querySelector('.head').textContent = (m.content || '').slice(0, 48);
+    const [restoreBtn, purgeBtn] = div.querySelectorAll('button');
+    restoreBtn.addEventListener('click', async () => {
+      try { await api('/trash/' + encodeURIComponent(m.id) + '/restore', { method: 'POST' }); } catch { return; }
+      refreshTrash();
+    });
+    purgeBtn.addEventListener('click', async () => {
+      if (!confirm('Purge permanently? This is irreversible.')) return;
+      try { await api('/trash/' + encodeURIComponent(m.id), { method: 'DELETE' }); } catch { return; }
+      refreshTrash();
+    });
+    list.appendChild(div);
+  }
+}
+
+/* ---------- compose: a new memory through the real pipeline ---------- */
+const composeEl = document.getElementById('compose');
+document.getElementById('compose-btn').addEventListener('click', () =>
+  composeEl.classList.toggle('open'));
+document.getElementById('compose-close').addEventListener('click', () =>
+  composeEl.classList.remove('open'));
+document.getElementById('c-store').addEventListener('click', async () => {
+  const status = document.getElementById('c-status');
+  const content = document.getElementById('c-content').value.trim();
+  const type = document.getElementById('c-type').value;
+  const tags = document.getElementById('c-tags').value
+    .split(',').map(s => s.trim()).filter(Boolean);
+  const sal = document.getElementById('c-salience').value;
+  const body = Object.assign(
+    { content, visibility: document.getElementById('c-vis').value },
+    type ? { memory_type: type } : {},
+    tags.length ? { tags } : {},
+    sal !== '' ? { salience: +sal } : {},
+    AGENT ? { agent_id: AGENT } : {},
+  );
+  status.className = ''; status.textContent = 'storing…';
+  try {
+    const node = await api('/remember', { method: 'POST', body: JSON.stringify(body) });
+    status.className = 'ok';
+    status.textContent = 'stored ' + node.id.slice(0, 8) + ' — reload to place it';
+    document.getElementById('c-content').value = '';
+  } catch (e) {
+    /* the thalamus gate speaks honestly (too short / over cap / dup policy) */
+    status.className = 'err';
+    status.textContent = e.message.includes('→ 500') ? 'rejected — see server reason (likely thalamus gate)' : e.message;
+  }
+});
+
+/* ---------- card actions: edit / trash / link-draw ---------- */
+let linkArm = null;   /* node index armed as link source, or null */
+const editForm = document.getElementById('card-editform');
+
+function disarmLink() {
+  linkArm = null;
+  document.getElementById('card-link').setAttribute('aria-pressed', 'false');
+}
+
+document.getElementById('card-edit').addEventListener('click', () => {
+  if (selectedIdx < 0) return;
+  const n = nodes[selectedIdx];
+  editForm.hidden = !editForm.hidden;
+  if (!editForm.hidden) {
+    document.getElementById('e-content').value =
+      document.getElementById('card-content').textContent;
+    document.getElementById('e-tags').value = n.tags.join(', ');
+    document.getElementById('e-salience').value = n.salience.toFixed(2);
+    document.getElementById('e-status').textContent = '';
+  }
+});
+document.getElementById('e-cancel').addEventListener('click', () => { editForm.hidden = true; });
+document.getElementById('e-save').addEventListener('click', async () => {
+  if (selectedIdx < 0) return;
+  const n = nodes[selectedIdx];
+  const status = document.getElementById('e-status');
+  const body = {
+    content:  document.getElementById('e-content').value,
+    tags:     document.getElementById('e-tags').value.split(',').map(s => s.trim()).filter(Boolean),
+    salience: +document.getElementById('e-salience').value,
+    visibility: document.getElementById('e-vis').value,
+  };
+  status.className = ''; status.textContent = 'saving…';
+  try {
+    const updated = await api('/memory/' + encodeURIComponent(n.id) +
+      (AGENT ? '?agent_id=' + encodeURIComponent(AGENT) : ''),
+      { method: 'PUT', body: JSON.stringify(body) });
+    n.tags = updated.tags || body.tags;
+    n.salience = body.salience;
+    n.head = body.content.slice(0, 200);
+    n.chars = body.content.length;
+    status.className = 'ok'; status.textContent = 'saved (version snapshotted)';
+    editForm.hidden = true;
+    openCard(selectedIdx);
+    dirty = true;
+  } catch (e) {
+    status.className = 'err'; status.textContent = e.message;
+  }
+});
+
+document.getElementById('card-trash').addEventListener('click', async () => {
+  if (selectedIdx < 0) return;
+  const n = nodes[selectedIdx];
+  try {
+    await api('/memory/' + encodeURIComponent(n.id), { method: 'DELETE' });
+  } catch { return; }
+  n.trashed = true;             /* restorable from the settings drawer */
+  deselect(); disarmLink();
+  dirty = true;
+});
+
+document.getElementById('card-link').addEventListener('click', () => {
+  if (selectedIdx < 0) return;
+  if (linkArm !== null) { disarmLink(); return; }
+  linkArm = selectedIdx;
+  document.getElementById('card-link').setAttribute('aria-pressed', 'true');
+});
+
+async function completeLink(targetIdx) {
+  const srcIdx = linkArm;
+  disarmLink();
+  const linkType = document.getElementById('card-linktype').value;
+  try {
+    await api('/associate', {
+      method: 'POST',
+      body: JSON.stringify({
+        source_id: nodes[srcIdx].id,
+        target_id: nodes[targetIdx].id,
+        link_type: linkType,
+        weight: 0.5,
+      }),
+    });
+  } catch { return; }
+  /* mirror locally: the new strand appears without a reload */
+  const idx = edges.length;
+  edges.push({ a: srcIdx, b: targetIdx, weight: 0.5, eff: 0.5, cold: true });
+  adj[srcIdx].push(idx); adj[targetIdx].push(idx);
+  nodes[srcIdx].degree++; nodes[targetIdx].degree++;
+  edgeRank = edges.map((_, i) => i).sort((i, j) => edges[j].eff - edges[i].eff);
+  pulses.push({ idx: targetIdx, t0: performance.now(),
+    color: TYPE_COLOR[nodes[targetIdx].type] || FALLBACK_COLOR });
+  selectNode(targetIdx);
+  dirty = true;
+}
+
 /* shareable boot params: ?lens=health opens a lens, ?q=… runs a recall */
 boot().then(() => {
+  bindSettings();
+  api('/meta').then(m => {
+    const db = document.getElementById('s-db');
+    db.textContent = (m.db_path || 'unknown').split('/').slice(-3).join('/');
+    db.title = m.db_path || '';
+    document.getElementById('s-version').textContent = m.version || '';
+    document.getElementById('wordmark').title = 'brain: ' + (m.db_path || 'unknown');
+  }).catch(() => {});
   connectEvents();               /* the EEG runs in every lens */
   const lensParam = urlParams.get('lens');
   if (lensParam && document.querySelector(`#lenses [data-lens="${lensParam}"]`))
     setLens(lensParam);
+  else if (S.defaultLens !== 'atlas')
+    setLens(S.defaultLens);
   const q = urlParams.get('q');
   if (q) {
     document.getElementById('query').value = q;
     runRecall();
   }
+  /* ?open=settings|compose — deep-link a drawer (docs, demos, captures) */
+  const open = urlParams.get('open');
+  if (open === 'settings') { settingsEl.classList.add('open'); refreshTrash(); }
+  if (open === 'compose') composeEl.classList.add('open');
 });
