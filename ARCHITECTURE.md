@@ -98,8 +98,9 @@ CerebroCortex-RS/
 │   │       ├── transport.rs         # newline-delimited JSON-RPC over stdio
 │   │       ├── dispatch.rs          # initialize handshake + tool routing
 │   │       └── tools.rs             # tool schema registry (67 tools)
-│   ├── cerebro-api/                  # axum REST API + dashboard (step 11)
+│   ├── cerebro-api/                  # axum REST API + the Lucida observatory (serves ui-web/ at /)
 │   └── cerebro-cli/                  # clap CLI (step 11)
+├── ui-web/                           # Lucida: 5-lens web observatory (vanilla JS, no build step) — docs/UI-DESIGN.md
 ├── tests/
 │   ├── integration_test.rs           # build-order gate tests
 │   └── fixtures/
