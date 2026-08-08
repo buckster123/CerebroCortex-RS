@@ -2212,6 +2212,45 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Newest audit rowid, or 0 on an empty log — the Live lens's starting
+    /// cursor (Lucida U3: stream only what happens AFTER connect).
+    pub async fn max_audit_id(&self) -> Result<i64> {
+        let conn = self.conn.lock().await;
+        let id: Option<i64> =
+            conn.query_row("SELECT MAX(id) FROM audit_log", [], |r| r.get(0))?;
+        Ok(id.unwrap_or(0))
+    }
+
+    /// Audit rows strictly after `after_id`, oldest first, capped — the SSE
+    /// tail's poll step. Rowid-cursor (not timestamp) so a burst of writes in
+    /// the same second can never be skipped or replayed.
+    pub async fn list_audit_since(
+        &self,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT id, timestamp, agent_id, action, memory_id, details \
+             FROM audit_log WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![after_id, limit as i64], |r| {
+            Ok(serde_json::json!({
+                "id":        r.get::<_, i64>(0)?,
+                "timestamp": r.get::<_, String>(1)?,
+                "agent_id":  r.get::<_, Option<String>>(2)?,
+                "action":    r.get::<_, String>(3)?,
+                "memory_id": r.get::<_, Option<String>>(4)?,
+                "details":   r.get::<_, Option<String>>(5)?,
+            }))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     pub async fn query_audit(
         &self,
         limit: usize,

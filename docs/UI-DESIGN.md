@@ -153,7 +153,7 @@ env/config.
 | U1 | `/graph/export` + `/graph/layout` + ui-web shell with Atlas lens (pan/zoom/hover/select/search) | field renders a real brain from a real DB — **shipped 2026-08-08; gate passed against the dev brain (369 memories / 5,885 links)** |
 | U1b | settings drawer + memory CRUD + link-drawing (instruments over existing routes) | a memory created, edited, and trashed from the UI round-trips |
 | U2 | trace-carrying recall + Thought lens ripple | a typed query animates its real spread — **shipped 2026-08-08; and the lens's first real query exposed the seed-cap spread no-op (see field notes)** |
-| U3 | SSE audit tail + Live lens glow | an MCP `remember` from another terminal ripples in ≤2s |
+| U3 | SSE audit tail + Live lens glow | an MCP `remember` from another terminal ripples in ≤2s — **shipped 2026-08-08; gate passed (stdio `cerebro-mcp` remember → SSE tap in the same poll window); found the axum-0.7 brace-route 404 and the stale dev-MCP binary along the way** |
 | U4 | Dream observatory + `/dream/reports` | a real dream cycle scrubbable |
 | U5 | `ui-slint` mirror (dashboard + Atlas + Thought) | native app browses the same DB |
 | U6 | Health lens + time-lapse + polish | watchdog metrics visible in-field |
@@ -195,7 +195,29 @@ additive.
 - Trace events whose endpoints fall outside the export cap are dropped
   client-side; the meta line keeps the honest totals.
 
-### Settings-drawer backlog for U1b (surfaced by U1+U2, as predicted)
+## U3 field notes (2026-08-08)
+
+- **The EEG runs in every lens** — the stream connects at boot; a mutation
+  pulses on the field wherever you are. The ticker panel is Live-only.
+  Replay: `?since=<audit rowid>` fetches history as plain JSON
+  (`GET /audit/since/{id}` — the REST surface's first audit read) before the
+  `EventSource` opens; `?es=off` skips the stream (captures, demos).
+- **Mutations only, by design**: reads deliberately don't audit (wave-3
+  decision), so the EEG shows writes — remember, update, delete, associate,
+  session_save, dream_run, the lot (28 actions). If recall-visibility is ever
+  wanted, that's a deliberate audit-contract change, not a UI patch.
+- **The axum find**: the whole cerebro-api router was written in 0.8 brace
+  syntax while the workspace pinned 0.7 — every parameterized route
+  (`/memory/{id}`, episodes, graph, trash…) was a silent 404 since the crate
+  was born; the U1 card's full-body fetch was quietly falling back to the
+  content head. Fixed by the 0.8 bump; `parameterized_routes_resolve` pins it.
+- **The dev MCP daemon runs a stale binary** (pre-wave-3: no audit writes, no
+  dedup gate, no ratchet, old Private default) — its remembers left no audit
+  rows during the gate run. Rebuild + `/mcp` reconnect after merge.
+- Headless-capture lesson: an open `EventSource` pins chromium's virtual-time
+  forever — hence `?es=off` + REST replay for deterministic screenshots.
+
+### Settings-drawer backlog for U1b (surfaced by U1+U2+U3, as predicted)
 
 - Ripple speed (`HOP_MS`, currently 950ms) + replay behavior
 - Edge-LOD thresholds (overview share, zoom breakpoints, alpha dim)
@@ -203,6 +225,8 @@ additive.
 - Recall `top_k` for the query bar (currently 12)
 - Default lens on load; default agent scope
 - Layout recompute button (POST /graph/layout) — post-dream refresh
+- Live: poll cadence (`?poll_ms` exists server-side), ticker depth (40),
+  pause/resume stream, agent filter, born-since-load auto-refresh threshold
 
 ## Out-of-scope (recorded so we don't drift)
 

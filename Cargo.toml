@@ -40,9 +40,14 @@ lopdf       = "0.44"
 # HTTP client (Anthropic API, dream engine LLM calls)
 reqwest     = { version = "0.12", features = ["json"] }
 # Web framework (cerebro-api)
-axum        = "0.7"
+# 0.8+: brace path params ({id}) — the whole cerebro-api router is written in
+# that syntax; under 0.7 every parameterized route was a silent 404 (matchit
+# treats braces as literals there). Found by Lucida U3's audit-tail work.
+axum        = "0.8"
 tower       = "0.4"
 tower-http  = { version = "0.6", features = ["catch-panic"] }
+# SSE stream builder (cerebro-api /events — the Live lens audit tail)
+async-stream = "0.3"
 # CLI
 clap        = { version = "4", features = ["derive", "env"] }
 # UUIDs
