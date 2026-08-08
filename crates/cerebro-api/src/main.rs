@@ -86,6 +86,11 @@ fn normalize_priority(p: &str) -> String {
     p.to_uppercase()
 }
 
+/// Round to 3 decimals for the wire (mirrors the MCP sibling's round3).
+fn round3(x: f32) -> f64 {
+    (x as f64 * 1000.0).round() / 1000.0
+}
+
 fn parse_link_type(s: &str) -> LinkType {
     match s {
         "causal"       => LinkType::Causal,
@@ -612,6 +617,212 @@ async fn graph_common(
 }
 
 // ---------------------------------------------------------------------------
+// Lucida (U1): graph export + cached semantic layout + embedded observatory UI
+// ---------------------------------------------------------------------------
+
+/// Char-boundary-safe head of a string (the wire_summary doctrine: a graph
+/// export is an index, not the texts — full bodies come from GET /memory/:id).
+fn head_chars(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
+}
+
+#[derive(Deserialize)]
+struct GraphExportQuery {
+    agent_id: Option<String>,
+    cap:      Option<usize>,
+}
+
+/// Every visual channel the field needs, one round-trip. Nodes carry live
+/// ACT-R/FSRS numbers (computed here, not stored); edges carry the decayed
+/// effective weight and traversal stamps. Scope-filtered like any recall.
+async fn graph_export(
+    Query(q): Query<GraphExportQuery>,
+    State(brain): State<Brain>,
+) -> AppResult {
+    use std::collections::HashSet;
+    let scope = scope_from(q.agent_id.as_deref());
+    let cap   = q.cap.unwrap_or(4000).clamp(1, 20_000);
+    let now   = Utc::now();
+
+    let storage = brain.storage.read().await;
+    let mut nodes = storage.sqlite.list_memories_scoped(
+        &scope,
+        &ListFilter { limit: cap + 1, ..Default::default() },
+    ).await?;
+    let truncated = nodes.len() > cap;
+    nodes.truncate(cap);
+
+    let node_wire: Vec<Value> = nodes.iter().map(|n| {
+        let activation = cerebro::activation::base_level_activation(
+            &n.access_times, now, cerebro::config::ACTR_DECAY_RATE,
+        );
+        // Sigmoid-mapped to [0,1] for the glow channel (raw B(t) is unbounded).
+        let glow = cerebro::activation::recall_probability(
+            activation, cerebro::config::ACTR_RETRIEVAL_THRESHOLD, cerebro::config::ACTR_NOISE,
+        );
+        // Elapsed from last review, falling back to creation — never pinned
+        // at 1.0 for the never-recalled (the R-21 trap, not repeated here).
+        let elapsed_days = (now - n.strength.last_review.unwrap_or(n.created_at))
+            .num_seconds().max(0) as f32 / 86_400.0;
+        let retr = cerebro::activation::retrievability(elapsed_days, n.strength.stability);
+        json!({
+            "id":            n.id.0,
+            "memory_type":   n.memory_type,
+            "layer":         n.layer,
+            "salience":      round3(n.salience),
+            "tags":          n.tags,
+            "agent_id":      n.agent_id.as_ref().map(|a| a.0.clone()),
+            "visibility":    n.visibility,
+            "content_head":  head_chars(&n.content, 200),
+            "content_chars": n.content.chars().count(),
+            "created_at":    n.created_at.to_rfc3339(),
+            "access_count":  n.access_count,
+            "activation":    round3(glow),
+            "retrievability": round3(retr),
+            "valence":       n.emotional_valence,
+            "intensity":     round3(n.emotional_intensity),
+        })
+    }).collect();
+
+    let ids: HashSet<&str> = nodes.iter().map(|n| n.id.0.as_str()).collect();
+    let links = storage.sqlite.list_all_links().await?;
+    let edge_wire: Vec<Value> = links.iter()
+        .filter(|l| ids.contains(l.source_id.0.as_str()) && ids.contains(l.target_id.0.as_str()))
+        .map(|l| json!({
+            "source":           l.source_id.0,
+            "target":           l.target_id.0,
+            "link_type":        l.link_type,
+            "weight":           round3(l.weight),
+            "effective_weight": round3(l.effective_weight(now, cerebro::config::LINK_DECAY_HALFLIFE_DAYS)),
+            "traversal_count":  l.traversal_count,
+            "last_traversed":   l.last_traversed.map(|t| t.to_rfc3339()),
+        }))
+        .collect();
+
+    Ok(Json(json!({
+        "nodes":        node_wire,
+        "edges":        edge_wire,
+        "truncated":    truncated,
+        "generated_at": now.to_rfc3339(),
+    })))
+}
+
+/// Top-2 PCA of the (mean-centered) embedding matrix via power iteration,
+/// axes independently scaled to [-1, 1]. Deterministic (fixed start vector),
+/// dependency-free, and honest about what it is: a stable *semantic* map, not
+/// a force simulation — the sky must not reshuffle between visits.
+fn pca_2d(embeddings: &[(MemoryId, Vec<f32>)]) -> Vec<(MemoryId, f32, f32)> {
+    let n = embeddings.len();
+    if n == 0 { return vec![]; }
+    let dim = embeddings[0].1.len();
+    if n == 1 || dim == 0 {
+        return embeddings.iter().map(|(id, _)| (id.clone(), 0.0, 0.0)).collect();
+    }
+
+    // Mean-center.
+    let mut mean = vec![0.0f32; dim];
+    for (_, e) in embeddings {
+        for (m, v) in mean.iter_mut().zip(e) { *m += v; }
+    }
+    for m in &mut mean { *m /= n as f32; }
+    let centered: Vec<Vec<f32>> = embeddings.iter()
+        .map(|(_, e)| e.iter().zip(&mean).map(|(v, m)| v - m).collect())
+        .collect();
+
+    // Power iteration for one principal axis of `rows`, seeded deterministically.
+    let principal = |rows: &[Vec<f32>]| -> Vec<f32> {
+        let mut v: Vec<f32> = (0..dim).map(|i| 1.0 + (i as f32) * 1e-3).collect();
+        for _ in 0..60 {
+            // w = Σ_r (r·v) r   (covariance-matrix product without the matrix)
+            let mut w = vec![0.0f32; dim];
+            for r in rows {
+                let dot: f32 = r.iter().zip(&v).map(|(a, b)| a * b).sum();
+                for (wi, ri) in w.iter_mut().zip(r) { *wi += dot * ri; }
+            }
+            let norm = w.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm < 1e-12 { break; }
+            for x in &mut w { *x /= norm; }
+            v = w;
+        }
+        v
+    };
+
+    let pc1 = principal(&centered);
+    // Deflate: remove the PC1 component, then find PC2 in the residual.
+    let deflated: Vec<Vec<f32>> = centered.iter().map(|r| {
+        let dot: f32 = r.iter().zip(&pc1).map(|(a, b)| a * b).sum();
+        r.iter().zip(&pc1).map(|(a, p)| a - dot * p).collect()
+    }).collect();
+    let pc2 = principal(&deflated);
+
+    let mut coords: Vec<(MemoryId, f32, f32)> = embeddings.iter().zip(&centered)
+        .map(|((id, _), r)| {
+            let x: f32 = r.iter().zip(&pc1).map(|(a, b)| a * b).sum();
+            let y: f32 = r.iter().zip(&pc2).map(|(a, b)| a * b).sum();
+            (id.clone(), x, y)
+        })
+        .collect();
+
+    // Scale each axis to [-1, 1] so the client maps to screen space directly.
+    let max_x = coords.iter().map(|c| c.1.abs()).fold(1e-9f32, f32::max);
+    let max_y = coords.iter().map(|c| c.2.abs()).fold(1e-9f32, f32::max);
+    for c in &mut coords {
+        c.1 /= max_x;
+        c.2 /= max_y;
+    }
+    coords
+}
+
+async fn layout_inner(brain: Brain, force: bool) -> AppResult {
+    let storage = brain.storage.read().await;
+    let (mut rows, mut stamp) = storage.sqlite.get_layout().await?;
+    let embedded = storage.sqlite.count_embedded().await?;
+    // Recompute when forced, or when the cache covers under 80% of the
+    // embedded set (new memories drift in; a dream can prune old ones).
+    let stale = force || (embedded > 0 && rows.len() * 5 < embedded * 4);
+    if stale {
+        let embeddings = storage.sqlite.list_embeddings().await?;
+        rows = pca_2d(&embeddings);
+        storage.sqlite.replace_layout(&rows).await?;
+        stamp = Some(Utc::now().to_rfc3339());
+    }
+    let coords: serde_json::Map<String, Value> = rows.into_iter()
+        .map(|(id, x, y)| (id.0, json!([round3(x), round3(y)])))
+        .collect();
+    Ok(Json(json!({
+        "coords":      coords,
+        "count":       coords.len(),
+        "embedded":    embedded,
+        "computed_at": stamp,
+    })))
+}
+
+async fn graph_layout(State(brain): State<Brain>) -> AppResult {
+    layout_inner(brain, false).await
+}
+
+async fn graph_layout_recompute(State(brain): State<Brain>) -> AppResult {
+    layout_inner(brain, true).await
+}
+
+// The observatory itself — three embedded files, one binary (house rule).
+async fn ui_index() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+     include_str!("../../../ui-web/index.html"))
+}
+async fn ui_css() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+     include_str!("../../../ui-web/style.css"))
+}
+async fn ui_js() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+     include_str!("../../../ui-web/app.js"))
+}
+
+// ---------------------------------------------------------------------------
 // Tags
 // ---------------------------------------------------------------------------
 
@@ -906,6 +1117,12 @@ async fn main() -> Result<()> {
     let brain: Brain = Arc::new(CerebroCortex::new(config).await?);
 
     let app = Router::new()
+        // Lucida observatory (embedded UI + its two data feeds)
+        .route("/",                get(ui_index))
+        .route("/style.css",       get(ui_css))
+        .route("/app.js",          get(ui_js))
+        .route("/graph/export",    get(graph_export))
+        .route("/graph/layout",    get(graph_layout).post(graph_layout_recompute))
         // Core
         .route("/health",          get(health))
         .route("/stats",           get(stats))
@@ -1041,5 +1258,48 @@ mod tests {
     #[test]
     fn normalize_priority_default_matches_lowercase_input() {
         assert_eq!(normalize_priority("MEDIUM"), normalize_priority("medium"));
+    }
+
+    // U1: the projection must actually separate semantic clusters — two blobs
+    // far apart in embedding space land far apart on the PC1 axis.
+    #[test]
+    fn pca_2d_separates_two_clusters() {
+        let dim = 32;
+        let mut embeddings = Vec::new();
+        // Cluster A near +e0, cluster B near -e0, with small deterministic
+        // per-point offsets on other axes so the data isn't degenerate.
+        for i in 0..12 {
+            let mut a = vec![0.0f32; dim];
+            a[0] = 1.0;
+            a[1 + (i % 8)] = 0.05 * (i as f32 + 1.0);
+            embeddings.push((MemoryId(format!("a{i}")), a));
+            let mut b = vec![0.0f32; dim];
+            b[0] = -1.0;
+            b[2 + (i % 8)] = -0.04 * (i as f32 + 1.0);
+            embeddings.push((MemoryId(format!("b{i}")), b));
+        }
+        let coords = pca_2d(&embeddings);
+        assert_eq!(coords.len(), 24);
+        let xs_a: Vec<f32> = coords.iter().filter(|c| c.0.0.starts_with('a')).map(|c| c.1).collect();
+        let xs_b: Vec<f32> = coords.iter().filter(|c| c.0.0.starts_with('b')).map(|c| c.1).collect();
+        let mean_a = xs_a.iter().sum::<f32>() / xs_a.len() as f32;
+        let mean_b = xs_b.iter().sum::<f32>() / xs_b.len() as f32;
+        assert!((mean_a - mean_b).abs() > 1.0,
+            "clusters must separate on PC1: a={mean_a} b={mean_b}");
+        // Axes are normalized to [-1, 1].
+        assert!(coords.iter().all(|c| c.1.abs() <= 1.001 && c.2.abs() <= 1.001));
+    }
+
+    #[test]
+    fn pca_2d_degenerate_inputs_are_safe() {
+        assert!(pca_2d(&[]).is_empty());
+        let one = pca_2d(&[(MemoryId("solo".into()), vec![0.5; 8])]);
+        assert_eq!(one, vec![(MemoryId("solo".into()), 0.0, 0.0)]);
+        // Identical points: no panic, finite coords.
+        let same = pca_2d(&[
+            (MemoryId("x".into()), vec![0.3; 8]),
+            (MemoryId("y".into()), vec![0.3; 8]),
+        ]);
+        assert!(same.iter().all(|c| c.1.is_finite() && c.2.is_finite()));
     }
 }

@@ -1037,6 +1037,39 @@ mod storage_basic {
         assert!(store.sqlite.get_memory_versions_raw(&id.0, 10).await.unwrap().is_empty());
     }
 
+    // U1: graph_layout round-trip, and the CASCADE that keeps purge safe —
+    // layout rows are pure derivation and must vanish with their memory
+    // (the R-06 lesson, applied at this table's birth).
+    #[tokio::test]
+    async fn graph_layout_roundtrip_and_purge_cascade() {
+        let (store, _dir) = make_store().await;
+
+        let a = MemoryNode::new("north star", MemoryType::Semantic);
+        let b = MemoryNode::new("south star", MemoryType::Semantic);
+        store.sqlite.insert_memory(&a).await.unwrap();
+        store.sqlite.insert_memory(&b).await.unwrap();
+
+        store.sqlite.replace_layout(&[
+            (a.id.clone(), -0.5, 0.25),
+            (b.id.clone(),  0.5, -0.25),
+        ]).await.unwrap();
+
+        let (rows, stamp) = store.sqlite.get_layout().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(stamp.is_some());
+        let ra = rows.iter().find(|r| r.0 == a.id).unwrap();
+        assert!((ra.1 + 0.5).abs() < 1e-6 && (ra.2 - 0.25).abs() < 1e-6);
+
+        // replace_layout is a full swap, not an append.
+        store.sqlite.replace_layout(&[(a.id.clone(), 0.1, 0.1)]).await.unwrap();
+        assert_eq!(store.sqlite.get_layout().await.unwrap().0.len(), 1);
+
+        // Purging the memory takes its layout row with it (ON DELETE CASCADE).
+        store.sqlite.delete_memory(&a.id, &VisibilityScope::global()).await.unwrap();
+        assert!(store.sqlite.purge_memory(&a.id, &VisibilityScope::global()).await.unwrap());
+        assert!(store.sqlite.get_layout().await.unwrap().0.is_empty());
+    }
+
     // R-04: a content edit snapshots the PRIOR row into memory_versions
     // (Python parity — get_memory_versions' "each content change creates a
     // snapshot" contract). Metadata-only updates snapshot nothing.
