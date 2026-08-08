@@ -10,7 +10,7 @@
 
 [![Rust](https://img.shields.io/badge/rust-1.78%2B-orange?logo=rust)](https://rustup.rs)
 [![Tools](https://img.shields.io/badge/MCP_tools-67%2F67-brightgreen)](#-the-tool-surface-67)
-[![Tests](https://img.shields.io/badge/tests-250_passing-brightgreen)](#-building-from-source)
+[![Tests](https://img.shields.io/badge/tests-264_passing-brightgreen)](#-building-from-source)
 [![Platform](https://img.shields.io/badge/platform-arm64_%7C_x86__64-lightgrey)](#-deployment)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
@@ -117,7 +117,7 @@ Four crates, one brain:
 crates/
   cerebro/        # the library — engines, activation math, storage, vision, ingestion
   cerebro-mcp/    # MCP-over-stdio binary — the agent-facing drop-in (67 tools)
-  cerebro-api/    # axum REST API + dashboard (optional, 127.0.0.1:8765, token auth)
+  cerebro-api/    # axum REST API + the Lucida observatory (127.0.0.1:8765, token auth)
   cerebro-cli/    # clap CLI (cerebro remember / recall / stats / dream ...)
 ```
 
@@ -125,7 +125,7 @@ crates/
 graph TB
     subgraph Frontends
         MCP[cerebro-mcp<br/>67 MCP tools]
-        API[cerebro-api<br/>REST + dashboard]
+        API[cerebro-api<br/>REST + Lucida observatory]
         CLI[cerebro<br/>CLI]
     end
 
@@ -446,11 +446,11 @@ cargo test                   # 250 tests, no network, no model download
 
 | Suite | Tests | What it gates |
 |-------|-------|---------------|
-| cerebro (unit) | 135 | engines, activation vs Python fixtures (±1e-4), dream phases, vision, ingestion, transport-free logic |
-| cerebro (integration) | 69 | storage CRUD, scope enforcement, migration + reap, retention, cortex end-to-end |
-| cerebro-mcp | 44 | dispatch routing, tool contracts, audit trail, panic isolation, frame caps |
-| cerebro-api | 2 | priority-casing parity with MCP |
-| **total** | **250** | |
+| cerebro (unit) | 137 | engines, activation vs Python fixtures (±1e-4), dream phases, vision, ingestion, transport-free logic |
+| cerebro (integration) | 76 | storage CRUD, scope enforcement, migration + reap, retention, cortex end-to-end |
+| cerebro-mcp | 46 | dispatch routing, tool contracts, audit trail, panic isolation, frame caps |
+| cerebro-api | 5 | priority casing, PCA projection, route-syntax pin |
+| **total** | **264** | |
 
 ## 🔗 Related
 

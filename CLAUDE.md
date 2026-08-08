@@ -15,7 +15,7 @@ See also: [ARCHITECTURE.md](ARCHITECTURE.md) | [CONTRIBUTING.md](CONTRIBUTING.md
 crates/
   cerebro/        # library — all cognitive logic (types, models, activation, engines, storage)
   cerebro-mcp/    # MCP-over-stdio binary (67 tools) — the ApexOS drop-in
-  cerebro-api/    # axum REST API + dashboard (optional, mirrors Python cerebro-api)
+  cerebro-api/    # axum REST API + the Lucida observatory (ui-web/ embedded, served at /)
   cerebro-cli/    # clap CLI (mirrors Python cerebro CLI)
 ```
 
@@ -107,6 +107,8 @@ agentd never knows. Same 67 tools. Same MCP contract.
 |-----|---------|---------|
 | `CEREBRO_DATA_DIR` | `~/.cerebro-cortex/` | SQLite DB + exports root |
 | `CEREBRO_EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | fastembed model ID |
+| `CEREBRO_API_ADDR` | `127.0.0.1:8765` | cerebro-api bind — non-loopback REQUIRES a token |
+| `CEREBRO_API_TOKEN` | — | cerebro-api bearer/`?token=` auth (falls back to `AGENTD_TOKEN`) |
 | `ANTHROPIC_API_KEY` | — | Required for dream engine LLM phases |
 | `SQLITE_VEC_PATH` | system default | Path to `sqlite-vec` `.so` (TBD on Pi — `apt-cache show sqlite-vec`) |
 | `RUST_LOG` | `info` | tracing filter — logs go to stderr, stdout is MCP JSON-RPC |
@@ -160,15 +162,7 @@ This feeds the knowledge graph. Dream cycles (`dream_run`) then consolidate acro
 
 ---
 
-**Lucida U4 done (2026-08-08)** — the Dream observatory, the last placard: `GET /dream/reports` (new `list_dream_reports`) feeds a cycle timeline + scrubbable per-phase anatomy (honest "LLM-skipped" dimming); DREAM NOW runs a real audited `POST /dream/run` from the panel; the field overlays exo-evolution state from export tags (champion halos, mutant dashes, dream-born rings, prune-candidate guttering) + trash embers with layout coords. Gate passed: an 8-phase cycle run from the observatory, links 5889→5893 on camera. **All five web lenses are live** — the full charter "overlay diff" (per-cycle affected-id lists in report metadata) is the noted engine-side follow-on. Remaining U-steps: U5 (Slint mirror), U6 (polish). 264 tests green.
-
-**Lucida U1b done (2026-08-08)** — the instruments: settings drawer (motion/field/live knobs + layout recompute + which-skull `GET /meta` indicator, localStorage-persisted), compose (real `remember` pipeline, visibility select), card edit (PUT with version snapshot + `edited_by`), trash browser (restore / confirm-purge), link-drawing (`associate` from a selected star). API: mutations now audit (the observatory shows in its own EEG), remember/update accept `visibility`, R-08 fixed (trash lifecycle uses the graph-eviction wrappers). **Field find: Python-migrated DBs carry `memory_versions` with an FK to the ghost `memory_nodes`** — W-A's snapshot/purge writes failed on BOTH local brains; `repair_ghost_fk_memory_versions` now runs on every open (row-preserving, idempotent), queued HIGH for ApexOS (every colony brain is Python-migrated). Release `cerebro-mcp` rebuilt post-repair — reload again. 264 tests green.
-
-**Lucida U3 done (2026-08-08)** — the Live lens (EEG): `GET /events` SSE-tails the audit log (rowid cursor, `?since`/`?poll_ms`; async-stream dep), `GET /audit/since/{id}` is the REST replay; the field pulses on any agent's mutation in every lens, ticker panel in Live. Gate passed: stdio `cerebro-mcp` remember → SSE tap same poll window. **Two finds:** (1) axum was pinned 0.7 while the whole cerebro-api router used 0.8 brace params — every parameterized route was a silent 404 since birth (0.8 bump + `parameterized_routes_resolve` pin); (2) **there are two brains** — the dev MCP (`.claude.json`) runs with `CEREBRO_DATA_DIR=~/Projects/CerebroCortex/data` (the real FORGE: 703 memories, 330 audit rows, fully embedded), while `~/.cerebro-cortex/` (the default the U1–U3 gate runs observed) is a May-era snapshot. The U3 "no audit rows" reading was the wrong skull; the session binary was wave-5-current, just pre-W-A/pre-spread-fix — rebuilt 2026-08-08 (Hermes' `~/.local/bin` copy too). **Point Lucida at the real brain**: `CEREBRO_DATA_DIR=~/Projects/CerebroCortex/data cerebro-api`. 263 tests green.
-
-**Lucida U2 done (2026-08-08)** — the Thought lens: `POST /recall/trace` returns a real recall plus its anatomy (`recall_traced`/`RecallTrace` in cortex, `spread_events`/`TraceEvent` in spreading; `recall`/`spread_traced` are now thin wrappers — same math, same reinforcement), and the field animates the actual per-hop spread. **The lens's first real query exposed a shared design bug: the spread budget counted seeds, recall over-fetches k*5=50=cap, so spreading activation was a silent no-op on every mature brain (Python inherits it — spreading.py:155).** Budget now bounds growth; regression test rides; dev-brain measurement: 0→75 walks, top score 0.415→0.62. Queued upstream in FORWARD-PORT-TO-APEXOS.md (HIGH). U1b settings backlog captured in the charter.
-
-**Lucida U1 done (2026-08-08)** — the observatory dashboard's Atlas lens is live: `ui-web/` (vanilla HTML/JS/CSS, no build step) embedded into `cerebro-api` via `include_str!` and served at `/`; new routes `GET /graph/export` (nodes+edges with live ACT-R/FSRS channels, scope-filtered, capped) and `GET|POST /graph/layout` (cached top-2-PCA of `memories.embedding` in the new `graph_layout` table — ON DELETE CASCADE, the R-06 lesson applied at birth). Field: semantic starfield, density-LOD edges, hover=tooltip/click=pinned-card, `/recall`-backed search, health lens (cold links + isolated rings). Design charter + field notes: `docs/UI-DESIGN.md`. Gate passed against the live dev brain (369 memories / 5,885 links; `cerebro backfill` embedded the 332 vector-less rows first). Next: U1b (settings + CRUD), U2 (traced-recall Thought lens).
+**Lucida arc done (2026-08-08)** — the observatory shipped end-to-end (PRs #21–#29; charter + field notes: `docs/UI-DESIGN.md`). First the 44-finding adversarial self-review (`SELF-REVIEW-2026-08-07.md`, waves W-A..W-G) with **W-A data-integrity applied** (REM `truncate_chars`, store-level version snapshots via `update_memory_noted`, `visibility` honored with the **SHARED parity default — pass `visibility:"private"` explicitly for FORGE-only memories**, purge FK children). Then all five web lenses over the live brain: Atlas (`ui-web/` vanilla Canvas2D embedded via `include_str!`; `/graph/export` live ACT-R/FSRS channels + `/graph/layout` cached PCA in the `graph_layout` table; density-LOD edges), Thought (`POST /recall/trace` — `recall_traced`/`spread_events` animate the real per-hop spread), Live (`GET /events` SSE audit tail + `/audit/since/{id}`), Health, Dream observatory (`/dream/reports`, audited DREAM NOW, tag-driven exo overlay) — plus the U1b instruments (settings drawer, compose/edit/trash/link-draw CRUD, **API mutations now audit**, R-08 graph-eviction wrappers, `GET /meta` which-skull). **Four engine bugs found by the lenses' first real use**: the spread seed-cap no-op (budget counted seeds — spreading was silently dead on every mature brain; Python inherits it, spreading.py:155), the axum-0.7-pin brace-route 404s (whole parameterized REST surface dead since birth; 0.8 bump, zero code changes), the Python ghost-FK in `memory_versions` (`repair_ghost_fk_memory_versions` on every open), and R-08. Upstream queue: ApexOS-RS `BACKPORT-QUEUE.md` (their #337); the local FORWARD-PORT file is a pointer. **Two brains**: the dev MCP runs the REAL FORGE brain (`CEREBRO_DATA_DIR=~/Projects/CerebroCortex/data`, 700+ memories); `~/.cerebro-cortex/` is a May-era snapshot — observatory over the real brain: `CEREBRO_DATA_DIR=~/Projects/CerebroCortex/data cerebro-api` → 127.0.0.1:8765. 264 tests green.
 
 **Backport wave 5 done (2026-07-28)** — the two queue entries from ApexOS-RS #286/#288 landed and BACKPORT-QUEUE.md retired (empty). (1) Listing summaries: `list_procedures`/`list_intentions`/`list_schemas`/`find_by_tags` return `wire_summary` rows (`content_head` 200 chars + honest `content_chars`); fetchers stay full-body, `list_deleted` keeps `wire_node` (only pre-restore window). (2) The colony's field findings — four nodes cross-checked `never_traversed_links_pct: 100.0` and were right three ways: `insert_link` is now an ON CONFLICT ratchet (weight=MAX, stamp, count+1 — Python `add_link` parity; OR REPLACE wiped activation history), `GraphStore::add_edge` updates in place (parallel petgraph edges double-counted spreading conductance), `spread_traced` + `record_traversals` batch-stamp walked links in recall (documented deviation from Python — the write half the port never had), and thalamus gate 2 dedups exact content per owner space (reinforce + return existing; messages exempt). 250 tests green.
 
@@ -218,20 +212,27 @@ This feeds the knowledge graph. Dream cycles (`dream_run`) then consolidate acro
 
 ---
 
-## Deferred / TBD
+## Deferred / TBD (the backlog)
 
-- `sqlite-vec` `.so` path on Pi — confirm before writing `storage/vector.rs`
-- `fastembed` model cache location on Pi — confirm on first deploy
-- Python ↔ Rust DB schema compat — verify same column names/types (step 12)
-- CCBS (Cognitive Bootstrap modules) — defer until core is solid
-- Semantic chunking for `ingest_file` — the Rust port chunks by paragraph/sentence
-  (Python parity with the legacy chunker); Python's embedding-based SemanticChunker
-  is unported. PDF embedded-image extraction and OCR likewise (VLM captions cover
-  visible text). Port if ingestion quality ever becomes the bottleneck
-- Dream-cycle **resume** (skip completed phases) — needs a persisted per-cycle phase table + a `cycle_id` on the `dream_run` tool (audit C-RS-004; pre-phase cleanup + `episodes_consolidated` already shipped)
-- MCP `resources`/`prompts` surfaces (3 prompts) — port only if an ApexOS consumer needs them; capabilities are advertised honestly so nothing is broken (audit C-RS-011)
-- Recall wire-shape parity vs agentd — verify during the ApexOS-RS integration pass (audit C-RS-014)
-- Topology/skill-invalidation exploration — gated experiment plan in `docs/ideas/CEREBRO_TOPO_EXPLORATION_PLAN.md` (reconciled against code 2026-07-27; backfill + dream hygiene already shipped from it)
+- **Lucida U5** — Slint native mirror (dashboard + Atlas + Thought; new `ui-slint`
+  crate) and **U6** — health-lens polish + time-lapse. Charter: `docs/UI-DESIGN.md`
+- **Review waves W-B..W-F** — the remaining verified findings in
+  `SELF-REVIEW-2026-08-07.md` (W-B first: CLI `delete --force` trap, dream
+  episode-gating compounding)
+- **ApexOS port execution** — their `BACKPORT-QUEUE.md` (#337): W-A + ghost-FK
+  repair land TOGETHER, seed-cap spread fix, traced recall, optional Lucida
+- **Dream overlay diff** — record per-phase affected-id lists into dream-report
+  metadata so the Dream lens can show exactly what a cycle changed (charter U4 note)
+- Dream-cycle **resume** (C-RS-004) — persisted per-cycle phase table + `cycle_id`
+- MCP `resources`/`prompts` surfaces (C-RS-011) — only if an ApexOS consumer needs them
+- Recall wire-shape parity vs agentd (C-RS-014) — verify during the ApexOS integration pass
+- Semantic chunking for `ingest_file` + PDF embedded-image/OCR — port if ingestion
+  quality becomes the bottleneck (VLM captions cover visible text today)
+- Topology/skill-invalidation exploration — gated plan in
+  `docs/ideas/CEREBRO_TOPO_EXPLORATION_PLAN.md`
+- CCBS (Cognitive Bootstrap modules) — defer until wanted
+- **Pi 5 standalone deploy** — still pending from way back: confirm `sqlite-vec`
+  `.so` path + fastembed cache location on the Pi at first deploy
 
 ---
 
