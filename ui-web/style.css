@@ -200,6 +200,56 @@ body[data-lens="health"] #health-panel { display: block; }
 #health-panel .note { margin-top: 10px; font-size: 11px; color: var(--ink-3); }
 #health-panel code { font-family: var(--mono); font-size: 10px; }
 
+/* ---------- dream observatory panel ---------- */
+#dream-panel {
+  position: fixed; top: 64px; right: 14px; width: 360px; z-index: 14;
+  background: var(--panel); border: 1px solid var(--panel-line); border-radius: 10px;
+  padding: 14px 16px; backdrop-filter: blur(6px); display: none;
+  max-height: calc(100vh - 100px); overflow-y: auto;
+}
+body[data-lens="dream"] #dream-panel { display: block; }
+#dream-panel h2 {
+  margin: 0 0 2px; font-family: var(--mono); font-size: 10px;
+  letter-spacing: 0.16em; color: var(--ink-2); font-weight: 600;
+}
+#dream-panel .meta { font-family: var(--mono); font-size: 9.5px; color: var(--ink-3); margin-bottom: 10px; }
+#dream-timeline { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
+#dream-timeline .cycle {
+  display: flex; gap: 8px; align-items: baseline; cursor: pointer;
+  border-radius: 5px; padding: 3px 6px; border: 1px solid transparent;
+}
+#dream-timeline .cycle:hover { background: rgba(122,152,199,0.09); }
+#dream-timeline .cycle[aria-selected="true"] {
+  border-color: rgba(58,125,224,0.45); background: rgba(58,125,224,0.10);
+}
+#dream-timeline .when { font-family: var(--mono); font-size: 10px; color: var(--ink); flex: none; font-variant-numeric: tabular-nums; }
+#dream-timeline .who { font-family: var(--mono); font-size: 9px; color: #d9906a; flex: none; }
+#dream-timeline .sum { font-size: 10.5px; color: var(--ink-2); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#dream-anatomy { display: flex; flex-direction: column; gap: 3px; margin-bottom: 8px; }
+#dream-anatomy .ph {
+  display: flex; gap: 8px; align-items: baseline;
+  border-top: 1px solid var(--panel-line); padding: 4px 0 2px;
+}
+#dream-anatomy .ph:first-child { border-top: 0; }
+#dream-anatomy .pname {
+  font-family: var(--mono); font-size: 9px; letter-spacing: 0.04em; color: var(--ink);
+  flex: none; width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+#dream-anatomy .pfx { font-size: 10.5px; color: var(--ink-2); flex: 1; }
+#dream-anatomy .ph.skipped .pname, #dream-anatomy .ph.skipped .pfx { color: var(--ink-3); }
+#dream-status { font-size: 11px; color: var(--ink-3); }
+#dream-status.ok { color: #3aa76c; }
+#dream-status.err { color: var(--status-risk); }
+.dream-legend {
+  margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--panel-line);
+  display: flex; flex-wrap: wrap; gap: 6px 14px;
+  font-family: var(--mono); font-size: 8.5px; letter-spacing: 0.08em; color: var(--ink-2);
+}
+.dream-legend i {
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  margin-right: 4px; box-shadow: 0 0 5px currentColor; vertical-align: -1px;
+}
+
 /* ---------- live panel (the EEG ticker) ---------- */
 #live-panel {
   position: fixed; top: 64px; right: 14px; width: 340px; z-index: 14;

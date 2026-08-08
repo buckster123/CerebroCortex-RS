@@ -154,7 +154,7 @@ env/config.
 | U1b | settings drawer + memory CRUD + link-drawing (instruments over existing routes) | a memory created, edited, and trashed from the UI round-trips — **shipped 2026-08-08; the round-trip's first run caught the Python ghost-FK (see field notes)** |
 | U2 | trace-carrying recall + Thought lens ripple | a typed query animates its real spread — **shipped 2026-08-08; and the lens's first real query exposed the seed-cap spread no-op (see field notes)** |
 | U3 | SSE audit tail + Live lens glow | an MCP `remember` from another terminal ripples in ≤2s — **shipped 2026-08-08; gate passed (stdio `cerebro-mcp` remember → SSE tap in the same poll window); found the axum-0.7 brace-route 404 and the stale dev-MCP binary along the way** |
-| U4 | Dream observatory + `/dream/reports` | a real dream cycle scrubbable |
+| U4 | Dream observatory + `/dream/reports` | a real dream cycle scrubbable — **shipped 2026-08-08; gate passed (an 8-phase cycle run from the panel, anatomy scrubbable, links 5889→5893 on camera)** |
 | U5 | `ui-slint` mirror (dashboard + Atlas + Thought) | native app browses the same DB |
 | U6 | Health lens + time-lapse + polish | watchdog metrics visible in-field |
 
@@ -244,6 +244,23 @@ additive.
 - Settings live in `localStorage` (`lucida.settings`); the server stays
   stateless about UI preferences, as chartered. `?open=settings|compose`
   deep-links a drawer.
+
+## U4 field notes (2026-08-08)
+
+- **The lens is honest to what the engine records.** `GET /dream/reports`
+  serves every cycle with full per-phase counters; the anatomy view shows
+  them verbatim, and zero-effect phases are dimmed with "likely LLM-skipped"
+  rather than hidden. The field overlay is driven by tags already in the
+  export (`skill_champion` halo, `dream_mutated`/`dream_merged` dashes,
+  `dream_formed`/`dream_distilled`/`dream_extracted` rose rings,
+  `prune_candidate` guttering) plus trash-with-coords embers.
+- **DREAM NOW is a real instrument**: `POST /dream/run` behind a confirm —
+  the observatory can put the brain to sleep, and the run audits (the EEG
+  shows the dream happening).
+- **The charter's full "overlay diff" vision** (scrub a cycle → exactly which
+  memories were pruned/strengthened THAT cycle) needs the dream engine to
+  record affected-id lists into the report metadata — an engine-side change,
+  deliberately deferred; the tag overlay is the honest v1.
 
 ### Settings-drawer backlog for U1b (surfaced by U1+U2+U3, as predicted)
 

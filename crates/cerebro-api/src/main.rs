@@ -1276,7 +1276,20 @@ async fn dream_run(
     let scope     = scope_from(q.agent_id.as_deref());
     let brain_arc = Arc::clone(&brain);
     let report    = brain.dream.run_cycle(scope, brain_arc, q.max_llm_calls).await?;
+    audit(&brain, q.agent_id.as_deref(), "dream_run", None,
+        Some(&format!("{} phases, success={}", report.phases.len(), report.success))).await;
     Ok(Json(serde_json::to_value(&report)?))
+}
+
+/// GET /dream/reports — the observatory timeline (Lucida U4): every recorded
+/// cycle, newest first, full per-phase counters.
+async fn dream_reports(
+    Query(q): Query<LimitQuery>,
+    State(brain): State<Brain>,
+) -> AppResult {
+    let rows = brain.storage.read().await.sqlite
+        .list_dream_reports(q.limit.min(100)).await?;
+    Ok(Json(json!({ "reports": rows })))
 }
 
 // dream_status is a global endpoint — the last dream report is not agent-scoped
@@ -1381,6 +1394,7 @@ fn build_router(brain: Brain) -> Router {
         // Dream
         .route("/dream/run",       post(dream_run))
         .route("/dream/status",    get(dream_status))
+        .route("/dream/reports",   get(dream_reports))
         .with_state(brain)
 }
 

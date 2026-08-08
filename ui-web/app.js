@@ -66,6 +66,8 @@ let lens = 'atlas';
 let hoverIdx = -1, selectedIdx = -1;
 let searchSet = null;         // Set of node indices matched by the last recall
 let dirty = true;
+let layoutCoords = {};        // id → [x, y] (kept for Dream-lens embers)
+const dream = { reports: [], selected: -1, embers: [] };   // U4 state
 
 /* ---------- settings (U1b): localStorage-persisted, applied live ---------- */
 const S_DEFAULTS = {
@@ -138,14 +140,22 @@ async function boot() {
       y = Math.sin(ang) * r * 0.72;
     }
     byId.set(n.id, i);
+    const tags = n.tags || [];
     return {
       id: n.id, type: n.memory_type, layer: n.layer, salience: n.salience,
-      tags: n.tags || [], head: n.content_head, chars: n.content_chars,
+      tags, head: n.content_head, chars: n.content_chars,
       glow: n.activation, retr: n.retrievability, access: n.access_count,
       created: n.created_at, agent: n.agent_id,
       x, y, rim, twinkle: h * Math.PI * 2, degree: 0,
+      /* exo-evolution markers (U4 Dream lens overlay) */
+      champion:  tags.includes('skill_champion'),
+      mutant:    tags.includes('dream_mutated') || tags.includes('dream_merged'),
+      dreamBorn: tags.includes('dream_formed') || tags.includes('dream_distilled')
+              || tags.includes('dream_extracted'),
+      pruneCand: tags.includes('prune_candidate'),
     };
   });
+  layoutCoords = layout.coords;   /* kept for ember placement (Dream lens) */
 
   edges = [];
   adj = nodes.map(() => []);
@@ -328,6 +338,9 @@ function render(now) {
     for (const p of pulses) {
       if (p.idx === i) act = Math.min(1, act + Math.max(0, 1 - (now - p.t0) / 8000) * 0.6);
     }
+    if (lens === 'dream' && n.pruneCand && !REDUCED) {
+      act *= 0.55 + 0.45 * Math.abs(Math.sin(t * 3.1 + n.twinkle));   /* guttering */
+    }
     if (!REDUCED && S.twinkle) act *= 0.93 + 0.07 * Math.sin(t * 1.7 + n.twinkle);
 
     const layerBoost = n.layer === 'working' ? 1.25 : 1;
@@ -371,6 +384,42 @@ function render(now) {
       const x = sx(nodes[i].x), y = sy(nodes[i].y);
       if (x < -20 || x > W + 20 || y < -20 || y > H + 20) continue;
       ctx.beginPath(); ctx.arc(x, y, 9 * view.k + 4, 0, 7); ctx.stroke();
+    }
+  }
+
+  /* Dream lens overlay (U4): the exo-evolution loop, watchable */
+  if (lens === 'dream') {
+    /* embers: trashed memories at their old places on the map */
+    ctx.fillStyle = 'rgba(224,82,82,0.35)';
+    for (const em of dream.embers) {
+      const x = sx(em.x), y = sy(em.y);
+      if (x < -10 || x > W + 10 || y < -10 || y > H + 10) continue;
+      ctx.beginPath(); ctx.arc(x, y, 2.2, 0, 7); ctx.fill();
+    }
+    /* marker rings on living stars */
+    for (let i = 0; i < nodes.length; i++) {
+      const n = nodes[i];
+      if (n.trashed || !(n.champion || n.mutant || n.dreamBorn)) continue;
+      const x = sx(n.x), y = sy(n.y);
+      if (x < -30 || x > W + 30 || y < -30 || y > H + 30) continue;
+      const r = (3.2 + n.salience * 9) * view.k + 5;
+      if (n.champion) {          /* the crowned: a golden halo */
+        ctx.strokeStyle = 'rgba(232,193,90,0.85)';
+        ctx.lineWidth = 1.6;
+        ctx.beginPath(); ctx.arc(x, y, r + 2, 0, 7); ctx.stroke();
+      }
+      if (n.mutant) {            /* variation offspring: violet dashes */
+        ctx.strokeStyle = 'rgba(143,110,224,0.8)';
+        ctx.lineWidth = 1.2;
+        ctx.setLineDash([3, 3]);
+        ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.stroke();
+        ctx.setLineDash([]);
+      }
+      if (n.dreamBorn) {         /* born in a dream: a rose ring */
+        ctx.strokeStyle = 'rgba(207,93,150,0.7)';
+        ctx.lineWidth = 1.1;
+        ctx.beginPath(); ctx.arc(x, y, r - 2, 0, 7); ctx.stroke();
+      }
     }
   }
 
@@ -618,10 +667,7 @@ document.getElementById('results-replay').addEventListener('click', () => {
 });
 
 /* ---------- lenses ---------- */
-const PLACARDS = {
-  dream: ['U4', 'Dream observatory',
-    'Dream reports on a timeline. Scrub a cycle to watch phase effects as overlay diffs: pruned memories collapse to embers, a newborn schema flares with rays to its sources, the skill-competition champion takes a halo while dominated rivals dim toward the prune floor.'],
-};
+const PLACARDS = {};   /* every lens is real now */
 
 /* ---------- Live (U3): the audit-log EEG ---------- */
 /* The stream connects at boot and stays up in every lens — a mutation
@@ -729,6 +775,7 @@ function setLens(name) {
   document.getElementById('query').placeholder =
     name === 'thought' ? 'think…  (a traced recall — you will watch it spread)' : 'recall…';
   if (name !== 'thought' && thought.trace) clearSearch();
+  if (name === 'dream') loadDreams();
   const pl = PLACARDS[name];
   if (pl) {
     document.getElementById('placard-phase').textContent = 'CHARTER · ' + pl[0];
@@ -946,6 +993,113 @@ async function completeLink(targetIdx) {
   selectNode(targetIdx);
   dirty = true;
 }
+
+/* ---------- Dream observatory (U4) ---------- */
+async function loadDreams() {
+  let resp, trash;
+  try {
+    [resp, trash] = await Promise.all([
+      api('/dream/reports?limit=30'),
+      api('/trash?limit=100'),
+    ]);
+  } catch { return; }
+  dream.reports = resp.reports || [];
+  /* embers: trashed memories that still have a place on the semantic map */
+  dream.embers = (trash || [])
+    .filter(m => layoutCoords[m.id])
+    .map(m => ({
+      x: layoutCoords[m.id][0] * 850, y: layoutCoords[m.id][1] * 850,
+      head: (m.content || '').slice(0, 40),
+    }));
+  renderDreamTimeline();
+  if (dream.reports.length && dream.selected < 0) selectCycle(0);
+  document.getElementById('dream-meta').textContent = dream.reports.length
+    ? dream.reports.length + ' cycle(s) · ' + dream.embers.length + ' ember(s) in the trash'
+    : 'no cycles recorded yet — DREAM NOW runs one';
+  dirty = true;
+}
+
+function renderDreamTimeline() {
+  const tl = document.getElementById('dream-timeline');
+  tl.innerHTML = '';
+  dream.reports.forEach((r, i) => {
+    const div = document.createElement('div');
+    div.className = 'cycle';
+    div.setAttribute('aria-selected', String(i === dream.selected));
+    const phases = Array.isArray(r.phases) ? r.phases : [];
+    const sums = phases.reduce((a, p) => ({
+      pruned:  a.pruned  + (p.memories_pruned || 0),
+      schemas: a.schemas + (p.schemas_extracted || 0) + (p.skills_distilled || 0),
+      links:   a.links   + (p.links_created || 0) + (p.links_strengthened || 0),
+    }), { pruned: 0, schemas: 0, links: 0 });
+    div.innerHTML = '<span class="when"></span><span class="who"></span><span class="sum"></span>';
+    div.querySelector('.when').textContent =
+      (r.started_at || '').slice(5, 16).replace('T', ' ');
+    div.querySelector('.who').textContent = r.agent_id || '·';
+    div.querySelector('.sum').textContent =
+      `${phases.length} phases · ${sums.links} links · ${sums.schemas} schemas · ${sums.pruned} pruned`;
+    div.addEventListener('click', () => selectCycle(i));
+    tl.appendChild(div);
+  });
+}
+
+/* Compact honest effect line per phase; zero-effect LLM-skip phases dim. */
+function phaseEffects(p) {
+  const parts = [];
+  const add = (n, label) => { if (n) parts.push(n + ' ' + label); };
+  add(p.memories_processed, 'processed');
+  add(p.links_created, 'links+');
+  add(p.links_strengthened, 'strengthened');
+  add(p.schemas_extracted, 'schemas');
+  add(p.skills_distilled, 'skills');
+  add(p.procedures_extracted, 'procedures');
+  add(p.procedures_rediscovered, 'rediscovered');
+  add(p.procedures_mutated, 'mutated');
+  add(p.procedures_merged, 'merged');
+  add(p.niches_contested, 'niches');
+  add(p.champions_marked, 'champions');
+  add(p.procedures_demoted, 'demoted');
+  add(p.memories_pruned, 'pruned');
+  add(p.episodes_consolidated, 'episodes');
+  add(p.llm_calls, 'LLM calls');
+  if (!parts.length) return p.success ? 'no effect (likely LLM-skipped)' : 'failed';
+  return parts.join(' · ');
+}
+
+function selectCycle(i) {
+  dream.selected = i;
+  renderDreamTimeline();
+  const anatomy = document.getElementById('dream-anatomy');
+  anatomy.innerHTML = '';
+  const r = dream.reports[i];
+  if (!r) return;
+  for (const p of (Array.isArray(r.phases) ? r.phases : [])) {
+    const div = document.createElement('div');
+    const fx = phaseEffects(p);
+    div.className = 'ph' + (fx.startsWith('no effect') ? ' skipped' : '');
+    div.innerHTML = '<span class="pname"></span><span class="pfx"></span>';
+    div.querySelector('.pname').textContent = p.phase;
+    div.querySelector('.pfx').textContent = fx;
+    anatomy.appendChild(div);
+  }
+}
+
+document.getElementById('dream-now').addEventListener('click', async () => {
+  if (!confirm('Run a real consolidation cycle? The brain will change — links strengthen, schemas may form, prune candidates may retire.')) return;
+  const status = document.getElementById('dream-status');
+  status.className = ''; status.textContent = 'dreaming…';
+  try {
+    const report = await api('/dream/run' +
+      (AGENT ? '?agent_id=' + encodeURIComponent(AGENT) : ''), { method: 'POST' });
+    status.className = 'ok';
+    status.textContent = 'cycle complete (' + (report.phases || []).length +
+      ' phases) — reload the field to see the new sky';
+  } catch (e) {
+    status.className = 'err'; status.textContent = e.message;
+  }
+  dream.selected = -1;
+  loadDreams();
+});
 
 /* shareable boot params: ?lens=health opens a lens, ?q=… runs a recall */
 boot().then(() => {
