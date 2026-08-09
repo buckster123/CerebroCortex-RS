@@ -101,6 +101,7 @@ CerebroCortex-RS/
 │   ├── cerebro-api/                  # axum REST API + the Lucida observatory (serves ui-web/ at /)
 │   └── cerebro-cli/                  # clap CLI (step 11)
 ├── ui-web/                           # Lucida: 5-lens web observatory (vanilla JS, no build step) — docs/UI-DESIGN.md
+├── ui-slint/                         # cerebro-ui: Lucida's native mirror (Slint; dashboard + Atlas + Thought)
 ├── tests/
 │   ├── integration_test.rs           # build-order gate tests
 │   └── fixtures/

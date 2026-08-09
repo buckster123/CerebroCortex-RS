@@ -10,7 +10,7 @@
 
 [![Rust](https://img.shields.io/badge/rust-1.78%2B-orange?logo=rust)](https://rustup.rs)
 [![Tools](https://img.shields.io/badge/MCP_tools-67%2F67-brightgreen)](#-the-tool-surface-67)
-[![Tests](https://img.shields.io/badge/tests-264_passing-brightgreen)](#-building-from-source)
+[![Tests](https://img.shields.io/badge/tests-274_passing-brightgreen)](#-building-from-source)
 [![Platform](https://img.shields.io/badge/platform-arm64_%7C_x86__64-lightgrey)](#-deployment)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
@@ -119,6 +119,7 @@ crates/
   cerebro-mcp/    # MCP-over-stdio binary — the agent-facing drop-in (67 tools)
   cerebro-api/    # axum REST API + the Lucida observatory (127.0.0.1:8765, token auth)
   cerebro-cli/    # clap CLI (cerebro remember / recall / stats / dream ...)
+ui-slint/         # cerebro-ui — Lucida's native mirror (Slint; dashboard + Atlas + Thought)
 ```
 
 ```mermaid
@@ -450,7 +451,8 @@ cargo test                   # 250 tests, no network, no model download
 | cerebro (integration) | 76 | storage CRUD, scope enforcement, migration + reap, retention, cortex end-to-end |
 | cerebro-mcp | 46 | dispatch routing, tool contracts, audit trail, panic isolation, frame caps |
 | cerebro-api | 5 | priority casing, PCA projection, route-syntax pin |
-| **total** | **264** | |
+| ui-slint | 10 | field placement (web-parity FNV-1a), star/edge ranking, trace prep honesty |
+| **total** | **274** | |
 
 ## 🔗 Related
 

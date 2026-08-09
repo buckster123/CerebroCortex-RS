@@ -4,6 +4,7 @@ members = [
     "crates/cerebro-mcp",
     "crates/cerebro-api",
     "crates/cerebro-cli",
+    "ui-slint",
 ]
 resolver = "2"
 

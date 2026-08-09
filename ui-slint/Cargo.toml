@@ -1,0 +1,25 @@
+[package]
+name    = "ui-slint"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "cerebro-ui"
+path = "src/main.rs"
+
+[dependencies]
+# Default features = winit + femtovg (desktop). Add "backend-linuxkms-noseat"
+# when a Pi kiosk build is wanted (house note: Prefrontal-RS ui-slint).
+slint       = "1"
+tokio       = { workspace = true }
+reqwest     = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+anyhow      = { workspace = true }
+chrono      = { workspace = true }
+# PNG encode for the LUCIDA_SNAPSHOT self-verification hook.
+image       = { version = "0.25", default-features = false, features = ["png"] }
+
+[build-dependencies]
+slint-build = "1"
