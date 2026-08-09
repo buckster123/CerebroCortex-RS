@@ -17,6 +17,7 @@ crates/
   cerebro-mcp/    # MCP-over-stdio binary (67 tools) — the ApexOS drop-in
   cerebro-api/    # axum REST API + the Lucida observatory (ui-web/ embedded, served at /)
   cerebro-cli/    # clap CLI (mirrors Python cerebro CLI)
+ui-slint/         # cerebro-ui — Lucida's native mirror (Slint; dashboard + Atlas + Thought)
 ```
 
 Full design and build order: [ARCHITECTURE.md](ARCHITECTURE.md).
@@ -162,6 +163,8 @@ This feeds the knowledge graph. Dream cycles (`dream_run`) then consolidate acro
 
 ---
 
+**Lucida U5 done (2026-08-09)** — the native mirror: root-level `ui-slint/` crate (binary `cerebro-ui`, house two-file shape per Prefrontal-RS D4: `src/main.rs` + `ui/main.slint`, pure logic unit-tested in `src/logic.rs`). Dashboard + Atlas + Thought over the same JSON surface (`/meta`, `/stats`, `/graph/export`, `/graph/layout`, `POST /recall/trace`, full bodies from `/memory/{id}`); placement math ported byte-for-byte from app.js (FNV-1a jitter/rim) so the two skies match; pan/zoom rides the edge-Path **viewbox bindings** (commands stay in field coords, built once); brightest-400/strongest-900 caps with the honest meta line; ripple = tokio task stepping hops at 950ms, gen-counter cancelled. Config: `CEREBRO_API_URL` + `CEREBRO_API_TOKEN`/`AGENTD_TOKEN`, `LUCIDA_AGENT`/`_STARS`/`_EDGES`. Gate passed against the real brain (769 mem / 12,507 links): field + panels + an 87-walk traced recall on camera. **Field find: `take_snapshot` under winit-femtovg returns the last *presented* frame** — an occluded window stops presenting, so captures lie; `SLINT_BACKEND=winit-software` re-renders synchronously (the `LUCIDA_SNAPSHOT` self-verify hook documents this). 274 tests green.
+
 **Lucida arc done (2026-08-08)** — the observatory shipped end-to-end (PRs #21–#29; charter + field notes: `docs/UI-DESIGN.md`). First the 44-finding adversarial self-review (`SELF-REVIEW-2026-08-07.md`, waves W-A..W-G) with **W-A data-integrity applied** (REM `truncate_chars`, store-level version snapshots via `update_memory_noted`, `visibility` honored with the **SHARED parity default — pass `visibility:"private"` explicitly for FORGE-only memories**, purge FK children). Then all five web lenses over the live brain: Atlas (`ui-web/` vanilla Canvas2D embedded via `include_str!`; `/graph/export` live ACT-R/FSRS channels + `/graph/layout` cached PCA in the `graph_layout` table; density-LOD edges), Thought (`POST /recall/trace` — `recall_traced`/`spread_events` animate the real per-hop spread), Live (`GET /events` SSE audit tail + `/audit/since/{id}`), Health, Dream observatory (`/dream/reports`, audited DREAM NOW, tag-driven exo overlay) — plus the U1b instruments (settings drawer, compose/edit/trash/link-draw CRUD, **API mutations now audit**, R-08 graph-eviction wrappers, `GET /meta` which-skull). **Four engine bugs found by the lenses' first real use**: the spread seed-cap no-op (budget counted seeds — spreading was silently dead on every mature brain; Python inherits it, spreading.py:155), the axum-0.7-pin brace-route 404s (whole parameterized REST surface dead since birth; 0.8 bump, zero code changes), the Python ghost-FK in `memory_versions` (`repair_ghost_fk_memory_versions` on every open), and R-08. Upstream queue: ApexOS-RS `BACKPORT-QUEUE.md` (their #337); the local FORWARD-PORT file is a pointer. **Two brains**: the dev MCP runs the REAL FORGE brain (`CEREBRO_DATA_DIR=~/Projects/CerebroCortex/data`, 700+ memories); `~/.cerebro-cortex/` is a May-era snapshot — observatory over the real brain: `CEREBRO_DATA_DIR=~/Projects/CerebroCortex/data cerebro-api` → 127.0.0.1:8765. 264 tests green.
 
 **Backport wave 5 done (2026-07-28)** — the two queue entries from ApexOS-RS #286/#288 landed and BACKPORT-QUEUE.md retired (empty). (1) Listing summaries: `list_procedures`/`list_intentions`/`list_schemas`/`find_by_tags` return `wire_summary` rows (`content_head` 200 chars + honest `content_chars`); fetchers stay full-body, `list_deleted` keeps `wire_node` (only pre-restore window). (2) The colony's field findings — four nodes cross-checked `never_traversed_links_pct: 100.0` and were right three ways: `insert_link` is now an ON CONFLICT ratchet (weight=MAX, stamp, count+1 — Python `add_link` parity; OR REPLACE wiped activation history), `GraphStore::add_edge` updates in place (parallel petgraph edges double-counted spreading conductance), `spread_traced` + `record_traversals` batch-stamp walked links in recall (documented deviation from Python — the write half the port never had), and thalamus gate 2 dedups exact content per owner space (reinforce + return existing; messages exempt). 250 tests green.
@@ -214,8 +217,7 @@ This feeds the knowledge graph. Dream cycles (`dream_run`) then consolidate acro
 
 ## Deferred / TBD (the backlog)
 
-- **Lucida U5** — Slint native mirror (dashboard + Atlas + Thought; new `ui-slint`
-  crate) and **U6** — health-lens polish + time-lapse. Charter: `docs/UI-DESIGN.md`
+- **Lucida U6** — health-lens polish + time-lapse. Charter: `docs/UI-DESIGN.md`
 - **Review waves W-B..W-F** — the remaining verified findings in
   `SELF-REVIEW-2026-08-07.md` (W-B first: CLI `delete --force` trap, dream
   episode-gating compounding)

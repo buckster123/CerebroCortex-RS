@@ -155,7 +155,7 @@ env/config.
 | U2 | trace-carrying recall + Thought lens ripple | a typed query animates its real spread — **shipped 2026-08-08; and the lens's first real query exposed the seed-cap spread no-op (see field notes)** |
 | U3 | SSE audit tail + Live lens glow | an MCP `remember` from another terminal ripples in ≤2s — **shipped 2026-08-08; gate passed (stdio `cerebro-mcp` remember → SSE tap in the same poll window); found the axum-0.7 brace-route 404 and the stale dev-MCP binary along the way** |
 | U4 | Dream observatory + `/dream/reports` | a real dream cycle scrubbable — **shipped 2026-08-08; gate passed (an 8-phase cycle run from the panel, anatomy scrubbable, links 5889→5893 on camera)** |
-| U5 | `ui-slint` mirror (dashboard + Atlas + Thought) | native app browses the same DB |
+| U5 | `ui-slint` mirror (dashboard + Atlas + Thought) | native app browses the same DB — **shipped 2026-08-09; gate passed against the real brain (769 memories / 12,507 links): field + panels + an 87-walk traced recall rendered natively (see field notes)** |
 | U6 | Health lens + time-lapse + polish | watchdog metrics visible in-field |
 
 Each step is one PR, tests riding. U1 is the bulk; everything after is
@@ -261,6 +261,39 @@ additive.
   memories were pruned/strengthened THAT cycle) needs the dream engine to
   record affected-id lists into the report metadata — an engine-side change,
   deliberately deferred; the tag overlay is the honest v1.
+
+## U5 field notes (2026-08-09)
+
+- **The two skies match star-for-star.** The placement math (PCA coord × 850
+  + FNV-1a jitter; un-embedded → elliptical rim) is ported byte-for-byte from
+  app.js into `ui-slint/src/logic.rs`, unit-tested against the JS FNV-1a
+  values. A memory sits where the web put it.
+- **Pan/zoom without re-tessellation:** edges batch into ONE Path command
+  string in *field coordinates*, built once per refresh; pan/zoom only moves
+  the Path's `viewbox-*` bindings. Star positions are per-item bindings off
+  the same `view-cx/cy/zoom` props. Four Path layers total: base links,
+  focus, ripple-done, ripple-active.
+- **The simplified field is honest about its caps**: brightest 400 stars
+  (live activation, salience tiebreak) / strongest 900 links, both env-tunable
+  (`LUCIDA_STARS`/`LUCIDA_EDGES`), and the rail's meta line carries the true
+  counts ("400 of 769 stars · 900 of 12,507 links"). Trace walks whose
+  endpoints fall outside the cap are dropped from drawing but counted
+  ("87 walks (59 shown)") — same doctrine as the web lens vs its export cap.
+- **`take_snapshot` under winit-femtovg captures the last *presented* frame,
+  not current state.** An occluded/unmapped window stops presenting, so the
+  headless-gate snapshots showed the boot frame forever while every property
+  write had long applied — a debugging rabbit hole until the renderer was
+  swapped. `SLINT_BACKEND=winit-software` re-renders synchronously; the
+  `LUCIDA_SNAPSHOT` self-verify hook is documented to run that way. (The
+  ApexOS face-arc precedent used snapshots on a *visible* window — that's why
+  it never hit this.)
+- Hover is sampled by a 90ms `Timer` gated on `has-hover` — never a `changed`
+  handler (the "Recursion detected" gotcha); click-vs-drag disambiguates by
+  squared pixel distance since press.
+- Slint compromises, per D4 ("we compromise in Slint, never in web"): no
+  twinkle, no parallax layers, constant-screen-size stars, hop cadence fixed
+  at 950ms, results list capped at recall top-k. Dream/Live/Health stay
+  web-only until wanted.
 
 ### Settings-drawer backlog for U1b (surfaced by U1+U2+U3, as predicted)
 
