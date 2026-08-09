@@ -825,6 +825,22 @@ impl SqliteStore {
         Ok(n as usize)
     }
 
+    /// Ids of embedded live memories — the graph export's per-node `embedded`
+    /// flag (Lucida U6: a rim star that is merely awaiting a layout recompute
+    /// must not be labeled "no embedding").
+    pub async fn list_embedded_ids(&self) -> Result<std::collections::HashSet<String>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT id FROM memories WHERE embedding IS NOT NULL AND deleted_at IS NULL",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = std::collections::HashSet::new();
+        for r in rows {
+            out.insert(r?);
+        }
+        Ok(out)
+    }
+
     /// Replace the whole cached layout in one transaction (a projection is
     /// global — axes shift together, so partial updates would lie).
     pub async fn replace_layout(&self, coords: &[(MemoryId, f32, f32)]) -> Result<()> {

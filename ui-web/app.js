@@ -60,6 +60,7 @@ let edgeRank = [];            // edge indices sorted by effective weight, desc
 let byId = new Map();
 let adj = [];                 // node index → [edge index]
 let health = null;
+let islandSet = new Set();    // U6: members of minor components (amber rings)
 
 const view = { x: 0, y: 0, k: 0.55 };
 let lens = 'atlas';
@@ -147,6 +148,8 @@ async function boot() {
       glow: n.activation, retr: n.retrievability, access: n.access_count,
       created: n.created_at, agent: n.agent_id,
       x, y, rim, twinkle: h * Math.PI * 2, degree: 0,
+      /* U6: rim-label honesty + the at-risk gutter's filter */
+      embedded: !!n.embedded, reviewed: !!n.reviewed,
       /* exo-evolution markers (U4 Dream lens overlay) */
       champion:  tags.includes('skill_champion'),
       mutant:    tags.includes('dream_mutated') || tags.includes('dream_merged'),
@@ -183,6 +186,26 @@ async function boot() {
   setText('h-cold',  fmtPct(g.never_traversed_links_pct));
   setText('h-largest', g.largest_component ?? '—');
 
+  /* U6: minor-component members ring amber in the health lens */
+  islandSet = new Set();
+  for (const isl of (g.islands || []))
+    for (const m of (isl.members || [])) {
+      const idx = byId.get(m.id);
+      if (idx !== undefined) islandSet.add(idx);
+    }
+  /* at-risk = the engine's activation_at_risk filter, in-field: reviewed
+     rows whose FSRS retrievability fell under the tool's 0.7 default */
+  setText('h-risk', nodes.filter(n => n.reviewed && n.retr < 0.7).length);
+
+  /* U6 time-lapse baseline: the live channels, restored when the slider
+     comes home (a projection never overwrites truth, only the view) */
+  projBase = {
+    glow: nodes.map(n => n.glow),
+    retr: nodes.map(n => n.retr),
+    eff:  edges.map(e => e.eff),
+  };
+  resetProjection();
+
   if (exp.truncated)
     notice('Field truncated to ' + nodes.length + ' memories — raise <code>?cap=</code> on /graph/export when the LOD work lands.');
 
@@ -190,6 +213,59 @@ async function boot() {
 }
 function setText(id, v) { document.getElementById(id).textContent = String(v); }
 function fmtPct(v) { return v == null ? '—' : v + '%'; }
+
+/* ---------- time-lapse (U6): project the sky forward ----------
+   The server recomputes every decay channel (ACT-R glow, FSRS retrievability,
+   link half-life) at now+N days — same math, later clock. The slider only
+   changes the view; projBase restores live truth at 0. */
+let projBase = null, projDays = 0, projTimer = null, projSeq = 0;
+const projSlider = document.getElementById('h-proj');
+function projLabel() {
+  setText('h-proj-label', projDays === 0 ? 'now' : '+' + projDays + 'd');
+  document.body.classList.toggle('projected', projDays > 0);
+}
+function resetProjection() {
+  projDays = 0;
+  projSeq++;                      /* orphan any in-flight projection fetch */
+  if (projSlider) projSlider.value = 0;
+  if (projBase) {
+    nodes.forEach((n, i) => { n.glow = projBase.glow[i]; n.retr = projBase.retr[i]; });
+    edges.forEach((e, i) => { e.eff = projBase.eff[i]; });
+    setText('h-risk', nodes.filter(n => n.reviewed && n.retr < 0.7).length);
+  }
+  projLabel();
+  dirty = true;
+}
+async function applyProjection(days) {
+  projDays = days;
+  projLabel();
+  if (days === 0) { resetProjection(); return; }
+  const seq = ++projSeq;
+  const scopeQ = AGENT ? '&agent_id=' + encodeURIComponent(AGENT) : '';
+  const at = new Date(Date.now() + days * 86400e3).toISOString();
+  try {
+    const exp = await api('/graph/export?at=' + encodeURIComponent(at) + scopeQ);
+    if (seq !== projSeq) return;   /* a newer drag position superseded us */
+    const chan = new Map(exp.nodes.map(n => [n.id, n]));
+    for (const n of nodes) {
+      const c = chan.get(n.id);
+      if (c) { n.glow = c.activation; n.retr = c.retrievability; }
+    }
+    const eff = new Map(exp.edges.map(e => [e.source + '|' + e.target, e.effective_weight]));
+    for (const e of edges) {
+      const v = eff.get(nodes[e.a].id + '|' + nodes[e.b].id);
+      if (v !== undefined) e.eff = v;
+    }
+    setText('h-risk', nodes.filter(n => n.reviewed && n.retr < 0.7).length);
+    dirty = true;
+  } catch (e) { /* keep the current view; the status quo is honest */ }
+}
+if (projSlider) projSlider.addEventListener('input', () => {
+  const d = parseInt(projSlider.value, 10) || 0;
+  projDays = d; projLabel();               /* label tracks the thumb live */
+  clearTimeout(projTimer);
+  projTimer = setTimeout(() => applyProjection(d), 350);
+});
 
 /* ---------- canvas ---------- */
 const canvas = document.getElementById('field');
@@ -341,6 +417,11 @@ function render(now) {
     if (lens === 'dream' && n.pruneCand && !REDUCED) {
       act *= 0.55 + 0.45 * Math.abs(Math.sin(t * 3.1 + n.twinkle));   /* guttering */
     }
+    /* U6: activation_at_risk made visible — reviewed stars under the
+       engine's 0.7 retrievability bar gutter at the edge of visibility */
+    if (lens === 'health' && n.reviewed && n.retr < 0.7) {
+      act *= REDUCED ? 0.5 : 0.4 + 0.45 * Math.abs(Math.sin(t * 2.6 + n.twinkle));
+    }
     if (!REDUCED && S.twinkle) act *= 0.93 + 0.07 * Math.sin(t * 1.7 + n.twinkle);
 
     const layerBoost = n.layer === 'working' ? 1.25 : 1;
@@ -381,6 +462,13 @@ function render(now) {
     ctx.lineWidth = 1;
     for (let i = 0; i < nodes.length; i++) {
       if (nodes[i].degree !== 0) continue;
+      const x = sx(nodes[i].x), y = sy(nodes[i].y);
+      if (x < -20 || x > W + 20 || y < -20 || y > H + 20) continue;
+      ctx.beginPath(); ctx.arc(x, y, 9 * view.k + 4, 0, 7); ctx.stroke();
+    }
+    /* U6: island rings — linked, but marooned off the main component */
+    ctx.strokeStyle = 'rgba(224,168,82,0.55)';
+    for (const i of islandSet) {
       const x = sx(nodes[i].x), y = sy(nodes[i].y);
       if (x < -20 || x > W + 20 || y < -20 || y > H + 20) continue;
       ctx.beginPath(); ctx.arc(x, y, 9 * view.k + 4, 0, 7); ctx.stroke();
@@ -443,7 +531,9 @@ async function openCard(i) {
   const color = TYPE_COLOR[n.type] || FALLBACK_COLOR;
   document.getElementById('card-chip').style.background = color;
   document.getElementById('card-type').textContent =
-    n.type + (n.rim ? ' · rim (no embedding)' : '');
+    n.type + (n.rim
+      ? (n.embedded ? ' · rim (awaiting layout)' : ' · rim (no embedding)')
+      : '');
   document.getElementById('card-id').textContent = n.id.slice(0, 18);
   document.getElementById('card-tags').innerHTML =
     n.tags.map(t => `<span class="tag"></span>`).join('');
@@ -768,6 +858,7 @@ async function connectEvents() {
 }
 const placard = document.getElementById('placard');
 function setLens(name) {
+  if (lens === 'health' && name !== 'health') resetProjection();   /* U6 */
   lens = name;
   document.body.dataset.lens = name;
   document.querySelectorAll('#lenses button').forEach(b =>
@@ -1126,4 +1217,11 @@ boot().then(() => {
   const open = urlParams.get('open');
   if (open === 'settings') { settingsEl.classList.add('open'); refreshTrash(); }
   if (open === 'compose') composeEl.classList.add('open');
+  /* ?proj=<days> — deep-link a time-lapse projection (U6; docs, captures) */
+  const proj = parseInt(urlParams.get('proj') || '0', 10);
+  if (proj > 0) {
+    setLens('health');
+    if (projSlider) projSlider.value = Math.min(proj, 365);
+    applyProjection(Math.min(proj, 365));
+  }
 });

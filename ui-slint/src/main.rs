@@ -105,7 +105,19 @@ struct NodeInfo {
     fx: f32,
     fy: f32,
     rim: bool,
+    /// U6 rim-label honesty: a rim star that IS embedded is merely awaiting
+    /// a layout recompute — saying "no embedding" there would be a lie.
+    embedded: bool,
     hue: u32,
+}
+
+/// The honest rim suffix for hover/card text ("" off the rim).
+fn rim_note(rim: bool, embedded: bool) -> &'static str {
+    match (rim, embedded) {
+        (false, _) => "",
+        (true, true) => " · rim (awaiting layout)",
+        (true, false) => " · rim (no embedding)",
+    }
 }
 
 struct Field {
@@ -217,7 +229,7 @@ fn main() -> Result<()> {
                             "{} · {}{}",
                             trim_chars(&n.head, 64),
                             n.mtype,
-                            if n.rim { " · rim (no embedding)" } else { "" }
+                            rim_note(n.rim, n.embedded)
                         )
                         .into(),
                     );
@@ -460,6 +472,7 @@ fn build_field(export: &Value, layout: &Value, agent: Option<&str>) -> Field {
             fx,
             fy,
             rim,
+            embedded: n["embedded"].as_bool().unwrap_or(false),
             id,
         });
     }
@@ -791,7 +804,7 @@ fn card_props(n: &NodeInfo) -> CardProps {
             n.access,
             n.agent,
             n.visibility,
-            if n.rim { " · rim (no embedding)" } else { "" },
+            rim_note(n.rim, n.embedded),
         ),
     }
 }

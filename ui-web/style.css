@@ -200,6 +200,23 @@ body[data-lens="health"] #health-panel { display: block; }
 #health-panel .note { margin-top: 10px; font-size: 11px; color: var(--ink-3); }
 #health-panel code { font-family: var(--mono); font-size: 10px; }
 
+/* U6 time-lapse slider — quiet until dragged, accent thumb */
+#h-proj {
+  width: 100%; margin: 6px 0 2px; appearance: none; height: 3px;
+  background: rgba(122,152,199,0.25); border-radius: 2px; outline-offset: 4px;
+}
+#h-proj::-webkit-slider-thumb {
+  appearance: none; width: 13px; height: 13px; border-radius: 50%;
+  background: var(--accent); border: 2px solid #0d1422; cursor: ew-resize;
+}
+#h-proj::-moz-range-thumb {
+  width: 11px; height: 11px; border-radius: 50%;
+  background: var(--accent); border: 2px solid #0d1422; cursor: ew-resize;
+}
+/* while projected, say so — the wordmark sub flips to the projection chip */
+body.projected #wordmark .sub { color: #e0a852; }
+body.projected #wordmark .sub::after { content: " · PROJECTION"; }
+
 /* ---------- dream observatory panel ---------- */
 #dream-panel {
   position: fixed; top: 64px; right: 14px; width: 360px; z-index: 14;

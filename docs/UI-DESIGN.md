@@ -156,7 +156,7 @@ env/config.
 | U3 | SSE audit tail + Live lens glow | an MCP `remember` from another terminal ripples in ≤2s — **shipped 2026-08-08; gate passed (stdio `cerebro-mcp` remember → SSE tap in the same poll window); found the axum-0.7 brace-route 404 and the stale dev-MCP binary along the way** |
 | U4 | Dream observatory + `/dream/reports` | a real dream cycle scrubbable — **shipped 2026-08-08; gate passed (an 8-phase cycle run from the panel, anatomy scrubbable, links 5889→5893 on camera)** |
 | U5 | `ui-slint` mirror (dashboard + Atlas + Thought) | native app browses the same DB — **shipped 2026-08-09; gate passed against the real brain (769 memories / 12,507 links): field + panels + an 87-walk traced recall rendered natively (see field notes)** |
-| U6 | Health lens + time-lapse + polish | watchdog metrics visible in-field |
+| U6 | Health lens + time-lapse + polish | watchdog metrics visible in-field — **shipped 2026-08-09; gate passed (at-risk count 9→42 across a +180d projection on the live brain, guttering + island rings in-field; see field notes)** |
 
 Each step is one PR, tests riding. U1 is the bulk; everything after is
 additive.
@@ -294,6 +294,33 @@ additive.
   twinkle, no parallax layers, constant-screen-size stars, hop cadence fixed
   at 950ms, results list capped at recall top-k. Dream/Live/Health stay
   web-only until wanted.
+
+## U6 field notes (2026-08-09)
+
+- **Time-lapse is a server-side projection, not a client trick.**
+  `GET /graph/export?at=<rfc3339>` recomputes every decay channel (ACT-R
+  glow, FSRS retrievability, link half-life) at the given instant — same
+  math, later clock — and echoes `projected_at` so the client can label
+  honestly (the wordmark grows an amber PROJECTION chip). Forward-only:
+  past instants clamp to now, because rewinding honestly would need
+  access-history filtering, not just a different `t`. The slider lives in
+  the health panel (0..+365d, debounced); `?proj=<days>` deep-links it.
+  A projection never overwrites truth — the live channels are cached and
+  restored when the slider comes home or the lens changes.
+- **The health lens now shows the whole watchdog**: cold links blue (as
+  before), isolated memories ringed red, island (minor-component) members
+  ringed amber from `memory_health`'s member rosters, and at-risk memories
+  guttering — the filter mirrors the engine's `activation_at_risk` exactly
+  (reviewed rows under the 0.7 retrievability default), so the field and
+  the tool always agree. The panel carries the count.
+- **Rim-label honesty** (found by André's first screenshot of a newborn
+  star): between a save and the next layout recompute, a rim star was
+  labeled "no embedding" while it was merely *awaiting layout*. The export
+  now carries per-node `embedded` + `reviewed` flags; both UIs distinguish
+  "rim (awaiting layout)" from "rim (no embedding)".
+- On the dev brain the projection reads: mean retrievability 0.754 → 0.48
+  across +180d, at-risk 9 → 42. An untouched brain dims — now you can
+  watch it happen before it does.
 
 ### Settings-drawer backlog for U1b (surfaced by U1+U2+U3, as predicted)
 

@@ -117,7 +117,15 @@
   <div class="hrow"><span class="hk">Isolated memories</span><span class="hv" id="h-iso"></span></div>
   <div class="hrow"><span class="hk">Never-traversed links</span><span class="hv" id="h-cold"></span></div>
   <div class="hrow"><span class="hk">Largest component</span><span class="hv" id="h-largest"></span></div>
-  <p class="note">Cold links render blue; isolated memories are ringed. Numbers from <code>memory_health</code>.</p>
+  <div class="hrow"><span class="hk">At-risk (R&nbsp;&lt;&nbsp;0.7)</span><span class="hv" id="h-risk"></span></div>
+  <p class="note">Cold links render blue; isolated memories ring red, island
+  (minor-component) memories ring amber; at-risk memories gutter.</p>
+  <div class="hrow"><span class="hk">Time-lapse</span><span class="hv" id="h-proj-label">now</span></div>
+  <input type="range" id="h-proj" min="0" max="365" step="1" value="0"
+         aria-label="decay projection, days from now">
+  <p class="note">Drag to watch the sky decay: every channel (glow,
+  retrievability, link strength) recomputed server-side at now+N days —
+  same math, later clock. A projection, never a write.</p>
 </aside>
 
 <div id="placard" role="dialog" aria-modal="false">
