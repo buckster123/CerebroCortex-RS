@@ -10,7 +10,7 @@
 
 [![Rust](https://img.shields.io/badge/rust-1.78%2B-orange?logo=rust)](https://rustup.rs)
 [![Tools](https://img.shields.io/badge/MCP_tools-67%2F67-brightgreen)](#-the-tool-surface-67)
-[![Tests](https://img.shields.io/badge/tests-274_passing-brightgreen)](#-building-from-source)
+[![Tests](https://img.shields.io/badge/tests-276_passing-brightgreen)](#-building-from-source)
 [![Platform](https://img.shields.io/badge/platform-arm64_%7C_x86__64-lightgrey)](#-deployment)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
@@ -450,9 +450,9 @@ cargo test                   # 250 tests, no network, no model download
 | cerebro (unit) | 137 | engines, activation vs Python fixtures (±1e-4), dream phases, vision, ingestion, transport-free logic |
 | cerebro (integration) | 76 | storage CRUD, scope enforcement, migration + reap, retention, cortex end-to-end |
 | cerebro-mcp | 46 | dispatch routing, tool contracts, audit trail, panic isolation, frame caps |
-| cerebro-api | 5 | priority casing, PCA projection, route-syntax pin |
+| cerebro-api | 7 | priority casing, PCA projection, route-syntax pin, time-lapse clamp + decay |
 | ui-slint | 10 | field placement (web-parity FNV-1a), star/edge ranking, trace prep honesty |
-| **total** | **274** | |
+| **total** | **276** | |
 
 ## 🔗 Related
 

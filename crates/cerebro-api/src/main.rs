@@ -694,6 +694,28 @@ fn head_chars(s: &str, max_chars: usize) -> &str {
 struct GraphExportQuery {
     agent_id: Option<String>,
     cap:      Option<usize>,
+    /// RFC3339 instant to project decay to (Lucida U6 time-lapse). Forward
+    /// only — past instants clamp to now, because rewinding honestly would
+    /// need access-history filtering, not just a different `t`.
+    at:       Option<String>,
+}
+
+/// Resolve the projection instant: absent → now (live export); present →
+/// parsed RFC3339 clamped forward. Second field says whether a projection
+/// was requested (drives the `projected_at` echo).
+fn resolve_projection(
+    at: Option<&str>,
+    now: chrono::DateTime<Utc>,
+) -> anyhow::Result<(chrono::DateTime<Utc>, bool)> {
+    match at {
+        None => Ok((now, false)),
+        Some(s) => {
+            let t = chrono::DateTime::parse_from_rfc3339(s)
+                .map_err(|e| anyhow::anyhow!("bad ?at= (want RFC3339): {e}"))?
+                .with_timezone(&Utc);
+            Ok((t.max(now), true))
+        }
+    }
 }
 
 /// Every visual channel the field needs, one round-trip. Nodes carry live
@@ -707,6 +729,9 @@ async fn graph_export(
     let scope = scope_from(q.agent_id.as_deref());
     let cap   = q.cap.unwrap_or(4000).clamp(1, 20_000);
     let now   = Utc::now();
+    // Every decay channel below (ACT-R, FSRS, link half-life) is computed at
+    // `t` — with ?at= the whole sky dims together, same math, later clock.
+    let (t, projected) = resolve_projection(q.at.as_deref(), now)?;
 
     let storage = brain.storage.read().await;
     let mut nodes = storage.sqlite.list_memories_scoped(
@@ -715,10 +740,11 @@ async fn graph_export(
     ).await?;
     let truncated = nodes.len() > cap;
     nodes.truncate(cap);
+    let embedded_ids = storage.sqlite.list_embedded_ids().await?;
 
     let node_wire: Vec<Value> = nodes.iter().map(|n| {
         let activation = cerebro::activation::base_level_activation(
-            &n.access_times, now, cerebro::config::ACTR_DECAY_RATE,
+            &n.access_times, t, cerebro::config::ACTR_DECAY_RATE,
         );
         // Sigmoid-mapped to [0,1] for the glow channel (raw B(t) is unbounded).
         let glow = cerebro::activation::recall_probability(
@@ -726,7 +752,7 @@ async fn graph_export(
         );
         // Elapsed from last review, falling back to creation — never pinned
         // at 1.0 for the never-recalled (the R-21 trap, not repeated here).
-        let elapsed_days = (now - n.strength.last_review.unwrap_or(n.created_at))
+        let elapsed_days = (t - n.strength.last_review.unwrap_or(n.created_at))
             .num_seconds().max(0) as f32 / 86_400.0;
         let retr = cerebro::activation::retrievability(elapsed_days, n.strength.stability);
         json!({
@@ -745,6 +771,11 @@ async fn graph_export(
             "retrievability": round3(retr),
             "valence":       n.emotional_valence,
             "intensity":     round3(n.emotional_intensity),
+            // U6: rim-label honesty (embedded-but-unplaced ≠ no embedding)
+            // and the at-risk gutter's filter (the engine's activation_at_risk
+            // only considers reviewed rows).
+            "embedded":      embedded_ids.contains(&n.id.0),
+            "reviewed":      n.strength.last_review.is_some(),
         })
     }).collect();
 
@@ -757,9 +788,9 @@ async fn graph_export(
             "target":           l.target_id.0,
             "link_type":        l.link_type,
             "weight":           round3(l.weight),
-            "effective_weight": round3(l.effective_weight(now, cerebro::config::LINK_DECAY_HALFLIFE_DAYS)),
+            "effective_weight": round3(l.effective_weight(t, cerebro::config::LINK_DECAY_HALFLIFE_DAYS)),
             "traversal_count":  l.traversal_count,
-            "last_traversed":   l.last_traversed.map(|t| t.to_rfc3339()),
+            "last_traversed":   l.last_traversed.map(|ts| ts.to_rfc3339()),
         }))
         .collect();
 
@@ -768,6 +799,9 @@ async fn graph_export(
         "edges":        edge_wire,
         "truncated":    truncated,
         "generated_at": now.to_rfc3339(),
+        // Honest labeling for the time-lapse: null on a live export, the
+        // clamped projection instant when ?at= was asked for.
+        "projected_at": projected.then(|| t.to_rfc3339()),
     })))
 }
 
@@ -1461,6 +1495,38 @@ async fn run_server(app: Router) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // U6 time-lapse: absent → live now; future → honored; past → clamps to
+    // now (rewinding honestly would need access-history filtering); garbage
+    // → honest error, not a silent live export.
+    #[test]
+    fn projection_resolves_forward_only() {
+        let now = Utc::now();
+        let (t, p) = resolve_projection(None, now).unwrap();
+        assert!((t, p) == (now, false));
+
+        let future = now + chrono::Duration::days(90);
+        let (t, p) = resolve_projection(Some(&future.to_rfc3339()), now).unwrap();
+        assert!(p);
+        assert_eq!(t, future);
+
+        let past = now - chrono::Duration::days(30);
+        let (t, p) = resolve_projection(Some(&past.to_rfc3339()), now).unwrap();
+        assert!(p);
+        assert_eq!(t, now);
+
+        assert!(resolve_projection(Some("not-a-time"), now).is_err());
+    }
+
+    // The projection's whole claim in one assertion: the same FSRS math at a
+    // later clock reads dimmer. (ACT-R and link half-life decay likewise —
+    // the export computes all three at `t`.)
+    #[test]
+    fn projection_dims_the_sky() {
+        let r_now = cerebro::activation::retrievability(0.0, 1.0);
+        let r_half_year = cerebro::activation::retrievability(180.0, 1.0);
+        assert!(r_half_year < r_now);
+    }
 
     // CB-012: the HTTP priority normalization must match the MCP canonical
     // (uppercase) so a `priority:<p>` tag written here is matched by an MCP
